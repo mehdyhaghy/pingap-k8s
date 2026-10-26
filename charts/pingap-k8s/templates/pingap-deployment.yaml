@@ -80,8 +80,12 @@ spec:
             - {{ . | quote }}
             {{- end }}
           env:
+            # [::] takes IPv4 too (pingora sets IPV6_V6ONLY only on request, so
+            # the socket is dual-stack on Linux; checked with Pingap 0.16.1: the
+            # admin answers on 127.0.0.1, ::1 and the pod IPv4), and works on
+            # IPv6-only clusters, where 0.0.0.0 would fail the liveness probe.
             - name: PINGAP_ADMIN_ADDR
-              value: "0.0.0.0:{{ $p.admin.port }}"
+              value: "[::]:{{ $p.admin.port }}"
             - name: PINGAP_ADMIN_USER
               valueFrom:
                 secretKeyRef:
