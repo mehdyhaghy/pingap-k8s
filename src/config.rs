@@ -26,8 +26,12 @@ use crate::types::{PortRef, ServiceKey, ServiceRef, UpstreamOptions};
 /// Maximum length of a DNS label.
 const DNS_LABEL_MAX: usize = 63;
 
-/// Default listen address of the metrics/health server.
-pub const DEFAULT_LISTEN: &str = "0.0.0.0:9090";
+/// Default listen address of the metrics/health server: all IPv6 and, on
+/// Linux, all IPv4 addresses too. Neither std nor tokio sets `IPV6_V6ONLY`,
+/// so an `[::]` socket also accepts IPv4 (as v4-mapped addresses) unless the
+/// node sets `net.ipv6.bindv6only=1`. Nodes booted with IPv6 disabled
+/// (`ipv6.disable=1`) cannot open it: set `listen = "0.0.0.0:9090"` there.
+pub const DEFAULT_LISTEN: &str = "[::]:9090";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -680,7 +684,7 @@ drain_terminating = true
             "etcd://etcd.edge.svc:2379/pingap?ca=/etc/pingap-k8s/etcd/ca.pem"
         );
         assert_eq!(c.defaults, Defaults::default());
-        assert_eq!(c.server.listen, "0.0.0.0:9090".parse().unwrap());
+        assert_eq!(c.server.listen, "[::]:9090".parse().unwrap());
         assert_eq!(c.upstreams.len(), 2);
         let web = &c.upstreams["web"];
         assert_eq!(

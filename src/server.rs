@@ -1,7 +1,8 @@
 //! Metrics and health HTTP server.
 //!
 //! Serves `GET /metrics`, `/healthz` and `/readyz` on the address from the
-//! config (`[server] listen`, default `0.0.0.0:9090` inside the pod). The
+//! config (`[server] listen`, default `[::]:9090` inside the pod, which
+//! also accepts IPv4 on Linux). The
 //! port is meant for in-cluster scraping and kubelet probes only: the chart
 //! exposes it through a ClusterIP Service and a NetworkPolicy, never publicly.
 
@@ -251,6 +252,32 @@ mod tests {
             .expect("server stops after shutdown signal")
             .unwrap()
             .unwrap();
+    }
+
+    /// The default listener `[::]` is dual-stack: tokio does not set
+    /// `IPV6_V6ONLY`, so IPv4 clients reach it too (unless the host sets
+    /// `net.ipv6.bindv6only=1`). Skipped where IPv6 is unavailable.
+    #[tokio::test]
+    async fn unspecified_ipv6_listener_accepts_ipv4() {
+        let Ok(listener) = TcpListener::bind("[::]:0").await else {
+            eprintln!("IPv6 unavailable, skipping");
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_listener(
+            listener,
+            Arc::new(Metrics::new()),
+            Readiness::new(),
+            async {
+                let _ = stop_rx.await;
+            },
+        ));
+        let (status, body) = get(SocketAddr::from(([127, 0, 0, 1], port)), "/healthz").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, "ok");
+        stop_tx.send(()).unwrap();
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]

@@ -144,7 +144,9 @@ config:
   #       drain_terminating: true
   upstreams: {}
   # Optional [server] table (metrics/health listener), passed through as is.
-  # Leave empty for the built-in default (0.0.0.0:9090).
+  # Leave empty for the built-in default ([::]:9090, which also accepts IPv4 on
+  # Linux unless the node sets net.ipv6.bindv6only=1). On nodes booted with IPv6
+  # disabled use {listen: "0.0.0.0:9090"}.
   server: {}
   # Store the rendered config in a Secret instead of a ConfigMap.
   useSecret: false

@@ -299,7 +299,7 @@ drain_terminating = true # any [defaults] key can be overridden per upstream
 | `debounce_max` | `2s` | write at the latest this long after the first pending event |
 | `resync` | `5m` | reconcile every upstream at this interval even without events |
 | `ipv4_only` | `false` | ignore IPv6 EndpointSlices |
-| `server.listen` | `0.0.0.0:9090` | address for `/metrics`, `/healthz` and `/readyz` (restart required) |
+| `server.listen` | `[::]:9090` | address for `/metrics`, `/healthz` and `/readyz` (restart required). `[::]` also accepts IPv4 on Linux unless the node sets `net.ipv6.bindv6only=1`; on nodes with IPv6 disabled at boot use `0.0.0.0:9090` |
 | `upstreams.<name>.services` | (required) | list of `<service>[.<namespace>]:<port> [weight]` |
 
 - `<port>` is a Service port **name** or **number** (the `port` field, not `targetPort`).
