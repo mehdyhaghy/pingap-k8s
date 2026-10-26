@@ -167,6 +167,7 @@ rbac.fromConfig, the namespace of every config.upstreams[*].services entry
 {{- end }}
 {{- if .Values.rbac.fromConfig }}
 {{- range $name, $up := .Values.config.upstreams }}
+{{- if $up }}
 {{- range $entry := (default (list) $up.services) }}
 {{- $target := first (regexSplit "\\s+" (trim $entry) -1) }}
 {{- $svc := regexReplaceAll ":[^:]*$" $target "" }}
@@ -174,6 +175,7 @@ rbac.fromConfig, the namespace of every config.upstreams[*].services entry
 {{- $nss = append $nss (index (splitn "." 2 $svc) "_1") }}
 {{- else }}
 {{- $nss = append $nss $default }}
+{{- end }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -250,6 +252,9 @@ default_namespace = {{ .Values.config.kubernetes.default_namespace | default "" 
 {{- fail (printf "config.upstreams: %q is not a valid Pingap upstream name ([A-Za-z0-9_-]+)" $name) }}
 {{- end }}
 {{- $up := index $.Values.config.upstreams $name }}
+{{- if not $up }}
+{{- continue }}
+{{- end }}
 {{- if not $up.services }}
 {{- fail (printf "config.upstreams.%s: services is required" $name) }}
 {{- end }}

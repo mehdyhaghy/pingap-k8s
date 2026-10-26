@@ -47,6 +47,9 @@ secrets/
 *.secret.yml
 *-secret.yaml
 *-secret.yml
+# Chart templates are source, never secrets themselves.
+!charts/**/templates/*.yaml
+!charts/**/templates/*.tpl
 kubeconfig
 kubeconfig*
 *.kubeconfig
