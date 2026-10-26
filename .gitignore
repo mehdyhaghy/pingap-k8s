@@ -133,3 +133,6 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
+
+# Local work checkpoint (agents and harnesses), never committed
+.checkpoint/
