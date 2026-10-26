@@ -170,6 +170,20 @@ metrics:
     port: 9090
     annotations: {}
 
+# Optional NetworkPolicy for the controller pods. When enabled, the
+# metrics/health port accepts traffic only from the sources below; everything
+# else is denied. Kubelet probes keep working (node-to-pod traffic is always
+# allowed). Egress is not restricted.
+networkPolicy:
+  enabled: false
+  # Allow pods in the release namespace (for example a scraper running there).
+  allowSameNamespace: false
+  # NetworkPolicy "from" peers allowed to scrape /metrics, for example:
+  #   - namespaceSelector:
+  #       matchLabels:
+  #         kubernetes.io/metadata.name: monitoring
+  metricsFrom: []
+
 # OpenTelemetry (metrics + logs over OTLP/gRPC). /metrics is served either way.
 otel:
   # OTLP gRPC endpoint of a collector on the private/cluster network, e.g.

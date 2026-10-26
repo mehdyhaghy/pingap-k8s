@@ -1,0 +1,8 @@
+# CI render check for the optional controller NetworkPolicy.
+networkPolicy:
+  enabled: true
+  allowSameNamespace: true
+  metricsFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
