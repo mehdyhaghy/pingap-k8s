@@ -64,6 +64,11 @@ const MIN_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Runs the election until `shutdown` completes.
 ///
+/// `client` must not have a client-wide request timeout
+/// (`EtcdWriter::connect_election`): a follower's `Campaign` call blocks until it is
+/// elected, and a timeout would cancel it and send the follower to the back of the queue.
+/// Every other RPC here has its own timeout.
+///
 /// `tx` carries `true` while this process is the leader and `false` otherwise. It is only
 /// changed (and receivers only woken) on transitions. `ttl` is rounded up to whole seconds
 /// (etcd leases have second granularity, minimum 1 s).

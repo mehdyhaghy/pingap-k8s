@@ -136,6 +136,19 @@ impl EtcdTarget {
 
     /// Connection options equivalent to Pingap's. Reads the PEM files.
     pub fn connect_options(&self) -> Result<ConnectOptions, EtcdError> {
+        Ok(self.base_options()?.with_timeout(self.timeout))
+    }
+
+    /// Like [`connect_options`](Self::connect_options) but without the client-wide
+    /// request timeout, for the leader election only. A follower's `Campaign` call blocks
+    /// until it is elected, which may take far longer than any request timeout; with one,
+    /// the call is cancelled and the follower re-campaigns at the back of the queue.
+    /// `leader.rs` bounds every other election RPC with its own timeout.
+    pub fn election_connect_options(&self) -> Result<ConnectOptions, EtcdError> {
+        self.base_options()
+    }
+
+    fn base_options(&self) -> Result<ConnectOptions, EtcdError> {
         let mut options = ConnectOptions::new();
         if let Some(tls) = self.tls_options()? {
             options = options.with_tls(tls);
@@ -148,7 +161,6 @@ impl EtcdTarget {
             _ => warn!("etcd url sets only one of user and password; connecting without auth"),
         }
         Ok(options
-            .with_timeout(self.timeout)
             .with_connect_timeout(self.connect_timeout)
             .with_keep_alive(KEEP_ALIVE_INTERVAL, KEEP_ALIVE_TIMEOUT))
     }
@@ -549,6 +561,15 @@ impl EtcdWriter {
 
     pub fn client(&self) -> Client {
         self.client.clone()
+    }
+
+    /// A separate client for the leader election, without a request timeout (see
+    /// [`EtcdTarget::election_connect_options`]). Not for KV writes.
+    pub async fn connect_election(target: &EtcdTarget) -> anyhow::Result<Client> {
+        let options = target.election_connect_options()?;
+        Client::connect(&target.endpoints, Some(options))
+            .await
+            .with_context(|| format!("connecting to etcd {:?} (election)", target.endpoints))
     }
 
     /// `"/" + <url path>` as Pingap keeps it.

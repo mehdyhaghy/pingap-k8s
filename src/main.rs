@@ -423,10 +423,18 @@ async fn run(
         return finish(server_task, None, None).await;
     }
 
-    // Leader election.
+    // Leader election, on its own client: a follower's Campaign blocks until it is
+    // elected and must not be cut by the request timeout of the KV client.
+    let Some(election_client) = retry("connecting to etcd (election)", &shutdown_rx, || {
+        EtcdWriter::connect_election(&target)
+    })
+    .await
+    else {
+        return finish(server_task, None, None).await;
+    };
     let (leader_tx, leader_rx) = watch::channel(false);
     let election = tokio::spawn(leader::run_election(
-        writer.client(),
+        election_client,
         election_name(writer.prefix()),
         leader::DEFAULT_TTL,
         detect_identity(std::env::var_os("POD_NAME"), hostname),

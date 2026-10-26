@@ -3,7 +3,8 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use etcd_client::Client;
+use etcd_client::{Client, GetOptions};
+use pingap_k8s::etcd::{EtcdWriter, parse_etcd_url};
 use pingap_k8s::leader::run_election;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
@@ -284,4 +285,77 @@ async fn shutdown_while_campaigning_returns() {
     assert_eq!(keys.kvs().len(), 1);
     assert!(a.is_leader());
     a.shutdown().await;
+}
+
+/// Candidate keys under the election prefix: (key, lease), oldest first.
+async fn candidate_keys(client: &Client, name: &str) -> Vec<(String, i64)> {
+    let resp = client
+        .kv_client()
+        .get(
+            format!("{name}/"),
+            Some(GetOptions::new().with_prefix().with_sort(
+                etcd_client::SortTarget::Create,
+                etcd_client::SortOrder::Ascend,
+            )),
+        )
+        .await
+        .unwrap();
+    resp.kvs()
+        .iter()
+        .map(|kv| (kv.key_str().unwrap().to_string(), kv.lease()))
+        .collect()
+}
+
+/// A follower whose campaign lasts longer than the etcd URL's request timeout keeps its
+/// place (same key, same lease) and is elected once the leader's lease is gone.
+#[tokio::test]
+async fn long_campaign_outlives_request_timeout() {
+    let Some(client) = client("long-campaign").await else {
+        return;
+    };
+    let host = std::env::var("PINGAP_K8S_TEST_ETCD")
+        .unwrap()
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+    // A 1 s request timeout: the KV client would cancel a 1 s+ Campaign.
+    let target = parse_etcd_url(&format!("etcd://{host}/pingap?timeout=1s")).unwrap();
+    let election_client = EtcdWriter::connect_election(&target).await.unwrap();
+
+    let name = election_name("long-campaign");
+    let leader = Candidate::start(&client, &name, "pod-a").await;
+    wait_value(&leader.rx, true, Duration::from_secs(5)).await;
+    let follower = Candidate::start(&election_client, &name, "pod-b").await;
+
+    // Wait for the follower's key, then for several request timeouts.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let queued = loop {
+        let keys = candidate_keys(&client, &name).await;
+        if keys.len() == 2 {
+            break keys[1].clone();
+        }
+        assert!(Instant::now() < deadline, "follower never campaigned");
+        sleep(Duration::from_millis(20)).await;
+    };
+    sleep(Duration::from_millis(3500)).await;
+    assert!(!follower.is_leader());
+    let keys = candidate_keys(&client, &name).await;
+    assert_eq!(keys.len(), 2, "{keys:?}");
+    assert_eq!(keys[1], queued, "the follower re-campaigned");
+
+    // The leader's lease goes away: the waiting campaign wins with the same key.
+    let leader_lease = keys[0].1;
+    leader.kill();
+    client.lease_client().revoke(leader_lease).await.unwrap();
+    wait_value(&follower.rx, true, Duration::from_secs(2)).await;
+    let resp = client
+        .election_client()
+        .leader(name.as_str())
+        .await
+        .unwrap();
+    let kv = resp.kv().unwrap();
+    assert_eq!(kv.key_str().unwrap(), queued.0);
+    assert_eq!(kv.lease(), queued.1);
+    assert_eq!(kv.value_str().unwrap(), "pod-b");
+    follower.shutdown().await;
 }
