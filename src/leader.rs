@@ -44,7 +44,7 @@ use etcd_client::{
     Client, Error as EtcdClientError, LeaderKey, LeaseClient, LeaseKeepAliveStream, LeaseKeeper,
     ResignOptions,
 };
-use rand::Rng as _;
+use rand::RngExt as _;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, sleep_until, timeout, timeout_at};

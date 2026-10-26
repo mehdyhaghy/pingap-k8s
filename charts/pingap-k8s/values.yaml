@@ -70,7 +70,7 @@ etcd:
   prefix: pingap
   image:
     repository: quay.io/coreos/etcd
-    tag: v3.6.12
+    tag: v3.7.3
     pullPolicy: IfNotPresent
   tls:
     # Generate a CA, the etcd server certificate and client certificates for the

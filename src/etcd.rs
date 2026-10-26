@@ -28,7 +28,7 @@ use etcd_client::{
     Certificate, Client, Compare, CompareOp, ConnectOptions, EventType, GetOptions, Identity,
     TlsOptions, Txn, TxnOp, WatchOptions, WatchStream,
 };
-use rand::Rng as _;
+use rand::RngExt as _;
 use tokio::sync::{RwLock, mpsc};
 use toml_edit::{Array, DocumentMut, Item, Table, TableLike, Value};
 use tracing::{debug, info, warn};

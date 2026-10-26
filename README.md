@@ -82,7 +82,7 @@ a warning is logged: Pingap rejects an empty list, and its health checks mark th
 
 ### Prerequisites
 
-- Kubernetes 1.32 or newer.
+- Kubernetes 1.32 or newer (CI tests 1.35, the oldest minor still supported upstream, and 1.37).
 - An etcd reachable from the cluster, on the private network only. You can reuse the etcd
   Pingap already uses, or let the chart deploy one (`etcd.deploy=true`).
 - Pingap running against that etcd with autoreload:

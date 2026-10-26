@@ -97,9 +97,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Oldest supported Kubernetes and the newest kindest/node.
+        # Oldest Kubernetes minor still supported upstream, and the newest kindest/node.
         node:
-          - kindest/node:v1.32.11
+          - kindest/node:v1.35.8
           - kindest/node:v1.37.0
     env:
       KIND_VERSION: v0.33.0

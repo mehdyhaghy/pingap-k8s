@@ -61,7 +61,7 @@ use std::future::{Future, pending};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rand::Rng;
+use rand::RngExt as _;
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio::task::{Id, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior, sleep_until};
