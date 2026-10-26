@@ -19,7 +19,7 @@ path = "src/main.rs"
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 clap = { version = "4", features = ["derive", "env"] }
-etcd-client = { version = "0.21", features = ["tls"] }
+etcd-client = { version = "0.21", features = ["tls", "tls-native-roots"] }
 futures = "0.3"
 humantime = "2"
 humantime-serde = "1"
