@@ -34,6 +34,11 @@ pingap:
     # pods, everything else to their HTTP port. Both upstreams follow the same
     # Deployment and start with a placeholder address the controller replaces.
     config: |
+      # Same shutdown budget as the chart default seed: preStop 15s + 30s + 10s < 60s.
+      [basic]
+      grace_period = "30s"
+      graceful_shutdown_timeout = "10s"
+
       [servers.e2e]
       addr = "[::]:8080"
       locations = ["echo-ws", "echo"]
