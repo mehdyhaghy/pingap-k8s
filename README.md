@@ -132,7 +132,7 @@ The chart creates:
 | Object | Notes |
 |---|---|
 | ServiceAccount | used only by the controller |
-| Role + RoleBinding **per namespace** | `get/list/watch` on `services` and `endpointslices`. The namespaces come from `rbac.namespaces` plus every namespace referenced in `config.upstreams` (`rbac.fromConfig: true`). Never a ClusterRole. |
+| Role + RoleBinding **per namespace** | `get/list/watch` on `services` and `endpointslices`. The namespaces come from `rbac.namespaces` plus every namespace referenced in `config.upstreams` (`rbac.fromConfig: true`). Never a ClusterRole. With `events.enabled`, also `create/patch` on `events.k8s.io` `events` there and in the release namespace. |
 | ConfigMap | the controller config, rendered as TOML from `config` (or a Secret with `config.useSecret: true`) |
 | Deployment | 2 replicas, non-root, read-only root filesystem, all capabilities dropped, probes on `/healthz` and `/readyz` |
 | PodDisruptionBudget | `minAvailable: 1` |
@@ -142,8 +142,8 @@ Config changes are applied without restarting the pods: the controller reloads i
 when the mounted ConfigMap changes (and on `SIGHUP`). Watches are started or stopped only for the
 Services that were added or removed. An invalid new config is rejected and the running one stays.
 
-A few settings are read only at startup: `[etcd]`, `[server]`, `[kubernetes]` `kubeconfig` and
-`context`, and `defaults.resync`. A change to them logs "restart required" and keeps the running
+A few settings are read only at startup: `[etcd]`, `[server]`, `[kubernetes]` `kubeconfig`,
+`context` and `events`, and `defaults.resync`. A change to them logs "restart required" and keeps the running
 value; apply it with `kubectl -n <namespace> rollout restart deployment/pingap-k8s`.
 
 Main chart values:
@@ -158,6 +158,7 @@ Main chart values:
 | `config.kubernetes`, `config.defaults`, `config.upstreams` | see below | rendered into the config file |
 | `rbac.namespaces` | `[]` | extra namespaces to grant read access in |
 | `rbac.fromConfig` | `true` | also grant access in every namespace referenced by `config.upstreams` |
+| `events.enabled` | `false` | post Kubernetes Events (see [Observability](#observability)); adds `create/patch` on `events.k8s.io` `events` to the Roles, the controller's only Kubernetes write permission |
 | `logFormat` / `logLevel` | `text` / `info` | log output (`text` or `json`) and filter |
 | `podDisruptionBudget.minAvailable` | `1` | |
 | `networkPolicy.enabled` | `false` | NetworkPolicy on the controller pods: only the sources below may reach the metrics port (none when both are empty); probes are not affected |
@@ -231,8 +232,8 @@ helm install pingap-k8s ./charts/pingap-k8s --namespace edge -f quickstart.yaml
   Pingap shuts down gracefully (seeded `[basic] grace_period = "30s"`,
   `graceful_shutdown_timeout = "10s"`) within `terminationGracePeriodSeconds: 60`. Keep that sum
   below the grace period if you change any of them; see `pingap.*` in `values.yaml`.
-- The admin UI listens on its own port behind a `ClusterIP`-only Service. Open it with a
-  port-forward:
+- The admin UI listens on its own port (`[::]:3018`, IPv4 and IPv6, so it also works on
+  IPv6-only clusters) behind a `ClusterIP`-only Service. Open it with a port-forward:
 
   ```sh
   kubectl -n edge get secret pingap-k8s-pingap-admin -o jsonpath='{.data.password}' | base64 -d; echo
@@ -349,6 +350,7 @@ kubeconfig = ""          # empty: in-cluster, then $KUBECONFIG, then ~/.kube/con
 context = ""
 default_namespace = ""   # empty: the controller pod's own namespace
 cluster_domain = "cluster.local"  # for target = "service" addresses
+events = false           # post Kubernetes Events (chart: events.enabled)
 
 [defaults]
 include_not_ready = false
@@ -375,6 +377,7 @@ drain_terminating = true # any [defaults] key can be overridden per upstream
 | `kubernetes.context` | `""` | kubeconfig context |
 | `kubernetes.default_namespace` | `""` | namespace for `services` entries without one; empty means the controller pod's namespace (`POD_NAMESPACE`) |
 | `kubernetes.cluster_domain` | `cluster.local` | cluster DNS domain used in `target = "service"` addresses; applies live |
+| `kubernetes.events` | `false` | post Kubernetes Events for resolve warnings, drain fallbacks, malformed entries and etcd reachability (needs `create/patch` on `events.k8s.io` `events`); restart required |
 | `include_not_ready` | `false` | also write endpoints that are not ready (and not terminating) |
 | `drain_terminating` | `true` | remove terminating endpoints; `false` treats serving terminating endpoints as ready |
 | `debounce` | `500ms` | wait this long after the last event before writing |
@@ -596,6 +599,12 @@ docker run --rm -v "$PWD/config.toml:/config.toml:ro" ghcr.io/mehdyhaghy/pingap-
   --check --config /config.toml
 ```
 
+Kubernetes Events (with `events.enabled`):
+
+```sh
+kubectl get events -A --field-selector reportingComponent=pingap-k8s
+```
+
 RBAC: the controller may read EndpointSlices and Services only in the namespaces it was granted
 (`yes` expected for each namespace in `config.upstreams`):
 
@@ -667,7 +676,16 @@ The controller serves on port `9090` (cluster-internal only):
 | `pingap_k8s_drain_fallback` | `upstream` |
 | `pingap_k8s_is_leader`, `pingap_k8s_etcd_up` | none |
 
+`pingap_k8s_etcd_up` follows every etcd call (writes, the owned-key watch, the election's
+keep-alives every 2 s), so a follower shows 0 within seconds of etcd going away too.
+
 The chart's metrics Service is `pingap-k8s-metrics` (`ClusterIP`, release `pingap-k8s`).
+
+With `events.enabled: true` the controller also posts Kubernetes Events (`reportingController`
+`pingap-k8s`), once per episode, like its warning logs: `ServiceMissing`, `PortNotInService`,
+`PortNotInSlices`, `DrainFallbackStarted`/`DrainFallbackEnded` on the Service (by the leader),
+`MalformedUpstream` and `EtcdUnreachable`/`EtcdRecovered` on the controller Pod. Repeats update the
+existing Event, and each object gets at most 25, then one per 5 minutes.
 
 ### Telemetry
 
@@ -695,7 +713,9 @@ Service), never a public address. Use `https://` for TLS (system roots).
 ## Security
 
 - **Kubernetes access is read-only and namespaced**: `get/list/watch` on `services` and
-  `endpointslices`, through one Role per namespace. Never a ClusterRole. API server TLS is always
+  `endpointslices`, through one Role per namespace. Never a ClusterRole. The only write
+  permission is opt-in: `events.enabled` adds `create/patch` on `events.k8s.io` `events` in those
+  namespaces and the release namespace. API server TLS is always
   verified; there is no insecure option. The ServiceAccount token is re-read on rotation.
 - **etcd write access is the main risk**: whoever can write `<prefix>/` can redirect traffic.
   - Keep etcd on the private or cluster network only: a `ClusterIP` Service plus a NetworkPolicy
