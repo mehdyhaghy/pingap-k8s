@@ -1,20 +1,8 @@
-# Only Cargo.toml, Cargo.lock and src/ are needed to build the image.
-**/target/
-.git/
-.github/
-.checkpoint/
-.idea/
-.vscode/
-charts/
-deploy/
-tests/
-scripts/
-*.md
-Dockerfile
-.dockerignore
-Makefile
-**/*.pem
-**/*.key
-**/*.crt
-.env
-.env.*
+# Allowlist: only Cargo.toml, Cargo.lock and src/ are needed to build the image.
+*
+!Cargo.toml
+!Cargo.lock
+!src/
+src/**/*.pem
+src/**/*.key
+src/**/*.crt
