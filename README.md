@@ -416,6 +416,8 @@ pingap-k8s --check --config config.toml
 
 ## Pingap side
 
+- Tested with Pingap 0.16.1 (the quickstart default) on Kubernetes 1.35 and 1.37, IPv4 and
+  dual-stack; a weekly CI run checks Pingap `latest`.
 - Run Pingap with `--conf etcd://...` and `--autoreload`.
 - Create each owned upstream once, in the admin UI or by hand, with the fields you want (health
   check, timeouts, algorithm). Leave `discovery` empty (static). Or let the controller create a
