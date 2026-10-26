@@ -1,0 +1,59 @@
+# Helm values for the end-to-end harness (scripts/e2e-up.sh): the same shape as
+# charts/pingap-k8s/ci/quickstart-values.yaml (used alone, so its "quickstart"
+# upstream does not have to be removed). Release "pingap-k8s" in namespace
+# "pingap-k8s", so object names are pingap-k8s, pingap-k8s-etcd, pingap-k8s-pingap...
+#
+# The controller image is built locally and loaded into kind (never pulled).
+image:
+  repository: pingap-k8s
+  tag: e2e
+  pullPolicy: Never
+
+logLevel: "info,pingap_k8s=debug"
+
+etcd:
+  deploy: true
+  replicas: 1
+  # Keep the PVC: e2e test 8 stops etcd (scale to 0) and expects the data back.
+  persistence:
+    enabled: true
+    size: 1Gi
+
+pingap:
+  deploy: true
+  service:
+    # Only reached from inside the cluster (client pod in the app namespace).
+    type: ClusterIP
+  admin:
+    # Created by e2e-up.sh (keys user, password) before the install: the chart's
+    # own admin Secret template is not in the repository yet (see tasks/T10.md).
+    existingSecret: pingap-k8s-pingap-admin-e2e
+  seed:
+    enabled: true
+    # One listener, two locations: "/ws" goes to the WebSocket port of the echo
+    # pods, everything else to their HTTP port. Both upstreams follow the same
+    # Deployment and start with a placeholder address the controller replaces.
+    config: |
+      [servers.e2e]
+      addr = "0.0.0.0:8080"
+      locations = ["echo-ws", "echo"]
+
+      [locations.echo]
+      upstream = "echo"
+
+      [locations.echo-ws]
+      upstream = "echo-ws"
+      path = "/ws"
+
+      [upstreams.echo]
+      addrs = ["127.0.0.1:9"]
+
+      [upstreams.echo-ws]
+      addrs = ["127.0.0.1:9"]
+
+config:
+  upstreams:
+    echo:
+      services: ["echo.e2e-app:http"]
+    echo-ws:
+      services: ["echo.e2e-app:ws"]

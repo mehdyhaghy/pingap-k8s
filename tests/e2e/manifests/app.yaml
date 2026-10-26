@@ -1,0 +1,145 @@
+# Test application for the end-to-end harness (applied by scripts/e2e-up.sh).
+#
+# - echo: Deployment + Service. Each pod runs
+#     * agnhost netexec on 8080 (Service port "http"): GET /hostname returns the pod name;
+#     * jmalloc/echo-server on 8090 (Service port "ws"): a WebSocket upgrade on any path
+#       first sends "Request served by <pod name>", then echoes every message.
+#   preStop sleep as in the design notes, so a terminating pod keeps serving until Pingap has
+#   swapped it out.
+# - e2e-client: agnhost (has curl and sh) for single requests through Pingap.
+# - e2e-load: fortio for load generation (`fortio load ... -json -`).
+#
+# Images are pinned; bump them deliberately.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: e2e-app
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo
+  namespace: e2e-app
+  labels:
+    app: echo
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: echo
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: echo
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: http
+          image: registry.k8s.io/e2e-test-images/agnhost:2.66.1
+          args: ["netexec", "--http-port=8080", "--udp-port=-1"]
+          ports:
+            - name: http
+              containerPort: 8080
+          # Not /healthz: netexec reports 412 there while its UDP server is off.
+          readinessProbe:
+            httpGet:
+              path: /hostname
+              port: http
+            periodSeconds: 2
+            failureThreshold: 1
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+        - name: ws
+          image: jmalloc/echo-server:v0.3.7
+          env:
+            - name: PORT
+              value: "8090"
+          ports:
+            - name: ws
+              containerPort: 8090
+          readinessProbe:
+            tcpSocket:
+              port: ws
+            periodSeconds: 2
+            failureThreshold: 1
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo
+  namespace: e2e-app
+spec:
+  type: ClusterIP
+  selector:
+    app: echo
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+    - name: ws
+      port: 8090
+      targetPort: ws
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: e2e-client
+  namespace: e2e-app
+  labels:
+    app: e2e-client
+spec:
+  terminationGracePeriodSeconds: 1
+  containers:
+    - name: client
+      image: registry.k8s.io/e2e-test-images/agnhost:2.66.1
+      args: ["pause"]
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: e2e-load
+  namespace: e2e-app
+  labels:
+    app: e2e-load
+spec:
+  terminationGracePeriodSeconds: 1
+  containers:
+    - name: fortio
+      image: fortio/fortio:1.75.3
+      # Idle server; load runs are started with `kubectl exec ... fortio load`.
+      args: ["server", "-http-port", "8080", "-grpc-port", "disabled", "-redirect-port", "disabled"]
+      ports:
+        - name: http
+          containerPort: 8080
+      readinessProbe:
+        httpGet:
+          path: /debug
+          port: http
+        periodSeconds: 2
+      resources:
+        requests:
+          cpu: 50m
+          memory: 32Mi

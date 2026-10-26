@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Brings up the end-to-end environment on kind:
+#   - kind cluster $E2E_CLUSTER (node image $KIND_NODE_IMAGE when set);
+#   - the controller image built from the Dockerfile and loaded into kind;
+#   - namespace e2e-app with the echo Deployment/Service and the client pods
+#     (tests/e2e/manifests/app.yaml);
+#   - the Helm chart (release pingap-k8s, namespace pingap-k8s) with the bundled
+#     etcd and the quickstart Pingap (tests/e2e/values.yaml, a variant of
+#     charts/pingap-k8s/ci/quickstart-values.yaml), upstreams "echo" and "echo-ws"
+#     following echo.e2e-app.
+# Then writes target/e2e/state.env (KEY=VALUE, shell sourceable) and
+# target/e2e/kubeconfig for the tests (cargo test --test e2e).
+#
+# etcd, the Pingap admin and the metrics endpoint stay ClusterIP: the tests
+# reach them with `kubectl exec` from inside the cluster, never through a
+# host port.
+#
+# Env:
+#   E2E_CLUSTER          kind cluster name (default pk8s-e2e)
+#   KIND_NODE_IMAGE      kindest/node image (default: kind's default)
+#   E2E_IMAGE            controller image tag to build and load (default pingap-k8s:e2e)
+#   E2E_SKIP_BUILD=1     do not build the image (it must already exist locally)
+#   E2E_WAIT_CONTROLLER  1: also wait for the controller Deployment to be Ready
+#                        (default 0 while src/main.rs is a stub)
+#   E2E_TIMEOUT          per-wait timeout (default 300s)
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CLUSTER="${E2E_CLUSTER:-pk8s-e2e}"
+IMAGE="${E2E_IMAGE:-pingap-k8s:e2e}"
+TIMEOUT="${E2E_TIMEOUT:-300s}"
+WAIT_CONTROLLER="${E2E_WAIT_CONTROLLER:-0}"
+STATE_DIR="$ROOT/target/e2e"
+KUBECONFIG_FILE="$STATE_DIR/kubeconfig"
+STATE_FILE="$STATE_DIR/state.env"
+
+RELEASE=pingap-k8s
+NS=pingap-k8s
+APP_NS=e2e-app
+
+log() { printf '[e2e-up] %s\n' "$*" >&2; }
+
+for tool in kind docker kubectl helm; do
+  command -v "$tool" >/dev/null || { echo "missing tool: $tool" >&2; exit 1; }
+done
+
+mkdir -p "$STATE_DIR"
+rm -f "$STATE_FILE"
+export KUBECONFIG="$KUBECONFIG_FILE"
+
+# --- cluster -----------------------------------------------------------------
+if kind get clusters 2>/dev/null | grep -qx "$CLUSTER"; then
+  log "deleting leftover cluster $CLUSTER"
+  kind delete cluster --name "$CLUSTER" >/dev/null
+fi
+create_args=(--name "$CLUSTER" --kubeconfig "$KUBECONFIG_FILE" --wait 180s)
+if [[ -n "${KIND_NODE_IMAGE:-}" ]]; then
+  create_args+=(--image "$KIND_NODE_IMAGE")
+fi
+log "creating kind cluster $CLUSTER ${KIND_NODE_IMAGE:+($KIND_NODE_IMAGE)}"
+kind create cluster "${create_args[@]}"
+
+# --- controller image ----------------------------------------------------------
+if [[ "${E2E_SKIP_BUILD:-0}" != "1" ]]; then
+  log "building $IMAGE"
+  docker build -t "$IMAGE" "$ROOT"
+fi
+log "loading $IMAGE into kind"
+kind load docker-image "$IMAGE" --name "$CLUSTER"
+
+# --- test app (before the chart: its RoleBinding goes into e2e-app) -------------
+log "applying the test app"
+kubectl apply -f "$ROOT/tests/e2e/manifests/app.yaml"
+
+# --- chart --------------------------------------------------------------------
+# Pingap admin credentials (pingap.admin.existingSecret in tests/e2e/values.yaml).
+ADMIN_USER=admin
+ADMIN_PASSWORD=e2e-admin-password
+kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n "$NS" create secret generic "$RELEASE-pingap-admin-e2e" \
+  --from-literal=user="$ADMIN_USER" --from-literal=password="$ADMIN_PASSWORD" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+log "installing the chart"
+helm upgrade --install "$RELEASE" "$ROOT/charts/pingap-k8s" \
+  --namespace "$NS" --create-namespace \
+  -f "$ROOT/tests/e2e/values.yaml" \
+  --set "image.repository=${IMAGE%:*}" \
+  --set "image.tag=${IMAGE##*:}"
+
+# --- readiness ------------------------------------------------------------------
+log "waiting for etcd"
+kubectl -n "$NS" rollout status "statefulset/$RELEASE-etcd" --timeout "$TIMEOUT"
+log "waiting for Pingap"
+kubectl -n "$NS" rollout status "deployment/$RELEASE-pingap" --timeout "$TIMEOUT"
+log "waiting for the test app"
+kubectl -n "$APP_NS" rollout status deployment/echo --timeout "$TIMEOUT"
+kubectl -n "$APP_NS" wait --for=condition=Ready pod/e2e-client pod/e2e-load --timeout "$TIMEOUT"
+if [[ "$WAIT_CONTROLLER" == "1" ]]; then
+  log "waiting for the controller"
+  kubectl -n "$NS" rollout status "deployment/$RELEASE" --timeout "$TIMEOUT"
+else
+  log "not waiting for the controller (E2E_WAIT_CONTROLLER=0)"
+fi
+
+ETCD_POD="$(kubectl -n "$NS" get pod -l app.kubernetes.io/name=etcd,app.kubernetes.io/instance=$RELEASE \
+  -o jsonpath='{.items[0].metadata.name}')"
+
+# --- state file -----------------------------------------------------------------
+cat >"$STATE_FILE" <<EOF
+# Written by scripts/e2e-up.sh. In-cluster URLs are reached from the client pods.
+E2E_CLUSTER=$CLUSTER
+E2E_KUBECONFIG=$KUBECONFIG_FILE
+E2E_IMAGE=$IMAGE
+E2E_NODE_IMAGE=${KIND_NODE_IMAGE:-}
+E2E_RELEASE=$RELEASE
+E2E_NAMESPACE=$NS
+E2E_APP_NAMESPACE=$APP_NS
+E2E_CONTROLLER_DEPLOYMENT=$RELEASE
+E2E_CONTROLLER_REPLICAS=2
+E2E_CONTROLLER_METRICS_URL=http://$RELEASE-metrics.$NS.svc:9090
+E2E_ETCD_STATEFULSET=$RELEASE-etcd
+E2E_ETCD_POD=$ETCD_POD
+E2E_ETCD_PREFIX=/pingap
+E2E_PINGAP_DEPLOYMENT=$RELEASE-pingap
+E2E_PINGAP_SERVICE=$RELEASE-pingap
+E2E_PINGAP_URL=http://$RELEASE-pingap.$NS.svc:80
+E2E_PINGAP_ADMIN_URL=http://$RELEASE-pingap-admin.$NS.svc:3018
+E2E_PINGAP_ADMIN_USER=$ADMIN_USER
+E2E_PINGAP_ADMIN_PASSWORD=$ADMIN_PASSWORD
+E2E_PINGAP_WS_PATH=/ws
+E2E_UPSTREAM=echo
+E2E_WS_UPSTREAM=echo-ws
+E2E_ECHO_DEPLOYMENT=echo
+E2E_ECHO_SERVICE=echo
+E2E_CLIENT_POD=e2e-client
+E2E_LOAD_POD=e2e-load
+EOF
+log "state written to $STATE_FILE"
+log "run the tests: PINGAP_K8S_E2E=1 cargo test --test e2e -- --test-threads=1"

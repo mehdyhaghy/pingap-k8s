@@ -88,3 +88,73 @@ jobs:
           tags: pingap-k8s:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  e2e:
+    name: e2e (kind ${{ matrix.node }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest supported Kubernetes and the newest kindest/node.
+        node:
+          - kindest/node:v1.32.11
+          - kindest/node:v1.37.0
+    env:
+      KIND_VERSION: v0.33.0
+      KIND_NODE_IMAGE: ${{ matrix.node }}
+      E2E_IMAGE: pingap-k8s:e2e
+      # Built below with the gha cache; e2e-up.sh only loads it into kind.
+      E2E_SKIP_BUILD: "1"
+      # Kept until teardown so a failure can be inspected in the next step.
+      E2E_KEEP: "1"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Install kind
+        run: |
+          curl -fsSLo kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          chmod +x kind
+          sudo mv kind /usr/local/bin/kind
+          kind version
+          kubectl version --client
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: build controller image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.E2E_IMAGE }}
+          cache-from: type=gha
+
+      - name: e2e
+        run: scripts/e2e-run.sh
+
+      - name: diagnostics
+        if: failure()
+        run: |
+          export KUBECONFIG=target/e2e/kubeconfig
+          kubectl get pods -A -o wide || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -50 || true
+          kubectl -n pingap-k8s logs -l app.kubernetes.io/instance=pingap-k8s --all-containers --prefix --tail=200 || true
+
+      - name: teardown
+        if: always()
+        run: scripts/e2e-down.sh
