@@ -49,6 +49,7 @@ resources is planned for later phases.
 - [Observability](#observability)
   - [Telemetry](#telemetry)
 - [Security](#security)
+- [Performance](#performance)
 - [Limitations](#limitations)
 - [Development](#development)
 - [License](#license)
@@ -744,6 +745,10 @@ Service), never a public address. Use `https://` for TLS (system roots).
 - **Hardened pods**: non-root (UID 65532), read-only root filesystem, no privilege escalation, all
   capabilities dropped, `RuntimeDefault` seccomp, for the controller, the bundled etcd and the
   quickstart Pingap. The controller image is distroless (no shell).
+
+## Performance
+
+At 50 upstreams × 20 endpoints: event-to-write p50 0.52 s (the 500 ms debounce), ~30 MB controller RSS, one etcd revision per write; see [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Limitations
 
