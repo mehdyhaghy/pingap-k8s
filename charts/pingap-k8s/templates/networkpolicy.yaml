@@ -1,0 +1,37 @@
+{{- /*
+Optional: restrict who can reach the controller's metrics/health port. Only the
+listed sources may scrape it. Kubelet probes are not affected: traffic from the
+node to its own pods is always allowed by NetworkPolicy. Egress is not limited
+(the controller needs the API server, etcd and, if set, the OTLP collector).
+*/ -}}
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pingap-k8s.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pingap-k8s.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "pingap-k8s.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  {{- if not (or .Values.networkPolicy.metricsFrom .Values.networkPolicy.allowSameNamespace) }}
+  # No sources listed: nothing may reach the metrics port (probes still work).
+  ingress: []
+  {{- else }}
+  ingress:
+    - from:
+        {{- if .Values.networkPolicy.allowSameNamespace }}
+        - podSelector: {}
+        {{- end }}
+        {{- with .Values.networkPolicy.metricsFrom }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      ports:
+        - port: {{ .Values.metricsPort }}
+          protocol: TCP
+  {{- end }}
+{{- end }}
