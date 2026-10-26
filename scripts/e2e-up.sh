@@ -2,12 +2,13 @@
 # Brings up the end-to-end environment on kind:
 #   - kind cluster $E2E_CLUSTER (node image $KIND_NODE_IMAGE when set);
 #   - the controller image built from the Dockerfile and loaded into kind;
-#   - namespace e2e-app with the echo Deployment/Service and the client pods
-#     (tests/e2e/manifests/app.yaml);
+#   - namespace e2e-app with the echo, podinfo (gRPC) and httpbin (SSE)
+#     Deployments/Services and the client pods (tests/e2e/manifests/app.yaml);
 #   - the Helm chart (release pingap-k8s, namespace pingap-k8s) with the bundled
 #     etcd and the quickstart Pingap (tests/e2e/values.yaml, a variant of
 #     charts/pingap-k8s/ci/quickstart-values.yaml), upstreams "echo" and "echo-ws"
-#     following echo.e2e-app.
+#     following echo.e2e-app, "grpc" following podinfo.e2e-app and "httpbin"
+#     following httpbin.e2e-app.
 # Then writes target/e2e/state.env (KEY=VALUE, shell sourceable) and
 # target/e2e/kubeconfig for the tests (cargo test --test e2e).
 #
@@ -86,7 +87,8 @@ if [[ "${E2E_PRELOAD:-1}" == "1" ]]; then
   platform="linux/$(docker version -f '{{.Server.Arch}}')"
   for img in quay.io/coreos/etcd:v3.6.12 vicanso/pingap:0.16.1 \
       registry.k8s.io/e2e-test-images/agnhost:2.66.1 jmalloc/echo-server:v0.3.7 \
-      fortio/fortio:1.75.3; do
+      fortio/fortio:1.75.3 ghcr.io/stefanprodan/podinfo:6.15.0 \
+      mccutchen/go-httpbin:2.25.0; do
     if docker image inspect "$img" >/dev/null 2>&1; then
       log "preloading $img ($platform)"
       docker save "$img" | docker exec -i "$node" \
@@ -150,6 +152,8 @@ log "waiting for Pingap"
 kubectl -n "$NS" rollout status "deployment/$RELEASE-pingap" --timeout "$TIMEOUT"
 log "waiting for the test app"
 kubectl -n "$APP_NS" rollout status deployment/echo --timeout "$TIMEOUT"
+kubectl -n "$APP_NS" rollout status deployment/podinfo --timeout "$TIMEOUT"
+kubectl -n "$APP_NS" rollout status deployment/httpbin --timeout "$TIMEOUT"
 kubectl -n "$APP_NS" wait --for=condition=Ready pod/e2e-client pod/e2e-load --timeout "$TIMEOUT"
 if [[ "$WAIT_CONTROLLER" == "1" ]]; then
   log "waiting for the controller"

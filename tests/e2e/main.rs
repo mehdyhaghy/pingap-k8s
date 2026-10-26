@@ -17,10 +17,13 @@
 //!   etcd StatefulSet `pingap-k8s-etcd`, Pingap Deployment/Service `pingap-k8s-pingap`,
 //!   admin Service `pingap-k8s-pingap-admin`), all ClusterIP;
 //! - namespace `e2e-app`: Deployment/Service `echo` (3 replicas; port "http" = agnhost
-//!   netexec, port "ws" = WebSocket echo), client pods `e2e-client` (curl) and `e2e-load`
-//!   (fortio);
-//! - Pingap: listener 8080, location `/ws` -> upstream `echo-ws`, everything else ->
-//!   upstream `echo`; the controller owns both (`echo.e2e-app:http`, `echo.e2e-app:ws`).
+//!   netexec, port "ws" = WebSocket echo), `podinfo` (3 replicas, port "grpc", h2c) and
+//!   `httpbin` (2 replicas, port "http", go-httpbin), client pods `e2e-client` (curl) and
+//!   `e2e-load` (fortio);
+//! - Pingap: listener 8080, location `/ws` -> upstream `echo-ws`, `/sse` -> upstream
+//!   `httpbin`, everything else -> upstream `echo`; listener 8081 (h2c, reached by pod IP)
+//!   -> upstream `grpc`. The controller owns all four (`echo.e2e-app:http`,
+//!   `echo.e2e-app:ws`, `httpbin.e2e-app:http`, `podinfo.e2e-app:grpc`).
 //!
 //! Helpers: [`k8s`] (scale, rollout, waits, pods, Role), [`etcd`] (etcdctl in the etcd pod),
 //! [`pingap`] (curl from the client pod, admin API), [`load`] (fortio), [`ws`] (WebSocket
@@ -28,8 +31,8 @@
 //! (per-pod metrics, leader, logs, config), [`track`] (timestamped etcd watch, request
 //! loop and pod tracker for the timing tests).
 //!
-//! The e2e integration tests 1–11 are in [`spec`] (`spec::e2e_01_initial_sync` ...
-//! `spec::e2e_11_quickstart_install`); filter with e.g. `scripts/e2e-run.sh e2e_04`.
+//! The e2e integration tests 1–13 are in [`spec`] (`spec::e2e_01_initial_sync` ...
+//! `spec::e2e_13_sse_stream`); filter with e.g. `scripts/e2e-run.sh e2e_04`.
 
 // Helpers are shared with the e2e tests (T12); not every one is used by every test.
 #![allow(dead_code)]

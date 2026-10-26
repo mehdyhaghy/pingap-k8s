@@ -30,9 +30,13 @@ pingap:
     existingSecret: pingap-k8s-pingap-admin-e2e
   seed:
     enabled: true
-    # One listener, two locations: "/ws" goes to the WebSocket port of the echo
-    # pods, everything else to their HTTP port. Both upstreams follow the same
-    # Deployment and start with a placeholder address the controller replaces.
+    # Listener 8080: "/ws" goes to the WebSocket port of the echo pods, "/sse" to
+    # the httpbin pods (e2e test 13), everything else to the echo HTTP port.
+    # Listener 8081 (e2e test 12): HTTP/2 without TLS (h2c, enabled_h2) for gRPC,
+    # every path to the podinfo gRPC port over h2c (alpn "H2"), with a gRPC health
+    # check. A separate listener, so the HTTP/1 tests on 8080 are unaffected; the
+    # test reaches it by Pingap pod IP (the chart's Service has one port).
+    # Every upstream starts with a placeholder address the controller replaces.
     config: |
       # Same shutdown budget as the chart default seed: preStop 15s + 30s + 10s < 60s.
       [basic]
@@ -41,7 +45,12 @@ pingap:
 
       [servers.e2e]
       addr = "[::]:8080"
-      locations = ["echo-ws", "echo"]
+      locations = ["echo-ws", "httpbin-sse", "echo"]
+
+      [servers.grpc]
+      addr = "[::]:8081"
+      enabled_h2 = true
+      locations = ["grpc"]
 
       [locations.echo]
       upstream = "echo"
@@ -50,11 +59,27 @@ pingap:
       upstream = "echo-ws"
       path = "/ws"
 
+      [locations.httpbin-sse]
+      upstream = "httpbin"
+      path = "/sse"
+
+      [locations.grpc]
+      upstream = "grpc"
+
       [upstreams.echo]
       addrs = ["127.0.0.1:9"]
 
       [upstreams.echo-ws]
       addrs = ["127.0.0.1:9"]
+
+      [upstreams.httpbin]
+      addrs = ["127.0.0.1:9"]
+
+      [upstreams.grpc]
+      addrs = ["127.0.0.1:9"]
+      alpn = "H2"
+      max_h2_streams = 100
+      health_check = "grpc://podinfo?service=podinfo&connection_timeout=2s&read_timeout=2s&check_frequency=5s"
 
 config:
   upstreams:
@@ -62,3 +87,7 @@ config:
       services: ["echo.e2e-app:http"]
     echo-ws:
       services: ["echo.e2e-app:ws"]
+    httpbin:
+      services: ["httpbin.e2e-app:http"]
+    grpc:
+      services: ["podinfo.e2e-app:grpc"]

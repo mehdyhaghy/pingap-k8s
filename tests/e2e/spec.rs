@@ -1,4 +1,4 @@
-//! e2e "Integration", tests 1–11, one test function each.
+//! e2e "Integration", tests 1–13, one test function each.
 //!
 //! Every test starts from the same baseline ([`baseline`]: etcd up, both controller
 //! replicas rolled out, echo at 3 replicas with no pod terminating, both upstreams equal to
@@ -13,7 +13,7 @@
 //! client pod ([`track::Traffic`]). Each test prints its numbers on lines starting with
 //! `[e2e_NN]`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
@@ -1852,4 +1852,596 @@ async fn e2e_11_quickstart_install() {
         qs_cleanup(&env),
     )
     .await;
+}
+
+// ---------------------------------------------------------------------------------------
+// Apps behind the gRPC and SSE upstreams (tests 12 and 13).
+// ---------------------------------------------------------------------------------------
+
+/// Ready pod IPs of `selector`.
+async fn app_ready_ips(env: &Env, selector: &str) -> anyhow::Result<Vec<String>> {
+    k8s::ready_pod_ips(&env.client, &env.app_namespace, selector).await
+}
+
+/// Waits for `upstream` to hold exactly the ready pods of `selector` on `port`.
+async fn wait_app_converged(
+    env: &Env,
+    selector: &str,
+    upstream: &str,
+    port: u16,
+    timeout: Duration,
+) -> anyhow::Result<Vec<String>> {
+    wait_for(
+        &format!("upstream {upstream} equal to the ready {selector} pods"),
+        timeout,
+        Duration::from_millis(200),
+        || async {
+            let ips = app_ready_ips(env, selector).await?;
+            if ips.is_empty() {
+                return Ok(None);
+            }
+            let addrs = env.etcd.upstream_addrs(upstream).await?;
+            Ok((addrs == Some(with_port(&ips, port))).then_some(ips))
+        },
+    )
+    .await
+}
+
+/// [`scale_echo`] for another Deployment of the test app and its upstream.
+async fn scale_app(
+    env: &Env,
+    deployment: &str,
+    selector: &str,
+    replicas: i32,
+    upstream: &str,
+    port: u16,
+) -> anyhow::Result<Vec<String>> {
+    k8s::scale_deployment(&env.client, &env.app_namespace, deployment, replicas).await?;
+    k8s::wait_deployment_rolled_out(&env.client, &env.app_namespace, deployment, ROLLOUT).await?;
+    wait_for(
+        &format!("only the wanted {deployment} pods left"),
+        ROLLOUT,
+        Duration::from_millis(250),
+        || async {
+            let pods = k8s::pods(&env.client, &env.app_namespace, selector).await?;
+            Ok((pods.len() == replicas as usize).then_some(()))
+        },
+    )
+    .await?;
+    wait_app_converged(env, selector, upstream, port, CONVERGE).await
+}
+
+// ---------------------------------------------------------------------------------------
+// 12. gRPC: per-request balancing over one client connection, and a new pod's first call.
+// ---------------------------------------------------------------------------------------
+
+const PODINFO_DEPLOYMENT: &str = "podinfo";
+const PODINFO_SELECTOR: &str = "app=podinfo";
+const PODINFO_REPLICAS: i32 = 3;
+/// Owned upstream following podinfo's "grpc" port (tests/e2e/values.yaml).
+const GRPC_UPSTREAM: &str = "grpc";
+/// podinfo container gRPC port.
+const GRPC_PORT: u16 = 9999;
+/// Pingap's h2c listener for gRPC (seed `[servers.grpc]`), reached by pod IP.
+const PINGAP_GRPC_PORT: u16 = 8081;
+/// gRPC calls per batch while waiting for the new pod (test 12).
+const GRPC_BATCH: usize = 20;
+/// Slack on top of [`SYNC_BUDGET`] for test 12: the first call to the new pod is timed at
+/// the end of its batch, one `kubectl exec` round trip after it was answered.
+const GRPC_SLACK: f64 = 1.0;
+
+/// Unary gRPC calls made by curl over HTTP/2 without TLS (prior knowledge): every call
+/// of one invocation goes over the same connection, which curl reports per transfer
+/// (`local_port`, and `num_connects` 0 when reused). The request is an empty message,
+/// which `info.InfoService/Info` takes. Prints one line per call: `<local port> <http
+/// status> <http version> <new connects> <body>`, the body with everything but
+/// `[A-Za-z0-9.-]` blanked (podinfo's InfoResponse starts with the pod name).
+const GRPC_CALLS_SCRIPT: &str = r#"url=$1; n=$2; d=$(mktemp -d); head -c 5 /dev/zero > "$d/req"
+set --
+i=1; while [ "$i" -le "$n" ]; do set -- "$@" -o "$d/$i" "$url"; i=$((i+1)); done
+curl -sS -m 10 --http2-prior-knowledge -H 'content-type: application/grpc' -H 'te: trailers' \
+  --data-binary "@$d/req" -w '%{local_port} %{http_code} %{http_version} %{num_connects}\n' \
+  "$@" > "$d/w"
+rc=$?
+i=1; while read -r line; do echo "$line $(tr -c 'A-Za-z0-9.-' ' ' < "$d/$i" 2>/dev/null)"; i=$((i+1)); done < "$d/w"
+rm -rf "$d"; exit $rc"#;
+
+/// One call of [`grpc_calls`].
+#[derive(Debug, Clone)]
+struct GrpcCall {
+    local_port: u16,
+    status: u16,
+    http_version: String,
+    connects: u32,
+    /// The podinfo pod that answered (a `podinfo-` word of the body).
+    host: Option<String>,
+}
+
+fn parse_grpc_calls(stdout: &str) -> Vec<GrpcCall> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            let local_port = words.next()?.parse().ok()?;
+            let status = words.next()?.parse().ok()?;
+            let http_version = words.next()?.to_string();
+            let connects = words.next()?.parse().ok()?;
+            let host = words
+                .find(|w| w.starts_with("podinfo-"))
+                .map(str::to_string);
+            Some(GrpcCall {
+                local_port,
+                status,
+                http_version,
+                connects,
+                host,
+            })
+        })
+        .collect()
+}
+
+/// `n` calls of `url` from the client pod in one curl invocation ([`GRPC_CALLS_SCRIPT`]).
+async fn grpc_calls(env: &Env, url: &str, n: usize) -> anyhow::Result<Vec<GrpcCall>> {
+    let n = n.to_string();
+    let out = env
+        .kubectl
+        .exec(
+            &env.app_namespace,
+            &env.pingap.client_pod,
+            None,
+            &["sh", "-c", GRPC_CALLS_SCRIPT, "sh", url, &n],
+        )
+        .await?;
+    let calls = parse_grpc_calls(&out.stdout);
+    if calls.is_empty() {
+        anyhow::bail!(
+            "no gRPC call completed: {:?} {:?}",
+            out.stdout,
+            out.stderr.trim()
+        );
+    }
+    Ok(calls)
+}
+
+/// `http://<Pingap pod IP>:8081`: the chart's Pingap Service exposes one port only.
+async fn pingap_grpc_base(env: &Env) -> anyhow::Result<String> {
+    let release = controller::release(env);
+    let pods = k8s::pods(&env.client, &env.namespace, &k8s::pingap_selector(&release)).await?;
+    let ip = pods
+        .iter()
+        .find(|p| p.ready && !p.terminating)
+        .and_then(|p| p.ip.clone())
+        .ok_or_else(|| anyhow::anyhow!("no ready Pingap pod: {pods:?}"))?;
+    let host = if ip.contains(':') {
+        format!("[{ip}]")
+    } else {
+        ip
+    };
+    Ok(format!("http://{host}:{PINGAP_GRPC_PORT}"))
+}
+
+/// Where [`WATCH_SCRIPT`] writes the messages of its stream, in the client pod.
+const WATCH_FILE: &str = "/tmp/e2e-grpc-watch";
+/// A `grpc.health.v1.Health/Watch` call through Pingap (server streaming: podinfo answers
+/// SERVING at once and keeps the stream open), its messages written to `$2`. Prints
+/// `START`, then `EXIT <curl status>` when the call ends.
+const WATCH_SCRIPT: &str = r#"f=$2; rm -f "$f"; head -c 5 /dev/zero > "$f.req"; echo START
+curl -sS -N -m 120 --http2-prior-knowledge -H 'content-type: application/grpc' -H 'te: trailers' \
+  --data-binary "@$f.req" -o "$f" "$1/grpc.health.v1.Health/Watch"
+echo "EXIT $?""#;
+
+/// The SERVING `HealthCheckResponse` in a gRPC frame, as `od -An -tx1` prints it.
+const WATCH_SERVING: &str = "00 00 00 00 02 08 01";
+
+/// e2e test 12. podinfo (3 replicas) serves gRPC behind Pingap's h2c listener
+/// (upstream `grpc`: alpn H2, gRPC health check). 60 unary `info.InfoService/Info` calls
+/// over one client connection must reach all three pods: HTTP/2 multiplexes the calls on
+/// one connection, so only per-request balancing spreads them. Then, with a
+/// `Health/Watch` stream open through Pingap, podinfo is scaled to 4: the new pod must
+/// answer calls within 3 s of Ready (plus [`GRPC_SLACK`]), no call may fail, and the
+/// stream must still be open after the `addrs` rewrite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_12_grpc_per_request_balancing() {
+    const T: &str = "e2e_12";
+    let Some(env) = Env::setup("e2e_12_grpc_per_request_balancing").await else {
+        return;
+    };
+    baseline(&env).await;
+    scale_app(
+        &env,
+        PODINFO_DEPLOYMENT,
+        PODINFO_SELECTOR,
+        PODINFO_REPLICAS,
+        GRPC_UPSTREAM,
+        GRPC_PORT,
+    )
+    .await
+    .expect("podinfo baseline");
+    let base = pingap_grpc_base(&env).await.unwrap();
+    let info = format!("{base}/info.InfoService/Info");
+
+    guarded(
+        async {
+            wait_for(
+                "a gRPC answer through Pingap",
+                Duration::from_secs(60),
+                Duration::from_secs(1),
+                || async {
+                    let calls = grpc_calls(&env, &info, 1).await?;
+                    Ok(calls[0].host.clone())
+                },
+            )
+            .await
+            .unwrap();
+
+            // Per-request balancing over one connection.
+            let names: BTreeSet<String> =
+                k8s::pods(&env.client, &env.app_namespace, PODINFO_SELECTOR)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|p| p.name)
+                    .collect();
+            let calls = grpc_calls(&env, &info, 60).await.unwrap();
+            let mut by_host: BTreeMap<String, usize> = BTreeMap::new();
+            for c in &calls {
+                let key = c
+                    .host
+                    .clone()
+                    .unwrap_or_else(|| format!("status {}", c.status));
+                *by_host.entry(key).or_default() += 1;
+            }
+            let ports: BTreeSet<u16> = calls.iter().map(|c| c.local_port).collect();
+            let connects: u32 = calls.iter().map(|c| c.connects).sum();
+            println!(
+                "[{T}] {} calls over {} connection(s) (local ports {ports:?}, {connects} connect(s)): {by_host:?}",
+                calls.len(),
+                ports.len()
+            );
+            assert_eq!(calls.len(), 60, "{calls:?}");
+            assert!(
+                calls
+                    .iter()
+                    .all(|c| c.status == 200 && c.http_version == "2" && c.host.is_some()),
+                "{calls:?}"
+            );
+            assert_eq!(ports.len(), 1, "not one client connection: {calls:?}");
+            assert_eq!(connects, 1, "not one client connection: {calls:?}");
+            let answered: BTreeSet<String> = by_host.keys().cloned().collect();
+            assert_eq!(answered, names, "pods that answered vs podinfo pods");
+
+            // A server stream open through Pingap during the scale-up.
+            let watch = track::LineStream::exec(
+                &env.kubectl,
+                &env.app_namespace,
+                &env.pingap.client_pod,
+                None,
+                &["sh", "-c", WATCH_SCRIPT, "sh", &base, WATCH_FILE],
+            )
+            .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+
+            // Scale to 4: time from the new pod's Ready to its first call.
+            let tracker = PodTracker::start(&env.client, &env.app_namespace, PODINFO_SELECTOR)
+                .await
+                .unwrap();
+            k8s::scale_deployment(&env.client, &env.app_namespace, PODINFO_DEPLOYMENT, 4)
+                .await
+                .unwrap();
+            let deadline = tokio::time::Instant::now() + ROLLOUT;
+            let mut failed: Vec<GrpcCall> = Vec::new();
+            let mut batches = 0;
+            let (name, seen, started, answered_at) = loop {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "no call reached a new podinfo pod: {:?}",
+                    tracker.snapshot()
+                );
+                let Some((name, seen)) = tracker.new_ready().into_iter().next() else {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                };
+                let started = SystemTime::now();
+                let calls = grpc_calls(&env, &info, GRPC_BATCH)
+                    .await
+                    .expect("gRPC calls during the scale-up");
+                let at = SystemTime::now();
+                batches += 1;
+                failed.extend(
+                    calls
+                        .iter()
+                        .filter(|c| c.status != 200 || c.host.is_none())
+                        .cloned(),
+                );
+                if calls.iter().any(|c| c.host.as_deref() == Some(name.as_str())) {
+                    break (name, seen, started, at);
+                }
+            };
+            let ready = seen.ready.unwrap();
+            let d = track::secs_between(answered_at, ready);
+            let d_start = track::secs_between(started, ready);
+            let dt = track::secs_between(answered_at, seen.ready_transition.unwrap());
+            println!(
+                "[{T}] new pod {name}: first call answered {} after Ready seen (its batch started {} after), {} after Ready lastTransitionTime; {batches} batch(es), {} failed call(s)",
+                s(d),
+                s(d_start),
+                s(dt),
+                failed.len()
+            );
+            assert!(failed.is_empty(), "failed calls: {failed:?}");
+            assert!(
+                d <= SYNC_BUDGET + GRPC_SLACK,
+                "{} > {SYNC_BUDGET}s + {GRPC_SLACK}s",
+                s(d)
+            );
+            wait_app_converged(&env, PODINFO_SELECTOR, GRPC_UPSTREAM, GRPC_PORT, CONVERGE)
+                .await
+                .unwrap();
+
+            // The stream got its first message and is still open after the rewrite.
+            let lines = watch.lines();
+            assert!(
+                lines.iter().any(|(_, l)| l == "START")
+                    && !lines.iter().any(|(_, l)| l.starts_with("EXIT")),
+                "Health/Watch stream ended during the scale-up: {lines:?}"
+            );
+            let dump = env
+                .kubectl
+                .exec(
+                    &env.app_namespace,
+                    &env.pingap.client_pod,
+                    None,
+                    &["od", "-An", "-tx1", WATCH_FILE],
+                )
+                .await
+                .unwrap();
+            let bytes = dump.stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+            println!(
+                "[{T}] Health/Watch stream still open after the rewrite; received {bytes:?}"
+            );
+            assert!(bytes.starts_with(WATCH_SERVING), "watch received {bytes:?}");
+            drop(watch.stop());
+        },
+        async {
+            let _ = env
+                .kubectl
+                .exec(
+                    &env.app_namespace,
+                    &env.pingap.client_pod,
+                    None,
+                    &["sh", "-c", "pkill -f Health/Watch; true"],
+                )
+                .await;
+            scale_app(
+                &env,
+                PODINFO_DEPLOYMENT,
+                PODINFO_SELECTOR,
+                PODINFO_REPLICAS,
+                GRPC_UPSTREAM,
+                GRPC_PORT,
+            )
+            .await
+            .map(|_| ())
+        },
+    )
+    .await;
+}
+
+// ---------------------------------------------------------------------------------------
+// 13. Server-sent events: streamed incrementally, and survive an addrs rewrite.
+// ---------------------------------------------------------------------------------------
+
+const HTTPBIN_DEPLOYMENT: &str = "httpbin";
+const HTTPBIN_SELECTOR: &str = "app=httpbin";
+const HTTPBIN_REPLICAS: i32 = 2;
+/// Owned upstream following httpbin's "http" port; Pingap routes `/sse` to it.
+const HTTPBIN_UPSTREAM: &str = "httpbin";
+const HTTPBIN_PORT: u16 = 8080;
+/// go-httpbin `/sse?count=..&duration=..`: one event per second for 30 s (31 events,
+/// the first at once).
+const SSE_EVENTS: usize = 31;
+const SSE_SECS: u64 = 30;
+/// Largest gap allowed between two events as they arrive (they are sent 1 s apart):
+/// a buffering proxy would deliver them in bursts.
+const SSE_MAX_GAP: f64 = 2.5;
+
+/// `data: {"id":N,"timestamp":...}` lines of a go-httpbin event stream: (arrival, id).
+fn sse_events(lines: &[(SystemTime, String)]) -> Vec<(SystemTime, u64)> {
+    lines
+        .iter()
+        .filter_map(|(at, l)| {
+            let data = l.strip_prefix("data: ")?;
+            let v: Value = k8s_openapi::serde_json::from_str(data).ok()?;
+            Some((*at, v.get("id")?.as_u64()?))
+        })
+        .collect()
+}
+
+/// e2e test 13. A 30 s server-sent event stream (go-httpbin `/sse`, one event per
+/// second) through Pingap's HTTP listener (location `/sse`, upstream `httpbin`). Five
+/// seconds in, httpbin is scaled 2 -> 3 (the controller rewrites the upstream's `addrs`).
+/// The events must arrive one by one as sent (no gap over [`SSE_MAX_GAP`], first to last
+/// spread over most of the 30 s), some before and some after the rewrite, and the stream
+/// must complete with every event and a clean end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_13_sse_stream() {
+    const T: &str = "e2e_13";
+    let Some(env) = Env::setup("e2e_13_sse_stream").await else {
+        return;
+    };
+    baseline(&env).await;
+    scale_app(
+        &env,
+        HTTPBIN_DEPLOYMENT,
+        HTTPBIN_SELECTOR,
+        HTTPBIN_REPLICAS,
+        HTTPBIN_UPSTREAM,
+        HTTPBIN_PORT,
+    )
+    .await
+    .expect("httpbin baseline");
+
+    guarded(
+        async {
+            wait_for(
+                "an event stream through Pingap",
+                Duration::from_secs(60),
+                Duration::from_secs(1),
+                || async {
+                    let r = env.pingap.get("/sse?count=1&duration=1s", &[]).await?;
+                    Ok((r.status == 200 && r.body.contains("event: ping")).then_some(()))
+                },
+            )
+            .await
+            .unwrap();
+
+            let script = format!(
+                "echo START; curl -sS -N -m 90 '{}/sse?count={SSE_EVENTS}&duration={SSE_SECS}s'; echo \"EXIT $?\"",
+                env.pingap.url
+            );
+            let stream = track::LineStream::exec(
+                &env.kubectl,
+                &env.app_namespace,
+                &env.pingap.client_pod,
+                None,
+                &["sh", "-c", &script],
+            )
+            .unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+
+            let watch = AddrsWatch::start(&env, HTTPBIN_UPSTREAM).await.unwrap();
+            k8s::scale_deployment(
+                &env.client,
+                &env.app_namespace,
+                HTTPBIN_DEPLOYMENT,
+                HTTPBIN_REPLICAS + 1,
+            )
+            .await
+            .unwrap();
+            let ips = wait_for(
+                "the third httpbin pod in the upstream",
+                ROLLOUT,
+                Duration::from_millis(200),
+                || async {
+                    let ips = app_ready_ips(&env, HTTPBIN_SELECTOR).await?;
+                    let addrs = env.etcd.upstream_addrs(HTTPBIN_UPSTREAM).await?;
+                    Ok((ips.len() == HTTPBIN_REPLICAS as usize + 1
+                        && addrs == Some(with_port(&ips, HTTPBIN_PORT)))
+                    .then_some(ips))
+                },
+            )
+            .await
+            .unwrap();
+            let want = with_port(&ips, HTTPBIN_PORT);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let rewrite = watch
+                .changes()
+                .into_iter()
+                .skip(1)
+                .find(|c| c.addrs.as_ref() == Some(&want))
+                .map(|c| c.at)
+                .expect("the rewrite on the etcd watch");
+
+            let end = wait_for(
+                "the event stream to end",
+                Duration::from_secs(90),
+                Duration::from_millis(250),
+                || async {
+                    Ok(stream
+                        .lines()
+                        .into_iter()
+                        .find(|(_, l)| l.starts_with("EXIT "))
+                        .map(|(_, l)| l))
+                },
+            )
+            .await
+            .unwrap();
+            let lines = stream.stop();
+            let events = sse_events(&lines);
+            assert!(!events.is_empty(), "no events: {lines:?}");
+            let ids: Vec<u64> = events.iter().map(|(_, id)| *id).collect();
+            let (first, last) = (events[0].0, events[events.len() - 1].0);
+            let spread = track::secs_between(last, first);
+            let max_gap = events
+                .windows(2)
+                .map(|w| track::secs_between(w[1].0, w[0].0))
+                .fold(0.0, f64::max);
+            let before = events.iter().filter(|(at, _)| *at < rewrite).count();
+            let after = events.len() - before;
+            println!(
+                "[{T}] {} events over {} (largest gap {}); addrs rewritten {} into the stream, {before} events before and {after} after; {end}",
+                events.len(),
+                s(spread),
+                s(max_gap),
+                s(track::secs_between(rewrite, first))
+            );
+            assert_eq!(end, "EXIT 0", "stream did not end cleanly: {lines:?}");
+            assert_eq!(
+                ids,
+                (0..SSE_EVENTS as u64).collect::<Vec<_>>(),
+                "events: {lines:?}"
+            );
+            assert!(
+                max_gap <= SSE_MAX_GAP,
+                "events not streamed one by one: gap {} > {SSE_MAX_GAP}s",
+                s(max_gap)
+            );
+            assert!(
+                spread >= SSE_SECS as f64 * 0.75,
+                "events arrived within {}, not spread over the stream",
+                s(spread)
+            );
+            assert!(
+                before >= 2 && after >= 2,
+                "the rewrite was not during the stream ({before} events before, {after} after)"
+            );
+        },
+        async {
+            scale_app(
+                &env,
+                HTTPBIN_DEPLOYMENT,
+                HTTPBIN_SELECTOR,
+                HTTPBIN_REPLICAS,
+                HTTPBIN_UPSTREAM,
+                HTTPBIN_PORT,
+            )
+            .await
+            .map(|_| ())
+        },
+    )
+    .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_grpc_calls() {
+        let calls = parse_grpc_calls(
+            "41000 200 2 1      podinfo-5d8f7c9b4-x2x9z  6.15.0  linux\n\
+             41000 200 2 0  podinfo-5d8f7c9b4-abcde\n\
+             41000 503 2 0 \n\
+             garbage\n",
+        );
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].host.as_deref(), Some("podinfo-5d8f7c9b4-x2x9z"));
+        assert_eq!((calls[0].local_port, calls[0].connects), (41000, 1));
+        assert_eq!(calls[1].connects, 0);
+        assert_eq!((calls[2].status, calls[2].host.as_deref()), (503, None));
+    }
+
+    #[test]
+    fn parses_sse_events() {
+        let t = SystemTime::UNIX_EPOCH;
+        let lines = vec![
+            (t, "event: ping".to_string()),
+            (t, r#"data: {"id":0,"timestamp":1700000000000}"#.to_string()),
+            (t, String::new()),
+            (t, r#"data: {"id":1,"timestamp":1700000001000}"#.to_string()),
+            (t, "EXIT 0".to_string()),
+        ];
+        let ids: Vec<u64> = sse_events(&lines).into_iter().map(|(_, id)| id).collect();
+        assert_eq!(ids, vec![0, 1]);
+    }
 }

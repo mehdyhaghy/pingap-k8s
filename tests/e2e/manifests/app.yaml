@@ -6,7 +6,12 @@
 #       first sends "Request served by <pod name>", then echoes every message.
 #   preStop sleep as in the design notes, so a terminating pod keeps serving until Pingap has
 #   swapped it out.
-# - e2e-client: agnhost (has curl and sh) for single requests through Pingap.
+# - podinfo: Deployment + Service for the gRPC test (e2e test 12). Each pod serves gRPC
+#   on 9999 (Service port "grpc", appProtocol kubernetes.io/h2c): info.InfoService/Info
+#   returns the pod name, grpc.health.v1 answers for the service "podinfo".
+# - httpbin: Deployment + Service for the SSE test (e2e test 13): go-httpbin on 8080
+#   (Service port "http"), GET /sse?count=N&duration=D streams N events over D.
+# - e2e-client: agnhost (has curl with HTTP/2 and sh) for single requests through Pingap.
 # - e2e-load: fortio for load generation (`fortio load ... -json -`).
 #
 # Images are pinned; bump them deliberately.
@@ -103,6 +108,123 @@ spec:
     - name: ws
       port: 8090
       targetPort: ws
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: podinfo
+  namespace: e2e-app
+  labels:
+    app: podinfo
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: podinfo
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: podinfo
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: podinfo
+          image: ghcr.io/stefanprodan/podinfo:6.15.0
+          command: ["./podinfo"]
+          args: ["--port=9898", "--grpc-port=9999", "--grpc-service-name=podinfo", "--level=info"]
+          ports:
+            - name: http
+              containerPort: 9898
+            - name: grpc
+              containerPort: 9999
+          readinessProbe:
+            grpc:
+              port: 9999
+              service: podinfo
+            periodSeconds: 2
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: podinfo
+  namespace: e2e-app
+spec:
+  type: ClusterIP
+  selector:
+    app: podinfo
+  ports:
+    - name: grpc
+      port: 9999
+      targetPort: grpc
+      appProtocol: kubernetes.io/h2c
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: httpbin
+  namespace: e2e-app
+  labels:
+    app: httpbin
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: httpbin
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: httpbin
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: httpbin
+          image: mccutchen/go-httpbin:2.25.0
+          # The default 10 s cap on response durations is too short for the 20 s stream.
+          args: ["/bin/go-httpbin", "-port", "8080", "-max-duration", "60s"]
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /status/200
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: httpbin
+  namespace: e2e-app
+spec:
+  type: ClusterIP
+  selector:
+    app: httpbin
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
 ---
 apiVersion: v1
 kind: Pod
