@@ -106,11 +106,19 @@ kubectl -n "$NS" create secret generic "$RELEASE-pingap-admin-e2e" \
   --dry-run=client -o yaml | kubectl apply -f -
 
 log "installing the chart"
+# E2E_PINGAP_TAG overrides the pinned Pingap image tag (CI uses "latest" weekly to
+# catch storage-format changes early, the design notes). It must be a Debian-based tag:
+# the seed init container needs a shell.
+pingap_tag=()
+if [[ -n "${E2E_PINGAP_TAG:-}" ]]; then
+  pingap_tag=(--set "pingap.image.tag=$E2E_PINGAP_TAG")
+fi
 helm upgrade --install "$RELEASE" "$ROOT/charts/pingap-k8s" \
   --namespace "$NS" --create-namespace \
   -f "$ROOT/tests/e2e/values.yaml" \
   --set "image.repository=${IMAGE%:*}" \
-  --set "image.tag=${IMAGE##*:}"
+  --set "image.tag=${IMAGE##*:}" \
+  "${pingap_tag[@]}"
 
 # --- readiness ------------------------------------------------------------------
 # On a failed wait, show what the cluster was doing before the script exits.

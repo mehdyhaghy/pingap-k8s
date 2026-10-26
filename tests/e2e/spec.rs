@@ -1309,7 +1309,6 @@ async fn e2e_07_leader_failover() {
 /// kind: the killed leader's restarted container won the election and the follower never
 /// took over (2 of 7 runs); when the follower does win, it is by timing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "bug: follower Campaign RPC cancelled by the etcd client's 10 s request timeout; takeover after SIGKILL is not reliable"]
 async fn e2e_07_leader_failover_sigkill() {
     const T: &str = "e2e_07b";
     let Some(env) = Env::setup("e2e_07_leader_failover_sigkill").await else {

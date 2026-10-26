@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    # Weekly e2e run against the newest Pingap image.
+    - cron: "0 3 * * 1"
 
 permissions:
   contents: read
@@ -105,6 +108,8 @@ jobs:
       KIND_VERSION: v0.33.0
       KIND_NODE_IMAGE: ${{ matrix.node }}
       E2E_IMAGE: pingap-k8s:e2e
+      # Scheduled runs test the newest Pingap image instead of the pinned tag.
+      E2E_PINGAP_TAG: ${{ github.event_name == 'schedule' && 'latest' || '' }}
       # Built below with the gha cache; e2e-up.sh only loads it into kind.
       E2E_SKIP_BUILD: "1"
       # Kept until teardown so a failure can be inspected in the next step.
