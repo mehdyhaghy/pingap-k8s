@@ -195,8 +195,14 @@ spec:
       containers:
         - name: httpbin
           image: mccutchen/go-httpbin:2.25.0
-          # The default 10 s cap on response durations is too short for the 20 s stream.
-          args: ["/bin/go-httpbin", "-port", "8080", "-max-duration", "60s"]
+          # The default 10 s cap on response durations is too short for the 30 s stream.
+          # Set through the environment: the image's entrypoint is already go-httpbin, so
+          # container args would follow it and a leading binary path would stop flag parsing.
+          env:
+            - name: PORT
+              value: "8080"
+            - name: MAX_DURATION
+              value: "60s"
           ports:
             - name: http
               containerPort: 8080
