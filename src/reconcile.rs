@@ -29,7 +29,10 @@
 //! promotion to leader, so the next pass calls the writer, which compares
 //! with etcd itself and reports `Unchanged` when nothing needs writing.
 //! A foreign `Put` sets it to the stored `addrs`, so a stale admin save is
-//! corrected and a save with the right `addrs` causes no write.
+//! corrected and a save with the right `addrs` causes no write. When any of
+//! these happens while a write of that upstream is in flight, the write's
+//! result does not overwrite it: the foreign write may be the newer one in
+//! etcd, so `last_written` stays unknown and the next pass asks the writer.
 //!
 //! an empty result keeps the last desired state (no write) and warns once
 //! per episode. fallback start and end are logged once each and exported
@@ -83,9 +86,24 @@ pub const MALFORMED_RETRY: Duration = Duration::from_secs(300);
 
 /// Inputs that can be handed to a running [`Reconciler`] from another task.
 struct Shared {
-    upstreams: Mutex<Option<BTreeMap<String, UpstreamConfig>>>,
+    /// The latest upstream set not applied yet, with its generation.
+    upstreams: Mutex<Pending>,
     foreign: Mutex<Option<mpsc::Receiver<ForeignWrite>>>,
     notify: Notify,
+    /// Generation of the upstream set the loop has applied.
+    applied: watch::Sender<u64>,
+}
+
+#[derive(Default)]
+struct Pending {
+    generation: u64,
+    upstreams: Option<BTreeMap<String, UpstreamConfig>>,
+}
+
+impl Pending {
+    fn take(&mut self) -> Option<(u64, BTreeMap<String, UpstreamConfig>)> {
+        self.upstreams.take().map(|u| (self.generation, u))
+    }
 }
 
 /// The reconcile loop. Clone it before calling [`Reconciler::run`] to keep a
@@ -123,9 +141,10 @@ impl<W: AddrsWriter, S: SnapshotSource> Reconciler<W, S> {
             metrics,
             readiness,
             shared: Arc::new(Shared {
-                upstreams: Mutex::new(None),
+                upstreams: Mutex::new(Pending::default()),
                 foreign: Mutex::new(None),
                 notify: Notify::new(),
+                applied: watch::Sender::new(0),
             }),
         }
     }
@@ -134,9 +153,28 @@ impl<W: AddrsWriter, S: SnapshotSource> Reconciler<W, S> {
     /// running (on any clone). New and changed upstreams are reconciled,
     /// removed ones are dropped together with their gauges, unchanged ones
     /// keep their debounce and retry state. The latest call wins.
-    pub fn set_upstreams(&self, upstreams: BTreeMap<String, UpstreamConfig>) {
-        *lock(&self.shared.upstreams) = Some(upstreams);
+    ///
+    /// Returns the generation of this set, for [`Reconciler::wait_applied`].
+    pub fn set_upstreams(&self, upstreams: BTreeMap<String, UpstreamConfig>) -> u64 {
+        let generation = {
+            let mut pending = lock(&self.shared.upstreams);
+            pending.generation += 1;
+            pending.upstreams = Some(upstreams);
+            pending.generation
+        };
         self.shared.notify.notify_one();
+        generation
+    }
+
+    /// Waits until the running loop has applied the upstream set of
+    /// `generation` (or a newer one). After that, no upstream of an older set
+    /// is reconciled again, so watchers only those sets used can be stopped
+    /// without the loop ever reading a Service that is no longer watched.
+    /// Never completes when the loop is not running: bound it with a timeout.
+    pub async fn wait_applied(&self, generation: u64) {
+        let mut applied = self.shared.applied.subscribe();
+        // The sender lives in `shared`, which `self` keeps alive.
+        let _ = applied.wait_for(|g| *g >= generation).await;
     }
 
     /// Replaces the foreign-write receiver of a running loop, for when the
@@ -172,8 +210,9 @@ impl<W: AddrsWriter, S: SnapshotSource> Reconciler<W, S> {
             unreachable: BTreeSet::new(),
         };
         engine.metrics.set_leader(is_leader);
-        if let Some(upstreams) = lock(&self.shared.upstreams).take() {
+        if let Some((generation, upstreams)) = lock(&self.shared.upstreams).take() {
             engine.apply_upstreams(upstreams, Instant::now());
+            self.shared.applied.send_replace(generation);
         }
         // Startup: reconcile everything now (the caller waited for the first list).
         engine.fire_all_now();
@@ -217,8 +256,9 @@ impl<W: AddrsWriter, S: SnapshotSource> Reconciler<W, S> {
                     if let Some(rx) = lock(&self.shared.foreign).take() {
                         foreign = Some(rx);
                     }
-                    if let Some(upstreams) = lock(&self.shared.upstreams).take() {
+                    if let Some((generation, upstreams)) = lock(&self.shared.upstreams).take() {
                         engine.apply_upstreams(upstreams, now);
+                        self.shared.applied.send_replace(generation);
                     }
                 }
                 Wake::WriteDone(Some(r)) => engine.write_done(r, now),
@@ -317,6 +357,9 @@ struct UpstreamState {
     retry_at: Option<Instant>,
     backoff: Duration,
     inflight: bool,
+    /// What is stored changed (or became unknown) while a write was in
+    /// flight, so that write's result no longer says what is stored.
+    stored_changed_inflight: bool,
     empty: bool,
     /// The stored entry is malformed; logged once per episode.
     malformed: bool,
@@ -335,6 +378,7 @@ impl UpstreamState {
             retry_at: None,
             backoff: RETRY_MIN,
             inflight: false,
+            stored_changed_inflight: false,
             empty: false,
             malformed: false,
             fallback: false,
@@ -354,6 +398,16 @@ impl UpstreamState {
         }
         if event && self.event_since.is_none() {
             self.event_since = Some(now);
+        }
+    }
+
+    /// Records what is now believed to be stored (`None` = unknown). A write
+    /// in flight then cannot overwrite it with its own list when it ends: a
+    /// foreign write or delete may have landed after it in etcd.
+    fn set_stored(&mut self, stored: Option<Vec<String>>) {
+        self.last_written = stored;
+        if self.inflight {
+            self.stored_changed_inflight = true;
         }
     }
 
@@ -437,7 +491,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
     fn mark_all(&mut self, now: Instant, event: bool, forget_written: bool) {
         for st in self.upstreams.values_mut() {
             if forget_written {
-                st.last_written = None;
+                st.set_stored(None);
             }
             st.mark(now, event);
         }
@@ -472,7 +526,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
                     _ => false,
                 };
                 self.metrics.record_foreign_write(&upstream, !correct);
-                st.last_written = addrs;
+                st.set_stored(addrs);
                 if correct {
                     tracing::debug!(%upstream, revision, "foreign write kept the desired addrs");
                 } else {
@@ -486,7 +540,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
                 };
                 tracing::warn!(%upstream, revision, "owned upstream key deleted; scheduling recreation");
                 self.metrics.record_foreign_write(&upstream, true);
-                st.last_written = None;
+                st.set_stored(None);
                 st.mark(now, true);
             }
         }
@@ -639,6 +693,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
                 };
                 if let Some(st) = self.upstreams.get_mut(&name) {
                     st.inflight = false;
+                    st.stored_changed_inflight = false;
                 }
                 if e.is_cancelled() {
                     return;
@@ -652,6 +707,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
             return; // removed while the write was in flight
         };
         st.inflight = false;
+        let stored_changed = std::mem::take(&mut st.stored_changed_inflight);
         match result {
             Ok(outcome) => {
                 let result = match outcome {
@@ -679,7 +735,10 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
                     st.malformed = false;
                 }
                 st.event_since = None;
-                st.last_written = Some(addrs);
+                // A foreign write seen while this write was in flight may be
+                // newer in etcd: leave it unknown so the pending pass asks
+                // the writer, which compares with etcd.
+                st.last_written = if stored_changed { None } else { Some(addrs) };
                 st.backoff = RETRY_MIN;
                 self.metrics.set_etcd_up(true);
                 self.unreachable.remove(&name);
@@ -847,6 +906,9 @@ mod tests {
         calls: Mutex<Vec<(String, Vec<String>, Instant)>>,
         stored: Mutex<HashMap<String, Vec<String>>>,
         failures: Mutex<std::collections::VecDeque<anyhow::Error>>,
+        /// When set, each write is stored at once but its result is held
+        /// back until the gate is notified (a write "in flight").
+        gate: Mutex<Option<Arc<Notify>>>,
     }
 
     impl AddrsWriter for FakeWriter {
@@ -857,6 +919,7 @@ mod tests {
         ) -> impl Future<Output = anyhow::Result<WriteOutcome>> + Send {
             lock(&self.calls).push((upstream.to_string(), addrs.to_vec(), Instant::now()));
             let fail = lock(&self.failures).pop_front();
+            let gate = lock(&self.gate).clone();
             let result = if let Some(err) = fail {
                 Err(err)
             } else {
@@ -867,7 +930,12 @@ mod tests {
                     Some(_) => Ok(WriteOutcome::Updated { revision: 2 }),
                 }
             };
-            async move { result }
+            async move {
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
+                result
+            }
         }
     }
 
@@ -1287,6 +1355,122 @@ mod tests {
         sleep(3000).await;
         assert_eq!(h.writer.calls().len(), 1);
         h.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn foreign_write_during_inflight_write_is_still_corrected() {
+        let h = Harness::start(&[("web", &["web"])], true, 64, |s| {
+            s.set("web", &["10.0.0.1"], &[])
+        });
+        sleep(10).await;
+        h.writer.clear();
+
+        // Our write of the new list is committed but its result is late.
+        let gate = Arc::new(Notify::new());
+        *lock(&h.writer.gate) = Some(Arc::clone(&gate));
+        h.source.set("web", &["10.0.0.1", "10.0.0.2"], &[]);
+        h.change("web");
+        sleep(600).await;
+        assert_eq!(h.writer.calls().len(), 1);
+
+        // A stale admin save lands in etcd after our write, and its watch
+        // event arrives before our write's result.
+        lock(&h.writer.stored).insert("web".into(), addrs(&["10.0.0.1"]));
+        h.foreign
+            .send(ForeignWrite::Put {
+                upstream: "web".into(),
+                addrs: Some(addrs(&["10.0.0.1"])),
+                revision: 20,
+            })
+            .await
+            .unwrap();
+        sleep(10).await;
+        *lock(&h.writer.gate) = None;
+        gate.notify_one();
+
+        sleep(3000).await;
+        let calls = h.writer.calls_for("web");
+        assert_eq!(calls.len(), 2, "the stale save must be corrected");
+        assert_eq!(calls[1], addrs(&["10.0.0.1", "10.0.0.2"]));
+        assert_eq!(
+            lock(&h.writer.stored).get("web"),
+            Some(&addrs(&["10.0.0.1", "10.0.0.2"]))
+        );
+        h.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn foreign_delete_during_inflight_write_is_recreated() {
+        let h = Harness::start(&[("web", &["web"])], true, 64, |s| {
+            s.set("web", &["10.0.0.1"], &[])
+        });
+        sleep(10).await;
+        h.writer.clear();
+
+        let gate = Arc::new(Notify::new());
+        *lock(&h.writer.gate) = Some(Arc::clone(&gate));
+        h.source.set("web", &["10.0.0.2"], &[]);
+        h.change("web");
+        sleep(600).await;
+
+        lock(&h.writer.stored).remove("web");
+        h.foreign
+            .send(ForeignWrite::Deleted {
+                upstream: "web".into(),
+                revision: 20,
+            })
+            .await
+            .unwrap();
+        sleep(10).await;
+        *lock(&h.writer.gate) = None;
+        gate.notify_one();
+
+        sleep(3000).await;
+        assert_eq!(h.writer.calls_for("web").len(), 2);
+        assert_eq!(
+            lock(&h.writer.stored).get("web"),
+            Some(&addrs(&["10.0.0.2"]))
+        );
+        h.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_applied_completes_after_the_loop_applied_the_set() {
+        let h = Harness::start(&[("a", &["a"])], true, 64, |s| {
+            s.set("a", &["10.0.0.1"], &[]);
+            s.set("b", &["10.0.0.2"], &[]);
+        });
+        sleep(10).await;
+        let mut next = BTreeMap::new();
+        next.insert("b".to_string(), upstream(&["b"]));
+        let generation = h.handle.set_upstreams(next.clone());
+        tokio::time::timeout(Duration::from_secs(1), h.handle.wait_applied(generation))
+            .await
+            .expect("applied");
+        // A newer set supersedes; waiting for an older generation returns at once.
+        let newer = h.handle.set_upstreams(next);
+        assert!(newer > generation);
+        tokio::time::timeout(Duration::from_secs(1), h.handle.wait_applied(newer))
+            .await
+            .expect("applied");
+        tokio::time::timeout(Duration::from_millis(1), h.handle.wait_applied(generation))
+            .await
+            .expect("older generation");
+        h.stop().await;
+
+        // Not running: the wait does not complete.
+        let rec = Reconciler::new(
+            Arc::new(FakeWriter::default()),
+            Arc::new(FakeSource::default()),
+            Arc::new(Metrics::new()),
+            Readiness::new(),
+        );
+        let generation = rec.set_upstreams(BTreeMap::new());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), rec.wait_applied(generation))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -35,9 +35,10 @@ const SA_NAMESPACE_FILE: &str = "/var/run/secrets/kubernetes.io/serviceaccount/n
 const SYNC_WAIT: Duration = Duration::from_secs(30);
 /// Quiet period after a config file event before reloading.
 const FILE_DEBOUNCE: Duration = Duration::from_secs(1);
-/// Delay before stopping watchers no longer referenced after a reload, so the
-/// reconciler has switched to the new upstreams first.
-const WATCH_DROP_DELAY: Duration = Duration::from_secs(1);
+/// How long a reload waits for the reconciler to switch to the new upstreams
+/// before it stops the watchers only the old ones used. On timeout they keep
+/// running (harmless) until the next reload.
+const APPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Upper bound for each shutdown step (the election resigns within ~6 s).
 const SHUTDOWN_STEP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Retry backoff for startup connections and the owned-key watch.
@@ -762,7 +763,7 @@ impl Controller {
         }
 
         let owned_changed = owned_names(&self.current) != owned_names(&new);
-        self.reconciler.set_upstreams(new.upstreams.clone());
+        let generation = self.reconciler.set_upstreams(new.upstreams.clone());
         self.current = new;
         if owned_changed && !self.restart_owned_watch().await {
             self.owned_watch_pending = true;
@@ -776,8 +777,19 @@ impl Controller {
             "config reloaded"
         );
         // Stop watchers of Services no longer referenced, once the reconciler has
-        // switched to the new upstreams.
-        tokio::time::sleep(WATCH_DROP_DELAY).await;
+        // switched to the new upstreams: until then it may still read them, and a
+        // Service that is not watched reads as missing (a partial set).
+        let applied = tokio::select! {
+            r = tokio::time::timeout(APPLY_TIMEOUT, self.reconciler.wait_applied(generation)) => r.is_ok(),
+            () = shutdown_signal(shutdown.clone()) => return Flow::Shutdown,
+        };
+        if !applied {
+            warn!(
+                timeout = ?APPLY_TIMEOUT,
+                "reconciler has not applied the new upstreams yet; keeping the watchers of removed Services until the next reload"
+            );
+            return Flow::Done;
+        }
         self.registry.set_services(new_keys);
         self.readiness
             .set_watchers_synced(self.registry.is_synced());
