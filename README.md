@@ -41,6 +41,7 @@ resources is planned for later phases.
 - [Configuration reference](#configuration-reference)
 - [Pingap side](#pingap-side)
 - [Graceful shutdown of application pods (preStop)](#graceful-shutdown-of-application-pods-prestop)
+- [Production checklist](#production-checklist)
 - [Observability](#observability)
   - [Telemetry](#telemetry)
 - [Security](#security)
@@ -212,11 +213,18 @@ helm install pingap-k8s ./charts/pingap-k8s --namespace edge -f quickstart.yaml
 - Pingap runs `pingap --conf etcd://... --autoreload` as a non-root user with a read-only root
   filesystem.
 - Before Pingap starts, an init container seeds the etcd prefix from `pingap.seed.config` **only if
-  the prefix has no server yet**: one listener on `:8080`, one location, and the upstream
+  the prefix has no server yet**: one listener on `[::]:8080` (IPv4 and IPv6), one location, and
+  the upstream
   `quickstart` (with a placeholder address the controller replaces). Servers (listeners) are
   read only at Pingap start, which is why they are seeded first.
 - The proxy listener is exposed through the `pingap-k8s-pingap` Service, whose type you choose
   (`pingap.service.type`).
+- Pod lifecycle: rolling updates surge one pod and never take one down first (`maxUnavailable: 0`),
+  replicas spread over nodes, and a PodDisruptionBudget (`minAvailable: 1`) applies from 2
+  replicas. On deletion a `preStop` sleep (15 s) lets endpoints and load balancers catch up, then
+  Pingap shuts down gracefully (seeded `[basic] grace_period = "30s"`,
+  `graceful_shutdown_timeout = "10s"`) within `terminationGracePeriodSeconds: 60`. Keep that sum
+  below the grace period if you change any of them; see `pingap.*` in `values.yaml`.
 - The admin UI listens on its own port behind a `ClusterIP`-only Service. Open it with a
   port-forward:
 
@@ -298,7 +306,7 @@ drain_terminating = true # any [defaults] key can be overridden per upstream
 | `debounce` | `500ms` | wait this long after the last event before writing |
 | `debounce_max` | `2s` | write at the latest this long after the first pending event |
 | `resync` | `5m` | reconcile every upstream at this interval even without events |
-| `ipv4_only` | `false` | ignore IPv6 EndpointSlices |
+| `ipv4_only` | `false` | ignore IPv6 EndpointSlices. On dual-stack clusters each pod has one slice per family, so it is written twice (`10.x:port` and `[fd00::x]:port`); set `true` unless the Pingap pods can reach app pods over IPv6 |
 | `server.listen` | `[::]:9090` | address for `/metrics`, `/healthz` and `/readyz` (restart required). `[::]` also accepts IPv4 on Linux unless the node sets `net.ipv6.bindv6only=1`; on nodes with IPv6 disabled at boot use `0.0.0.0:9090` |
 | `upstreams.<name>.services` | (required) | list of `<service>[.<namespace>]:<port> [weight]` |
 
@@ -364,6 +372,48 @@ your upstream's connect timeout.
 
 Each write rebuilds the upstream and resets its runtime state (circuit breaker, backend stats,
 round-robin position). The debounce keeps the number of writes during a rollout low.
+
+## Production checklist
+
+- [ ] **App pods have a `preStop` delay** sized from the upstream health-check connect timeout
+      ([above](#graceful-shutdown-of-application-pods-prestop)).
+- [ ] **Every owned upstream has a Pingap health check**, e.g.
+      `health_check = "http://api/healthz?connection_timeout=1s&check_frequency=5s"`. Minimal
+      upstreams created by the controller have none, and fail-static depends on it: while the
+      controller is down, or when a Service has no endpoints, health checks are what take dead pod
+      IPs out of rotation.
+- [ ] **The health-check connect timeout is short** (about 1 s). Each write is swapped in only
+      after a health-check round, so a slow or dead backend delays it by up to that timeout
+      (measured 3–5.5 s with a default health check).
+- [ ] **Idle timeouts are ordered**:
+  - Pingap upstream `idle_timeout` is shorter than the app's HTTP keep-alive timeout, so Pingap
+    never reuses a connection the app is closing.
+  - Pingora keeps idle client HTTP/1 connections for 60 s. A layer-4 load balancer in front of
+    Pingap (Service `LoadBalancer`) needs a longer idle timeout, so Pingap closes idle connections
+    first; a layer-7 load balancer that pools connections to Pingap needs a shorter one.
+- [ ] **NetworkPolicy allows Pingap pods to app pods** on the target port. Pingap connects to pod
+      IPs directly, so policies that only admit traffic "from the Service" do not apply.
+- [ ] **Client source IP** is decided:
+  - `externalTrafficPolicy: Local` keeps the client address (only nodes running a Pingap pod get
+    traffic, so spread the replicas); `Cluster`, the default, shows Pingap a node address;
+  - or PROXY protocol from the load balancer: server `proxy_protocol = true`, which needs
+    `basic.trusted_proxies`;
+  - set location `enable_reverse_proxy_headers = true` to pass `X-Real-IP`, `X-Forwarded-For` and
+    `X-Forwarded-Proto` to the apps.
+- [ ] **Dual-stack**: `ipv4_only = true` unless the Pingap pods route IPv6 to app pods (each
+      dual-stack pod is otherwise written once per family). Listen on `[::]` to accept both.
+- [ ] **Bundled etcd maintenance**: periodic auto-compaction is on (1 h). Compaction does not free
+      disk space: run `etcdctl defrag` now and then, one member at a time; take regular
+      `etcdctl snapshot save` backups; size `--quota-backend-bytes` (via `etcd.extraArgs`) and
+      the volume together, and watch for the `NOSPACE` alarm.
+- [ ] **Long-lived connections are rebalanced**: gRPC, HTTP/2 and WebSocket connections stay on
+      the pod they were opened to, and new pods only get new connections. Cap the connection age
+      in the app (for gRPC, the server's max connection age) if load must even out after scaling.
+- [ ] **Sticky sessions use consistent hashing**: `algo = "hash:cookie:<name>"` (or `hash:ip`,
+      `hash:header:<name>`). Pingora's consistent hash moves only the keys of the pods that
+      changed during a rollout; round robin has no affinity.
+- [ ] **Quickstart Pingap runs 2 or more replicas** (`pingap.replicas`), so its
+      PodDisruptionBudget applies.
 
 ## Observability
 
