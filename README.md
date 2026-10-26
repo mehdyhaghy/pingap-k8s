@@ -40,6 +40,7 @@ resources is planned for later phases.
   - [etcd client certificates](#etcd-client-certificates)
 - [Configuration reference](#configuration-reference)
 - [Pingap side](#pingap-side)
+- [Upstream target](#upstream-target)
 - [Graceful shutdown of application pods (preStop)](#graceful-shutdown-of-application-pods-prestop)
 - [Production checklist](#production-checklist)
 - [Observability](#observability)
@@ -277,6 +278,7 @@ url = "etcd://etcd.edge.svc:2379/pingap?ca=/etc/pingap-k8s/etcd/ca.crt&cert=/etc
 kubeconfig = ""          # empty: in-cluster, then $KUBECONFIG, then ~/.kube/config
 context = ""
 default_namespace = ""   # empty: the controller pod's own namespace
+cluster_domain = "cluster.local"  # for target = "service" addresses
 
 [defaults]
 include_not_ready = false
@@ -285,6 +287,7 @@ debounce = "500ms"
 debounce_max = "2s"
 resync = "5m"            # full re-list and re-reconcile, corrects drift
 ipv4_only = false
+target = "pods"          # or "service", see Upstream target
 
 # One table per Pingap upstream the controller owns.
 [upstreams.api]
@@ -301,12 +304,14 @@ drain_terminating = true # any [defaults] key can be overridden per upstream
 | `kubernetes.kubeconfig` | `""` | kubeconfig path; empty means in-cluster, then `$KUBECONFIG`, then `~/.kube/config` |
 | `kubernetes.context` | `""` | kubeconfig context |
 | `kubernetes.default_namespace` | `""` | namespace for `services` entries without one; empty means the controller pod's namespace (`POD_NAMESPACE`) |
+| `kubernetes.cluster_domain` | `cluster.local` | cluster DNS domain used in `target = "service"` addresses; applies live |
 | `include_not_ready` | `false` | also write endpoints that are not ready (and not terminating) |
 | `drain_terminating` | `true` | remove terminating endpoints; `false` treats serving terminating endpoints as ready |
 | `debounce` | `500ms` | wait this long after the last event before writing |
 | `debounce_max` | `2s` | write at the latest this long after the first pending event |
 | `resync` | `5m` | reconcile every upstream at this interval even without events |
 | `ipv4_only` | `false` | ignore IPv6 EndpointSlices. On dual-stack clusters each pod has one slice per family, so it is written twice (`10.x:port` and `[fd00::x]:port`); set `true` unless the Pingap pods can reach app pods over IPv6 |
+| `target` | `pods` | `pods` writes ready pod IPs, `service` writes the Service DNS name and port ([Upstream target](#upstream-target)); also per upstream |
 | `server.listen` | `[::]:9090` | address for `/metrics`, `/healthz` and `/readyz` (restart required). `[::]` also accepts IPv4 on Linux unless the node sets `net.ipv6.bindv6only=1`; on nodes with IPv6 disabled at boot use `0.0.0.0:9090` |
 | `upstreams.<name>.services` | (required) | list of `<service>[.<namespace>]:<port> [weight]` |
 
@@ -346,6 +351,45 @@ pingap-k8s --check --config config.toml
   controller's logs and metrics are the audit trail for `addrs`.
 - Pingap rewrites the whole entry on an admin save, so TOML comments in an owned upstream are kept
   by the controller but lost on the next admin save.
+
+## Upstream target
+
+Each owned upstream has a `target`, set in `[defaults]` or per upstream. Both modes use standard
+Kubernetes addressing only.
+
+| `target` | Written into `addrs` | Who balances | Use when |
+|---|---|---|---|
+| `pods` (default) | ready pod IPs from EndpointSlices | Pingap, per request | Pingap should reach the pods directly (the usual case) |
+| `service` | one `<service>.<namespace>.svc.<cluster_domain>:<port>` per Service | kube-proxy, or whatever layer sits behind the Service | traffic must go through the Service, e.g. for Service-level routing, policy or mTLS applied there |
+
+```toml
+[kubernetes]
+cluster_domain = "cluster.local"
+
+[upstreams.legacy]
+services = ["legacy.prod:http"]
+target = "service"
+```
+
+- `pods` gives per-pod health checks, drain within about a second, per-request balancing across
+  pods (gRPC included) and consistent-hash stickiness. Prefer it unless traffic must pass the
+  Service.
+- In `service` mode keep the Pingap upstream's `discovery` empty. Pingap then treats the hostname
+  in `addrs` as DNS discovery and re-resolves it every `update_frequency` (60 s by default). With
+  `discovery = "static"` the name is resolved only once, when the upstream is built.
+- The port written is the Service `port`. Several Services in one upstream give one address each,
+  with their weights. The Service and port must exist, as in `pods` mode.
+- Pingap forwards the client's `Host` header. If a layer behind the Service routes by Service
+  name, set `Host` with `proxy_set_headers` on the location, e.g.
+  `proxy_set_headers = ["Host:legacy.prod.svc.cluster.local"]`.
+- Lost compared with `pods`: Pingap's per-pod health checks (it sees one address), fast drain
+  (draining is up to the layer behind the Service), and per-request gRPC spread across pods
+  (connections are spread only if that layer balances per request).
+- `target` and `cluster_domain` apply live; switching an upstream between modes needs no restart.
+- Chart: `config.defaults.target`, `config.upstreams.<name>.target` and
+  `config.kubernetes.cluster_domain`. To add the quickstart Pingap pods to another layer that
+  selects pods by label or annotation, use `pingap.podLabels` and `pingap.podAnnotations`
+  (`podLabels` and `podAnnotations` for the controller).
 
 ## Graceful shutdown of application pods (preStop)
 
@@ -392,7 +436,9 @@ round-robin position). The debounce keeps the number of writes during a rollout 
     Pingap (Service `LoadBalancer`) needs a longer idle timeout, so Pingap closes idle connections
     first; a layer-7 load balancer that pools connections to Pingap needs a shorter one.
 - [ ] **NetworkPolicy allows Pingap pods to app pods** on the target port. Pingap connects to pod
-      IPs directly, so policies that only admit traffic "from the Service" do not apply.
+      IPs directly, so policies that only admit traffic "from the Service" do not apply. If
+      traffic must pass the Service (Service-level routing, policy or mTLS), use
+      [`target = "service"`](#upstream-target) for those upstreams.
 - [ ] **Client source IP** is decided:
   - `externalTrafficPolicy: Local` keeps the client address (only nodes running a Pingap pod get
     traffic, so spread the replicas); `Cluster`, the default, shows Pingap a node address;
@@ -496,7 +542,8 @@ Service), never a public address. Use `https://` for TLS (system roots).
 - Phase 1 manages upstream `addrs` only. Locations, servers and certificates are not generated
   (Ingress and Gateway API support are planned).
 - etcd is the only write target. Pingap file or ConfigMap storage is not supported.
-- Pingap must be able to reach pod IPs (normally: run Pingap inside the cluster).
+- Pingap must be able to reach pod IPs, or with `target = "service"` resolve and reach the
+  Service names (normally: run Pingap inside the cluster).
 - `ExternalName` Services are not supported.
 - When the controller is down, Pingap keeps serving the last addresses, but new pods get no
   traffic until it is back.
