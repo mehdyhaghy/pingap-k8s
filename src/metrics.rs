@@ -1,15 +1,20 @@
-//! Prometheus metrics.
+//! Metrics, recorded through the OpenTelemetry metrics API.
 //!
-//! `Metrics` owns its own `Registry` (never the process-global default), so
-//! tests and multiple instances do not interfere with each other. Served by
-//! `server.rs` on the in-cluster metrics port only.
+//! Every `Metrics` owns its own `SdkMeterProvider` and Prometheus registry
+//! (never a process-global one), so tests and multiple instances do not
+//! interfere with each other. The Prometheus reader is always attached and
+//! served by `server.rs` on the in-cluster metrics port; `telemetry.rs` adds
+//! the OTLP reader to the same provider when an endpoint is configured.
 
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use prometheus::{
-    Encoder, Histogram, HistogramOpts, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
-    TextEncoder,
-};
+use opentelemetry::KeyValue;
+use opentelemetry::metrics::{Counter, Histogram, MeterProvider as _};
+use opentelemetry_sdk::metrics::{MeterProviderBuilder, SdkMeterProvider};
+use prometheus::proto::MetricType;
+use prometheus::{Encoder, Registry, TextEncoder};
 
 /// Buckets for `pingap_k8s_event_to_write_seconds`, 50 ms to 30 s. Dense
 /// around the default debounce window (500 ms .. 2 s).
@@ -53,26 +58,32 @@ impl WriteResult {
     }
 }
 
+const NAMESPACE: &str = "k8s.namespace.name";
+const SERVICE: &str = "k8s.service.name";
+
+/// Current gauge values.
+///
+/// OpenTelemetry gauges cannot delete a series, so every gauge is an
+/// observable gauge whose callback reports this map: removing an entry
+/// (`remove_upstream`, `remove_watch`) makes the series disappear from the
+/// next collection on both `/metrics` and OTLP.
+#[derive(Default)]
+struct Gauges {
+    endpoints: BTreeMap<(String, &'static str), u64>,
+    drain_fallback: BTreeMap<String, u64>,
+    watch_up: BTreeMap<(String, String), u64>,
+    is_leader: u64,
+    etcd_up: u64,
+}
+
 pub struct Metrics {
-    pub registry: Registry,
-    /// `pingap_k8s_endpoints{upstream,class}`
-    pub endpoints: IntGaugeVec,
-    /// `pingap_k8s_writes_total{upstream,result}`
-    pub writes_total: IntCounterVec,
-    /// `pingap_k8s_foreign_writes_total{upstream,corrected}`
-    pub foreign_writes_total: IntCounterVec,
-    /// `pingap_k8s_watch_up{namespace,service}`
-    pub watch_up: IntGaugeVec,
-    /// `pingap_k8s_watch_errors_total{namespace,service,reason}`
-    pub watch_errors_total: IntCounterVec,
-    /// `pingap_k8s_event_to_write_seconds`
-    pub event_to_write_seconds: Histogram,
-    /// `pingap_k8s_drain_fallback{upstream}`
-    pub drain_fallback: IntGaugeVec,
-    /// `pingap_k8s_is_leader`
-    pub is_leader: IntGauge,
-    /// `pingap_k8s_etcd_up`
-    pub etcd_up: IntGauge,
+    registry: Registry,
+    pub(crate) provider: SdkMeterProvider,
+    gauges: Arc<Mutex<Gauges>>,
+    writes: Counter<u64>,
+    foreign_writes: Counter<u64>,
+    watch_errors: Counter<u64>,
+    event_to_write: Histogram<f64>,
 }
 
 impl Default for Metrics {
@@ -82,108 +93,102 @@ impl Default for Metrics {
 }
 
 impl Metrics {
+    /// Prometheus reader only, empty resource.
     pub fn new() -> Self {
+        Self::build(SdkMeterProvider::builder())
+    }
+
+    /// Adds the Prometheus reader to `builder` (which may carry a resource and
+    /// other readers), builds the provider and creates the instruments.
+    pub fn build(builder: MeterProviderBuilder) -> Self {
         let registry = Registry::new();
+        let exporter = opentelemetry_prometheus::exporter()
+            .with_registry(registry.clone())
+            .without_target_info()
+            .scope_info_enabled(false)
+            .build()
+            .expect("prometheus exporter on a fresh registry");
+        let provider = builder.with_reader(exporter).build();
+        let meter = provider.meter("pingap-k8s");
+        let gauges = Arc::new(Mutex::new(Gauges::default()));
 
-        let endpoints = IntGaugeVec::new(
-            Opts::new(
-                "pingap_k8s_endpoints",
-                "Endpoints currently written per upstream, by class.",
-            ),
-            &["upstream", "class"],
-        )
-        .expect("valid metric");
-        let writes_total = IntCounterVec::new(
-            Opts::new(
-                "pingap_k8s_writes_total",
-                "Write attempts of upstream addrs to etcd, by result.",
-            ),
-            &["upstream", "result"],
-        )
-        .expect("valid metric");
-        let foreign_writes_total = IntCounterVec::new(
-            Opts::new(
-                "pingap_k8s_foreign_writes_total",
-                "Writes to owned upstream keys not made by this controller.",
-            ),
-            &["upstream", "corrected"],
-        )
-        .expect("valid metric");
-        let watch_up = IntGaugeVec::new(
-            Opts::new(
-                "pingap_k8s_watch_up",
-                "1 when the Kubernetes watch for a Service is healthy, else 0.",
-            ),
-            &["namespace", "service"],
-        )
-        .expect("valid metric");
-        let watch_errors_total = IntCounterVec::new(
-            Opts::new(
-                "pingap_k8s_watch_errors_total",
-                "Kubernetes watch errors per Service, by reason.",
-            ),
-            &["namespace", "service", "reason"],
-        )
-        .expect("valid metric");
-        let event_to_write_seconds = Histogram::with_opts(
-            HistogramOpts::new(
-                "pingap_k8s_event_to_write_seconds",
-                "Time from the first pending Kubernetes event to the etcd write.",
-            )
-            .buckets(EVENT_TO_WRITE_BUCKETS.to_vec()),
-        )
-        .expect("valid metric");
-        let drain_fallback = IntGaugeVec::new(
-            Opts::new(
-                "pingap_k8s_drain_fallback",
-                "1 while an upstream is served only by draining endpoints.",
-            ),
-            &["upstream"],
-        )
-        .expect("valid metric");
-        let is_leader = IntGauge::new(
-            "pingap_k8s_is_leader",
-            "1 when this replica holds the leader lease and may write.",
-        )
-        .expect("valid metric");
-        let etcd_up = IntGauge::new(
-            "pingap_k8s_etcd_up",
-            "1 when the last etcd operation succeeded, else 0.",
-        )
-        .expect("valid metric");
-
-        let collectors: [Box<dyn prometheus::core::Collector>; 9] = [
-            Box::new(endpoints.clone()),
-            Box::new(writes_total.clone()),
-            Box::new(foreign_writes_total.clone()),
-            Box::new(watch_up.clone()),
-            Box::new(watch_errors_total.clone()),
-            Box::new(event_to_write_seconds.clone()),
-            Box::new(drain_fallback.clone()),
-            Box::new(is_leader.clone()),
-            Box::new(etcd_up.clone()),
-        ];
-        for collector in collectors {
-            registry
-                .register(collector)
-                .expect("metric names are unique");
-        }
+        let g = gauges.clone();
+        meter
+            .u64_observable_gauge("pingap_k8s.endpoints")
+            .with_description("Endpoints currently written per upstream, by class.")
+            .with_callback(move |o| {
+                for ((upstream, class), v) in &lock(&g).endpoints {
+                    let attrs = [
+                        KeyValue::new("upstream", upstream.clone()),
+                        KeyValue::new("class", *class),
+                    ];
+                    o.observe(*v, &attrs);
+                }
+            })
+            .build();
+        let g = gauges.clone();
+        meter
+            .u64_observable_gauge("pingap_k8s.watch_up")
+            .with_description("1 when the Kubernetes watch for a Service is healthy, else 0.")
+            .with_callback(move |o| {
+                for ((ns, svc), v) in &lock(&g).watch_up {
+                    let attrs = [
+                        KeyValue::new(NAMESPACE, ns.clone()),
+                        KeyValue::new(SERVICE, svc.clone()),
+                    ];
+                    o.observe(*v, &attrs);
+                }
+            })
+            .build();
+        let g = gauges.clone();
+        meter
+            .u64_observable_gauge("pingap_k8s.drain_fallback")
+            .with_description("1 while an upstream is served only by draining endpoints.")
+            .with_callback(move |o| {
+                for (upstream, v) in &lock(&g).drain_fallback {
+                    o.observe(*v, &[KeyValue::new("upstream", upstream.clone())]);
+                }
+            })
+            .build();
+        let g = gauges.clone();
+        meter
+            .u64_observable_gauge("pingap_k8s.is_leader")
+            .with_description("1 when this replica holds the leader lease and may write.")
+            .with_callback(move |o| o.observe(lock(&g).is_leader, &[]))
+            .build();
+        let g = gauges.clone();
+        meter
+            .u64_observable_gauge("pingap_k8s.etcd_up")
+            .with_description("1 when the last etcd operation succeeded, else 0.")
+            .with_callback(move |o| o.observe(lock(&g).etcd_up, &[]))
+            .build();
 
         Metrics {
+            writes: meter
+                .u64_counter("pingap_k8s.writes")
+                .with_description("Write attempts of upstream addrs to etcd, by result.")
+                .build(),
+            foreign_writes: meter
+                .u64_counter("pingap_k8s.foreign_writes")
+                .with_description("Writes to owned upstream keys not made by this controller.")
+                .build(),
+            watch_errors: meter
+                .u64_counter("pingap_k8s.watch_errors")
+                .with_description("Kubernetes watch errors per Service, by error type.")
+                .build(),
+            event_to_write: meter
+                .f64_histogram("pingap_k8s.event_to_write")
+                .with_unit("s")
+                .with_description("Time from the first pending Kubernetes event to the etcd write.")
+                .with_boundaries(EVENT_TO_WRITE_BUCKETS.to_vec())
+                .build(),
             registry,
-            endpoints,
-            writes_total,
-            foreign_writes_total,
-            watch_up,
-            watch_errors_total,
-            event_to_write_seconds,
-            drain_fallback,
-            is_leader,
-            etcd_up,
+            provider,
+            gauges,
         }
     }
 
-    /// Prometheus text exposition format of everything in this registry.
+    /// Prometheus text exposition format of every instrument.
     pub fn encode(&self) -> String {
         let families = self.registry.gather();
         let mut buf = Vec::new();
@@ -194,121 +199,130 @@ impl Metrics {
         String::from_utf8(buf).unwrap_or_default()
     }
 
+    /// Current value of one `/metrics` series with exactly `labels`, 0 when
+    /// absent. Histograms are read by `<name>_count`. For tests.
+    pub fn value(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
+        for family in self.registry.gather() {
+            let histogram = family.get_field_type() == MetricType::HISTOGRAM;
+            let wanted = if histogram {
+                name.strip_suffix("_count") == Some(family.name())
+            } else {
+                name == family.name()
+            };
+            if !wanted {
+                continue;
+            }
+            for m in family.get_metric() {
+                let pairs = m.get_label();
+                let matches = pairs.len() == labels.len()
+                    && labels
+                        .iter()
+                        .all(|(k, v)| pairs.iter().any(|p| p.name() == *k && p.value() == *v));
+                if matches {
+                    return match family.get_field_type() {
+                        MetricType::HISTOGRAM => m.get_histogram().get_sample_count(),
+                        MetricType::GAUGE => m.get_gauge().get_value() as u64,
+                        _ => m.get_counter().get_value() as u64,
+                    };
+                }
+            }
+        }
+        0
+    }
+
     pub fn record_write(&self, upstream: &str, result: WriteResult) {
-        self.writes_total
-            .with_label_values(&[upstream, result.as_str()])
-            .inc();
+        self.writes.add(
+            1,
+            &[
+                KeyValue::new("upstream", upstream.to_string()),
+                KeyValue::new("result", result.as_str()),
+            ],
+        );
     }
 
     pub fn set_endpoints(&self, upstream: &str, ready: usize, draining: usize) {
-        self.endpoints
-            .with_label_values(&[upstream, EndpointClass::Ready.as_str()])
-            .set(to_i64(ready));
-        self.endpoints
-            .with_label_values(&[upstream, EndpointClass::Draining.as_str()])
-            .set(to_i64(draining));
+        let mut g = lock(&self.gauges);
+        for (class, n) in [
+            (EndpointClass::Ready, ready),
+            (EndpointClass::Draining, draining),
+        ] {
+            g.endpoints
+                .insert((upstream.to_string(), class.as_str()), n as u64);
+        }
     }
 
     pub fn set_drain_fallback(&self, upstream: &str, active: bool) {
-        self.drain_fallback
-            .with_label_values(&[upstream])
-            .set(i64::from(active));
+        lock(&self.gauges)
+            .drain_fallback
+            .insert(upstream.to_string(), u64::from(active));
     }
 
     pub fn record_foreign_write(&self, upstream: &str, corrected: bool) {
-        let corrected = if corrected { "true" } else { "false" };
-        self.foreign_writes_total
-            .with_label_values(&[upstream, corrected])
-            .inc();
+        self.foreign_writes.add(
+            1,
+            &[
+                KeyValue::new("upstream", upstream.to_string()),
+                KeyValue::new("corrected", corrected),
+            ],
+        );
     }
 
     pub fn set_watch_up(&self, namespace: &str, service: &str, up: bool) {
-        self.watch_up
-            .with_label_values(&[namespace, service])
-            .set(i64::from(up));
+        lock(&self.gauges)
+            .watch_up
+            .insert((namespace.to_string(), service.to_string()), u64::from(up));
     }
 
+    /// `reason` is the bounded `error.type` attribute.
     pub fn record_watch_error(&self, namespace: &str, service: &str, reason: &str) {
-        self.watch_errors_total
-            .with_label_values(&[namespace, service, reason])
-            .inc();
+        self.watch_errors.add(
+            1,
+            &[
+                KeyValue::new(NAMESPACE, namespace.to_string()),
+                KeyValue::new(SERVICE, service.to_string()),
+                KeyValue::new("error.type", reason.to_string()),
+            ],
+        );
     }
 
     pub fn observe_event_to_write(&self, elapsed: Duration) {
-        self.event_to_write_seconds.observe(elapsed.as_secs_f64());
+        self.event_to_write.record(elapsed.as_secs_f64(), &[]);
     }
 
     pub fn set_leader(&self, leader: bool) {
-        self.is_leader.set(i64::from(leader));
+        lock(&self.gauges).is_leader = u64::from(leader);
     }
 
     pub fn set_etcd_up(&self, up: bool) {
-        self.etcd_up.set(i64::from(up));
+        lock(&self.gauges).etcd_up = u64::from(up);
     }
 
     /// Drops the per-upstream gauge series of an upstream removed from the
     /// config, so it stops being reported. Counters are kept (they are
     /// cumulative and dropping them would look like a reset).
     pub fn remove_upstream(&self, upstream: &str) {
-        for class in [EndpointClass::Ready, EndpointClass::Draining] {
-            let _ = self
-                .endpoints
-                .remove_label_values(&[upstream, class.as_str()]);
-        }
-        let _ = self.drain_fallback.remove_label_values(&[upstream]);
+        let mut g = lock(&self.gauges);
+        g.endpoints.retain(|(u, _), _| u != upstream);
+        g.drain_fallback.remove(upstream);
     }
 
     /// Drops the `watch_up` series of a Service that is no longer watched.
     pub fn remove_watch(&self, namespace: &str, service: &str) {
-        let _ = self.watch_up.remove_label_values(&[namespace, service]);
+        lock(&self.gauges)
+            .watch_up
+            .remove(&(namespace.to_string(), service.to_string()));
     }
 }
 
-fn to_i64(n: usize) -> i64 {
-    i64::try_from(n).unwrap_or(i64::MAX)
+fn lock(g: &Mutex<Gauges>) -> MutexGuard<'_, Gauges> {
+    g.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn registers_every_metric() {
-        let m = Metrics::new();
-        m.set_endpoints("web", 3, 1);
-        m.record_write("web", WriteResult::Ok);
-        m.record_foreign_write("web", true);
-        m.set_watch_up("apps", "web", true);
-        m.record_watch_error("apps", "web", "forbidden");
-        m.observe_event_to_write(Duration::from_millis(700));
-        m.set_drain_fallback("web", false);
-        m.set_leader(true);
-        m.set_etcd_up(true);
-
-        let names: Vec<String> = m
-            .registry
-            .gather()
-            .iter()
-            .map(|f| f.name().to_string())
-            .collect();
-        for expected in [
-            "pingap_k8s_endpoints",
-            "pingap_k8s_writes_total",
-            "pingap_k8s_foreign_writes_total",
-            "pingap_k8s_watch_up",
-            "pingap_k8s_watch_errors_total",
-            "pingap_k8s_event_to_write_seconds",
-            "pingap_k8s_drain_fallback",
-            "pingap_k8s_is_leader",
-            "pingap_k8s_etcd_up",
-        ] {
-            assert!(names.iter().any(|n| n == expected), "missing {expected}");
-        }
-    }
-
-    #[test]
-    fn encodes_text_format_with_spec_labels() {
-        let m = Metrics::new();
+    fn record_everything(m: &Metrics) {
         m.set_endpoints("web", 3, 1);
         m.record_write("web", WriteResult::Ok);
         m.record_write("web", WriteResult::Ok);
@@ -322,6 +336,12 @@ mod tests {
         m.set_drain_fallback("web", true);
         m.set_leader(true);
         m.set_etcd_up(false);
+    }
+
+    #[test]
+    fn encodes_spec_names_and_labels() {
+        let m = Metrics::new();
+        record_everything(&m);
 
         let text = m.encode();
         for line in [
@@ -333,37 +353,90 @@ mod tests {
             r#"pingap_k8s_writes_total{result="conflict",upstream="web"} 1"#,
             r#"pingap_k8s_writes_total{result="error",upstream="web"} 1"#,
             r#"pingap_k8s_writes_total{result="unchanged",upstream="web"} 1"#,
+            "# TYPE pingap_k8s_foreign_writes_total counter",
             r#"pingap_k8s_foreign_writes_total{corrected="false",upstream="web"} 1"#,
-            r#"pingap_k8s_watch_up{namespace="apps",service="web"} 1"#,
-            r#"pingap_k8s_watch_errors_total{namespace="apps",reason="forbidden",service="web"} 1"#,
+            "# TYPE pingap_k8s_watch_up gauge",
+            r#"pingap_k8s_watch_up{k8s_namespace_name="apps",k8s_service_name="web"} 1"#,
+            "# TYPE pingap_k8s_watch_errors_total counter",
+            r#"pingap_k8s_watch_errors_total{error_type="forbidden",k8s_namespace_name="apps",k8s_service_name="web"} 1"#,
             "# TYPE pingap_k8s_event_to_write_seconds histogram",
             r#"pingap_k8s_event_to_write_seconds_bucket{le="0.5"} 0"#,
             r#"pingap_k8s_event_to_write_seconds_bucket{le="0.75"} 1"#,
             r#"pingap_k8s_event_to_write_seconds_bucket{le="30"} 1"#,
             "pingap_k8s_event_to_write_seconds_count 1",
+            "# TYPE pingap_k8s_drain_fallback gauge",
             r#"pingap_k8s_drain_fallback{upstream="web"} 1"#,
+            "# TYPE pingap_k8s_is_leader gauge",
             "pingap_k8s_is_leader 1",
+            "# TYPE pingap_k8s_etcd_up gauge",
             "pingap_k8s_etcd_up 0",
         ] {
             assert!(text.contains(line), "missing line {line:?} in:\n{text}");
         }
+        // No scope labels, no target_info, nothing beyond the nine families.
+        assert!(!text.contains("otel_scope"), "{text}");
+        assert!(!text.contains("target_info"), "{text}");
+        let families: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("# TYPE "))
+            .collect();
+        assert_eq!(families.len(), 9, "{families:?}");
+    }
+
+    #[test]
+    fn value_reads_series() {
+        let m = Metrics::new();
+        record_everything(&m);
+        let w = |r| {
+            m.value(
+                "pingap_k8s_writes_total",
+                &[("upstream", "web"), ("result", r)],
+            )
+        };
+        assert_eq!(w("ok"), 2);
+        assert_eq!(w("conflict"), 1);
+        assert_eq!(
+            m.value(
+                "pingap_k8s_endpoints",
+                &[("upstream", "web"), ("class", "ready")]
+            ),
+            3
+        );
+        assert_eq!(m.value("pingap_k8s_is_leader", &[]), 1);
+        assert_eq!(m.value("pingap_k8s_event_to_write_seconds_count", &[]), 1);
+        assert_eq!(m.value("pingap_k8s_writes_total", &[("upstream", "x")]), 0);
     }
 
     #[test]
     fn remove_upstream_drops_gauges_keeps_counters() {
         let m = Metrics::new();
         m.set_endpoints("web", 2, 0);
+        m.set_endpoints("api", 1, 0);
         m.set_drain_fallback("web", false);
         m.record_write("web", WriteResult::Ok);
+        let before = m.encode();
+        assert!(before.contains(r#"pingap_k8s_endpoints{class="ready",upstream="web"} 2"#));
         m.remove_upstream("web");
         m.set_watch_up("apps", "web", true);
+        m.set_watch_up("apps", "api", false);
         m.remove_watch("apps", "web");
 
         let text = m.encode();
-        assert!(!text.contains("pingap_k8s_endpoints{"));
-        assert!(!text.contains("pingap_k8s_drain_fallback{"));
-        assert!(!text.contains("pingap_k8s_watch_up{"));
+        assert!(!text.contains(r#"upstream="web"} 2"#), "{text}");
+        assert!(!text.contains("pingap_k8s_drain_fallback{"), "{text}");
+        assert!(!text.contains(r#"k8s_service_name="web""#), "{text}");
+        assert!(text.contains(r#"pingap_k8s_endpoints{class="ready",upstream="api"} 1"#));
+        assert!(text.contains(
+            r#"pingap_k8s_watch_up{k8s_namespace_name="apps",k8s_service_name="api"} 0"#
+        ));
         assert!(text.contains(r#"pingap_k8s_writes_total{result="ok",upstream="web"} 1"#));
+
+        // A re-added upstream reports again.
+        m.set_endpoints("web", 1, 0);
+        assert!(
+            m.encode()
+                .contains(r#"pingap_k8s_endpoints{class="ready",upstream="web"} 1"#)
+        );
     }
 
     #[test]

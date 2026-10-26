@@ -158,6 +158,16 @@ metrics:
     port: 9090
     annotations: {}
 
+# OpenTelemetry (metrics + logs over OTLP/gRPC). /metrics is served either way.
+otel:
+  # OTLP gRPC endpoint of a collector on the private/cluster network, e.g.
+  # "http://otel-collector.observability.svc:4317". Never a public address.
+  # Empty: no OTLP export.
+  endpoint: ""
+  # Extra resource attributes, added to k8s.namespace.name, k8s.pod.name and
+  # k8s.deployment.name, e.g. {deployment.environment.name: prod}.
+  resourceAttributes: {}
+
 podDisruptionBudget:
   enabled: true
   minAvailable: 1

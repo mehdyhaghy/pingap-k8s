@@ -5,5 +5,6 @@ pub mod metrics;
 pub mod reconcile;
 pub mod resolve;
 pub mod server;
+pub mod telemetry;
 pub mod types;
 pub mod watch;

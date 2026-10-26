@@ -42,6 +42,7 @@ resources is planned for later phases.
 - [Pingap side](#pingap-side)
 - [Graceful shutdown of application pods (preStop)](#graceful-shutdown-of-application-pods-prestop)
 - [Observability](#observability)
+  - [Telemetry](#telemetry)
 - [Security](#security)
 - [Limitations](#limitations)
 - [Development](#development)
@@ -378,12 +379,36 @@ The controller serves on port `9090` (cluster-internal only):
 | `pingap_k8s_endpoints` | `upstream`, `class="ready\|draining"` |
 | `pingap_k8s_writes_total` | `upstream`, `result="ok\|conflict\|error\|unchanged"` |
 | `pingap_k8s_foreign_writes_total` | `upstream`, `corrected="true\|false"` |
-| `pingap_k8s_watch_up` | `namespace`, `service` |
-| `pingap_k8s_watch_errors_total` | `namespace`, `service`, `reason` |
+| `pingap_k8s_watch_up` | `k8s_namespace_name`, `k8s_service_name` |
+| `pingap_k8s_watch_errors_total` | `k8s_namespace_name`, `k8s_service_name`, `error_type` |
 | `pingap_k8s_event_to_write_seconds` | histogram |
 | `pingap_k8s_drain_fallback` | `upstream` |
+| `pingap_k8s_is_leader`, `pingap_k8s_etcd_up` | none |
 
 The chart's metrics Service is `pingap-k8s-metrics` (`ClusterIP`, release `pingap-k8s`).
+
+### Telemetry
+
+Metrics are recorded once through OpenTelemetry and exposed two ways: `/metrics` (always) and,
+when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, OTLP over gRPC (OpenTelemetry names such as
+`pingap_k8s.writes` with `k8s.namespace.name`-style attributes). Logs always go to stderr; with an
+endpoint the same events are also sent as OTLP log records. There are no traces.
+
+Only the standard environment variables are read: `OTEL_EXPORTER_OTLP_ENDPOINT`,
+`OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TIMEOUT`, `OTEL_METRIC_EXPORT_INTERVAL`,
+`OTEL_SDK_DISABLED=true` (turns OTLP export off), `OTEL_SERVICE_NAME` (default `pingap-k8s`) and
+`OTEL_RESOURCE_ATTRIBUTES`. The chart sets the endpoint from `otel.endpoint` and always sets
+`k8s.namespace.name`, `k8s.pod.name` and `k8s.deployment.name`, plus `otel.resourceAttributes`:
+
+```yaml
+otel:
+  endpoint: http://otel-collector.observability.svc:4317
+  resourceAttributes:
+    deployment.environment.name: prod
+```
+
+The endpoint must be a collector on the private or cluster network (for example a ClusterIP
+Service), never a public address. Use `https://` for TLS (system roots).
 
 ## Security
 

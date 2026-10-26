@@ -14,8 +14,8 @@
 //!
 //! Failures: an error puts the watcher in the "down" state. It logs an error
 //! once (a 403 names the missing permission), sets
-//! `pingap_k8s_watch_up{namespace,service}` to 0 and counts
-//! `pingap_k8s_watch_errors_total{..,reason}`. The watcher then waits for the
+//! `pingap_k8s_watch_up{k8s_namespace_name,k8s_service_name}` to 0 and counts
+//! `pingap_k8s_watch_errors_total{..,error_type}`. The watcher then waits for the
 //! next delay of kube's [`DefaultBackoff`] (800 ms to 30 s, jittered, the policy
 //! `.default_backoff()` applies) and starts over with a fresh list. The first
 //! successful list after that logs one info line and sets `watch_up` back to 1.
@@ -110,7 +110,7 @@ impl WatchKind {
     }
 }
 
-/// Short, bounded `reason` label for `pingap_k8s_watch_errors_total`.
+/// Short, bounded `error.type` attribute of `pingap_k8s_watch_errors_total`.
 pub fn classify_error(err: &watcher::Error) -> &'static str {
     match err {
         watcher::Error::InitialListFailed(e)
@@ -701,10 +701,14 @@ mod tests {
 
         // Errors are counted and the watch is reported down.
         let errors = || {
-            metrics
-                .watch_errors_total
-                .with_label_values(&["prod", "echo", "transport"])
-                .get()
+            metrics.value(
+                "pingap_k8s_watch_errors_total",
+                &[
+                    ("k8s_namespace_name", "prod"),
+                    ("k8s_service_name", "echo"),
+                    ("error_type", "transport"),
+                ],
+            )
         };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while errors() < 2 && tokio::time::Instant::now() < deadline {
@@ -712,7 +716,10 @@ mod tests {
         }
         assert!(errors() >= 2, "errors counted for both watchers");
         assert_eq!(
-            metrics.watch_up.with_label_values(&["prod", "echo"]).get(),
+            metrics.value(
+                "pingap_k8s_watch_up",
+                &[("k8s_namespace_name", "prod"), ("k8s_service_name", "echo")]
+            ),
             0
         );
 

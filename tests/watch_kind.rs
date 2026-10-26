@@ -159,7 +159,10 @@ async fn run(client: Client, ns: &str, image: &str) -> anyhow::Result<()> {
     anyhow::ensure!(registry.is_synced());
     wait_for_notification(&mut rx, &key, Duration::from_secs(5)).await?;
     anyhow::ensure!(
-        metrics.watch_up.with_label_values(&[ns, SVC]).get() == 1,
+        metrics.value(
+            "pingap_k8s_watch_up",
+            &[("k8s_namespace_name", ns), ("k8s_service_name", SVC)]
+        ) == 1,
         "watch_up should be 1"
     );
 

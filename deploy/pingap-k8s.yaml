@@ -218,6 +218,8 @@ spec:
                   fieldPath: metadata.name
             - name: RUST_LOG
               value: "info"
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "k8s.namespace.name=$(POD_NAMESPACE),k8s.pod.name=$(POD_NAME),k8s.deployment.name=pingap-k8s"
           ports:
             - name: metrics
               containerPort: 9090

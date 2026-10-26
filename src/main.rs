@@ -22,6 +22,7 @@ use pingap_k8s::leader;
 use pingap_k8s::metrics::Metrics;
 use pingap_k8s::reconcile::Reconciler;
 use pingap_k8s::server::{self, Readiness};
+use pingap_k8s::telemetry::Telemetry;
 use pingap_k8s::types::{ForeignWrite, ServiceKey};
 use pingap_k8s::watch::WatchRegistry;
 
@@ -75,8 +76,22 @@ struct Args {
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
-    init_logging(args.log_format);
+    let identity = detect_identity(std::env::var_os("POD_NAME"), hostname);
+    let telemetry = match Telemetry::init(identity, !args.check) {
+        Ok(telemetry) => telemetry,
+        Err(err) => {
+            eprintln!("invalid OpenTelemetry configuration: {err:#}");
+            return ExitCode::from(EXIT_INVALID_CONFIG);
+        }
+    };
+    init_logging(args.log_format, &telemetry);
 
+    let code = main_inner(args, telemetry.metrics.clone()).await;
+    telemetry.shutdown().await;
+    code
+}
+
+async fn main_inner(args: Args, metrics: Arc<Metrics>) -> ExitCode {
     let namespace = pod_namespace();
     if args.check {
         return check(&args.config, &namespace);
@@ -90,7 +105,7 @@ async fn main() -> ExitCode {
         }
     };
 
-    match run(args.config, namespace, config, target).await {
+    match run(args.config, namespace, config, target, metrics).await {
         Ok(()) => {
             info!("stopped");
             ExitCode::SUCCESS
@@ -105,16 +120,20 @@ async fn main() -> ExitCode {
 // ---------------------------------------------------------------------------
 // Startup helpers
 
-fn init_logging(format: LogFormat) {
-    use tracing_subscriber::EnvFilter;
+/// stderr always; OTLP log records too when telemetry has an endpoint.
+fn init_logging(format: LogFormat, telemetry: &Telemetry) {
+    use tracing_subscriber::{EnvFilter, Layer as _, prelude::*};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let builder = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr);
-    match format {
-        LogFormat::Text => builder.init(),
-        LogFormat::Json => builder.json().flatten_event(true).init(),
-    }
+    let fmt = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+    let fmt = match format {
+        LogFormat::Text => fmt.boxed(),
+        LogFormat::Json => fmt.json().flatten_event(true).boxed(),
+    };
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt)
+        .with(telemetry.log_layer())
+        .init();
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -356,6 +375,7 @@ async fn run(
     namespace: String,
     config: Config,
     target: EtcdTarget,
+    metrics: Arc<Metrics>,
 ) -> anyhow::Result<()> {
     info!(
         config = %config_path.display(),
@@ -372,8 +392,7 @@ async fn run(
     let (reload_tx, reload_rx) = mpsc::channel::<Trigger>(8);
     spawn_signal_handler(shutdown_tx.clone(), reload_tx.clone())?;
 
-    // Metrics and readiness first, so /healthz answers during startup.
-    let metrics = Arc::new(Metrics::new());
+    // The metrics server first, so /healthz answers during startup.
     let readiness = Readiness::new();
     let listener = TcpListener::bind(config.server.listen)
         .await

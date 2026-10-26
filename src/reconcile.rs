@@ -1004,7 +1004,10 @@ mod tests {
     }
 
     fn write_count(m: &Metrics, upstream: &str, result: &str) -> u64 {
-        m.writes_total.with_label_values(&[upstream, result]).get()
+        m.value(
+            "pingap_k8s_writes_total",
+            &[("upstream", upstream), ("result", result)],
+        )
     }
 
     // ---- tests ----
@@ -1017,8 +1020,8 @@ mod tests {
         sleep(10).await;
         assert_eq!(h.writer.calls_for("web"), vec![addrs(&["10.0.0.1"])]);
         assert_eq!(write_count(&h.metrics, "web", "ok"), 1);
-        assert_eq!(h.metrics.etcd_up.get(), 1);
-        assert_eq!(h.metrics.is_leader.get(), 1);
+        assert_eq!(h.metrics.value("pingap_k8s_etcd_up", &[]), 1);
+        assert_eq!(h.metrics.value("pingap_k8s_is_leader", &[]), 1);
         sleep(5000).await;
         assert_eq!(h.writer.calls().len(), 1);
         h.stop().await;
@@ -1053,7 +1056,11 @@ mod tests {
             at >= Duration::from_millis(850) && at <= Duration::from_millis(900),
             "{at:?}"
         );
-        assert_eq!(h.metrics.event_to_write_seconds.get_sample_count(), 1);
+        assert_eq!(
+            h.metrics
+                .value("pingap_k8s_event_to_write_seconds_count", &[]),
+            1
+        );
         h.stop().await;
     }
 
@@ -1102,13 +1109,13 @@ mod tests {
         assert!(h.writer.calls().is_empty());
         // followers still compute
         assert_eq!(
-            h.metrics
-                .endpoints
-                .with_label_values(&["web", "ready"])
-                .get(),
+            h.metrics.value(
+                "pingap_k8s_endpoints",
+                &[("upstream", "web"), ("class", "ready")]
+            ),
             2
         );
-        assert_eq!(h.metrics.is_leader.get(), 0);
+        assert_eq!(h.metrics.value("pingap_k8s_is_leader", &[]), 0);
 
         h.leader.send(true).unwrap();
         sleep(3000).await;
@@ -1116,7 +1123,7 @@ mod tests {
             h.writer.calls_for("web"),
             vec![addrs(&["10.0.0.1", "10.0.0.2"])]
         );
-        assert_eq!(h.metrics.is_leader.get(), 1);
+        assert_eq!(h.metrics.value("pingap_k8s_is_leader", &[]), 1);
 
         // demoted again: no more writes
         h.leader.send(false).unwrap();
@@ -1157,14 +1164,17 @@ mod tests {
             s.set("web", &[], &["10.0.0.9"])
         });
         sleep(10).await;
-        let gauge = || h.metrics.drain_fallback.with_label_values(&["web"]).get();
+        let gauge = || {
+            h.metrics
+                .value("pingap_k8s_drain_fallback", &[("upstream", "web")])
+        };
         assert_eq!(gauge(), 1);
         assert_eq!(h.writer.calls_for("web"), vec![addrs(&["10.0.0.9"])]);
         assert_eq!(
-            h.metrics
-                .endpoints
-                .with_label_values(&["web", "draining"])
-                .get(),
+            h.metrics.value(
+                "pingap_k8s_endpoints",
+                &[("upstream", "web"), ("class", "draining")]
+            ),
             1
         );
 
@@ -1185,7 +1195,7 @@ mod tests {
         sleep(10).await;
         assert_eq!(h.writer.calls().len(), 1);
         assert!(!h.readiness_last_write_ok());
-        assert_eq!(h.metrics.etcd_up.get(), 0);
+        assert_eq!(h.metrics.value("pingap_k8s_etcd_up", &[]), 0);
 
         // state changes while etcd is down: the latest one wins
         h.source.set("web", &["10.0.0.2"], &[]);
@@ -1197,7 +1207,7 @@ mod tests {
         assert_eq!(write_count(&h.metrics, "web", "error"), 3);
         assert_eq!(write_count(&h.metrics, "web", "ok"), 1);
         assert!(h.readiness_last_write_ok());
-        assert_eq!(h.metrics.etcd_up.get(), 1);
+        assert_eq!(h.metrics.value("pingap_k8s_etcd_up", &[]), 1);
 
         // backoff: retry delays grow (0.4-0.6 s, then 0.8-1.2 s)
         let t = h.writer.calls();
@@ -1238,10 +1248,10 @@ mod tests {
         sleep(3000).await;
         assert!(h.writer.calls().is_empty());
         let fw = |c: &str| {
-            h.metrics
-                .foreign_writes_total
-                .with_label_values(&["web", c])
-                .get()
+            h.metrics.value(
+                "pingap_k8s_foreign_writes_total",
+                &[("upstream", "web"), ("corrected", c)],
+            )
         };
         assert_eq!(fw("false"), 1);
 
@@ -1293,7 +1303,7 @@ mod tests {
         sleep(10).await;
         assert_eq!(write_count(&h.metrics, "web", "conflict"), 1);
         assert_eq!(write_count(&h.metrics, "web", "error"), 0);
-        assert_eq!(h.metrics.etcd_up.get(), 1);
+        assert_eq!(h.metrics.value("pingap_k8s_etcd_up", &[]), 1);
         assert!(h.readiness_last_write_ok());
         sleep(1000).await;
         assert_eq!(h.writer.calls().len(), 2);
@@ -1313,7 +1323,7 @@ mod tests {
         assert_eq!(write_count(&h.metrics, "web", "error"), 1);
         // etcd answered: a malformed entry does not fail readiness
         assert!(h.readiness_last_write_ok());
-        assert_eq!(h.metrics.etcd_up.get(), 1);
+        assert_eq!(h.metrics.value("pingap_k8s_etcd_up", &[]), 1);
 
         // the next event retries
         h.source.set("web", &["10.0.0.2"], &[]);
