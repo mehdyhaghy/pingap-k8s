@@ -74,7 +74,10 @@ use crate::etcd::EtcdError;
 use crate::metrics::{Metrics, WriteResult};
 use crate::resolve::{self, ResolveWarning, ServiceInput};
 use crate::server::Readiness;
-use crate::types::{AddrsWriter, ForeignWrite, ServiceKey, SnapshotSource, WriteOutcome};
+use crate::status::StatusBoard;
+use crate::types::{
+    AddrsWriter, ForeignWrite, ServiceKey, SnapshotSource, UpstreamTarget, WriteOutcome,
+};
 
 /// First retry delay after a failed write.
 pub const RETRY_MIN: Duration = Duration::from_millis(500);
@@ -114,6 +117,7 @@ pub struct Reconciler<W: AddrsWriter, S: SnapshotSource> {
     metrics: Arc<Metrics>,
     readiness: Readiness,
     shared: Arc<Shared>,
+    status: StatusBoard,
 }
 
 impl<W: AddrsWriter, S: SnapshotSource> Clone for Reconciler<W, S> {
@@ -124,6 +128,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Clone for Reconciler<W, S> {
             metrics: Arc::clone(&self.metrics),
             readiness: self.readiness.clone(),
             shared: Arc::clone(&self.shared),
+            status: self.status.clone(),
         }
     }
 }
@@ -146,7 +151,20 @@ impl<W: AddrsWriter, S: SnapshotSource> Reconciler<W, S> {
                 notify: Notify::new(),
                 applied: watch::Sender::new(0),
             }),
+            status: StatusBoard::new(),
         }
+    }
+
+    /// Publishes read-only state into `board` for `/status`.
+    /// Call before [`Reconciler::run`]. Does not change reconcile behaviour.
+    pub fn with_status(mut self, board: StatusBoard) -> Self {
+        self.status = board;
+        self
+    }
+
+    /// The board this reconciler publishes into.
+    pub fn status_board(&self) -> StatusBoard {
+        self.status.clone()
     }
 
     /// Replaces the set of owned upstreams. Works before and while `run` is
@@ -208,8 +226,10 @@ impl<W: AddrsWriter, S: SnapshotSource> Reconciler<W, S> {
             inflight: JoinSet::new(),
             inflight_ids: HashMap::new(),
             unreachable: BTreeSet::new(),
+            status: self.status,
         };
         engine.metrics.set_leader(is_leader);
+        engine.status.set_running(is_leader);
         if let Some((generation, upstreams)) = lock(&self.shared.upstreams).take() {
             engine.apply_upstreams(upstreams, Instant::now());
             self.shared.applied.send_replace(generation);
@@ -436,9 +456,50 @@ struct Engine<W: AddrsWriter, S: SnapshotSource> {
     /// reached (drives readiness). Malformed entries and conflicts are not
     /// in here.
     unreachable: BTreeSet<String>,
+    /// Read-only copy of the state for `/status`.
+    status: StatusBoard,
 }
 
 impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
+    /// Copies the state of `name` into the status board.
+    fn publish(&self, name: &str) {
+        let Some(st) = self.upstreams.get(name) else {
+            return;
+        };
+        let leader = self.leader;
+        self.status.update_upstream(name, |u| {
+            u.target = match st.config.options.target {
+                UpstreamTarget::Pods => "pods",
+                UpstreamTarget::Service { .. } => "service",
+            }
+            .to_string();
+            u.services = st
+                .config
+                .services
+                .iter()
+                .map(|r| match r.weight {
+                    Some(w) => format!("{}.{}:{} {w}", r.key.name, r.key.namespace, r.port),
+                    None => format!("{}.{}:{}", r.key.name, r.key.namespace, r.port),
+                })
+                .collect();
+            u.desired = st.desired.clone().unwrap_or_default();
+            u.stored = st.last_written.clone();
+            u.in_sync =
+                leader && !st.inflight && st.desired.is_some() && st.last_written == st.desired;
+            u.pending = st.inflight || st.retry_at.is_some() || st.debounce.is_some();
+            u.fallback = st.fallback;
+            u.no_endpoints = st.empty;
+            u.malformed = st.malformed;
+            u.warnings = st.warnings.iter().map(ToString::to_string).collect();
+        });
+    }
+
+    fn publish_all(&self) {
+        for name in self.upstreams.keys() {
+            self.publish(name);
+        }
+    }
+
     fn apply_upstreams(&mut self, new: BTreeMap<String, UpstreamConfig>, now: Instant) {
         let removed: Vec<String> = self
             .upstreams
@@ -468,6 +529,9 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
                 }
             }
         }
+        self.status
+            .retain_upstreams(|name| self.upstreams.contains_key(name));
+        self.publish_all();
         self.by_service.clear();
         for (name, st) in &self.upstreams {
             for sref in &st.config.services {
@@ -533,6 +597,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
                     tracing::warn!(%upstream, revision, "foreign write changed addrs; scheduling a corrective write");
                     st.mark(now, true);
                 }
+                self.publish(&upstream);
             }
             ForeignWrite::Deleted { upstream, revision } => {
                 let Some(st) = self.upstreams.get_mut(&upstream) else {
@@ -542,6 +607,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
                 self.metrics.record_foreign_write(&upstream, true);
                 st.set_stored(None);
                 st.mark(now, true);
+                self.publish(&upstream);
             }
         }
     }
@@ -552,6 +618,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
         }
         self.leader = leader;
         self.metrics.set_leader(leader);
+        self.status.set_leader(leader);
         if leader {
             tracing::info!("became leader; reconciling all upstreams");
             // Another replica may have written meanwhile: forget what we
@@ -566,6 +633,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
             self.unreachable.clear();
             self.update_readiness();
         }
+        self.publish_all();
     }
 
     fn next_deadline(&self) -> Option<Instant> {
@@ -585,6 +653,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
             .collect();
         for name in due {
             self.reconcile(&name);
+            self.publish(&name);
         }
     }
 
@@ -616,6 +685,10 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
 
         self.metrics
             .set_endpoints(name, resolved.ready, resolved.draining);
+        self.status.update_upstream(name, |u| {
+            u.ready = resolved.ready;
+            u.draining = resolved.draining;
+        });
 
         // Each distinct warning once, until it clears.
         let current: BTreeSet<ResolveWarning> = resolved.warnings.iter().cloned().collect();
@@ -725,6 +798,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
                     }
                 };
                 self.metrics.record_write(&name, result);
+                self.status.record_write(&name, result.as_str(), &addrs);
                 if result == WriteResult::Ok
                     && let Some(since) = st.event_since
                 {
@@ -743,6 +817,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
                 self.metrics.set_etcd_up(true);
                 self.unreachable.remove(&name);
                 self.update_readiness();
+                self.publish(&name);
             }
             Err(err) => self.write_failed(&name, &err, now),
         }
@@ -757,6 +832,15 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
             } else {
                 WriteResult::Error
             },
+        );
+        self.status.record_write(
+            name,
+            match kind {
+                FailureKind::Conflict => "conflict",
+                FailureKind::Malformed => "malformed",
+                FailureKind::Other => "error",
+            },
+            &[],
         );
         // A malformed entry or a CAS conflict means etcd answered.
         self.metrics.set_etcd_up(kind != FailureKind::Other);
@@ -791,6 +875,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
             tracing::warn!(upstream = %name, error = %err, retry_in = ?delay, "writing addrs failed; will retry");
         }
         self.update_readiness();
+        self.publish(name);
     }
 
     fn update_readiness(&self) {
@@ -1094,6 +1179,42 @@ mod tests {
         assert_eq!(h.metrics.value("pingap_k8s_is_leader", &[]), 1);
         sleep(5000).await;
         assert_eq!(h.writer.calls().len(), 1);
+        h.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn status_board_mirrors_state() {
+        let h = Harness::start(&[("web", &["web", "gone"])], true, 64, |s| {
+            s.set("web", &["10.0.0.1"], &["10.0.0.9"])
+        });
+        sleep(10).await;
+        let board = h.handle.status_board();
+        let u = board.upstream("web").expect("published");
+        assert_eq!(u.target, "pods");
+        assert_eq!(u.services, vec!["web.prod:http", "gone.prod:http"]);
+        assert_eq!(u.desired, addrs(&["10.0.0.1"]));
+        assert_eq!(u.stored, Some(addrs(&["10.0.0.1"])));
+        assert!(u.in_sync && !u.pending && !u.fallback);
+        assert_eq!((u.ready, u.draining), (1, 1));
+        assert_eq!(u.warnings, vec!["service prod/gone not found"]);
+        let w = u.last_write.expect("write recorded");
+        assert_eq!((w.result.as_str(), w.addrs), ("ok", addrs(&["10.0.0.1"])));
+
+        // A failed write is recorded; demotion clears in_sync.
+        h.writer.fail(1, || anyhow::anyhow!("connection refused"));
+        h.source.set("web", &["10.0.0.2"], &[]);
+        h.change("web");
+        sleep(600).await;
+        let u = board.upstream("web").unwrap();
+        assert_eq!(u.last_write.unwrap().result, "error");
+        assert!(!u.in_sync && u.pending);
+        h.leader.send(false).unwrap();
+        sleep(10).await;
+        assert!(!board.upstream("web").unwrap().in_sync);
+
+        h.handle.set_upstreams(BTreeMap::new());
+        sleep(10).await;
+        assert!(board.upstream("web").is_none());
         h.stop().await;
     }
 

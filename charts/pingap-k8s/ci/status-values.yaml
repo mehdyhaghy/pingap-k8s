@@ -1,0 +1,5 @@
+# The read-only /status endpoint (loopback only, reached with kubectl port-forward).
+status:
+  enabled: true
+podAnnotations:
+  example.com/team: edge

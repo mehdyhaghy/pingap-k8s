@@ -115,6 +115,11 @@ impl Default for KubernetesSection {
 pub struct ServerSection {
     /// Listen address for `/metrics`, `/healthz` and `/readyz`.
     pub listen: SocketAddr,
+    /// Listen address of the read-only `/status` endpoint. Empty
+    /// (the default) disables it. Must be a loopback address: it is reached
+    /// with `kubectl port-forward` only, never through a Service.
+    #[serde(deserialize_with = "deserialize_status_listen")]
+    pub status_listen: Option<SocketAddr>,
 }
 
 impl Default for ServerSection {
@@ -123,8 +128,21 @@ impl Default for ServerSection {
             listen: DEFAULT_LISTEN
                 .parse()
                 .expect("valid default listen address"),
+            status_listen: None,
         }
     }
+}
+
+/// `""` is `None`; anything else must be an `ip:port` socket address.
+fn deserialize_status_listen<'de, D>(d: D) -> Result<Option<SocketAddr>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(d)?;
+    if s.trim().is_empty() {
+        return Ok(None);
+    }
+    s.trim().parse().map(Some).map_err(serde::de::Error::custom)
 }
 
 /// `[defaults]` after applying built-in defaults. `resync` is global; the
@@ -274,6 +292,15 @@ impl Config {
             validate_namespace(&raw.kubernetes.default_namespace).map_err(|reason| {
                 ConfigError::Invalid(format!("kubernetes.default_namespace: {reason}"))
             })?;
+        }
+
+        if let Some(addr) = raw.server.status_listen
+            && !addr.ip().is_loopback()
+        {
+            return Err(ConfigError::Invalid(format!(
+                "server.status_listen {addr} must be a loopback address (127.0.0.1 or [::1]); \
+                 the status endpoint is reached with kubectl port-forward only"
+            )));
         }
 
         let mut upstreams = BTreeMap::new();
@@ -961,6 +988,33 @@ target = "service"
         assert_eq!(c.server.listen, "[::]:9090".parse().unwrap());
         assert!(cfg("[server]\nlisten = \"localhost:9090\"\n").is_err());
         assert!(cfg("[server]\nport = 1\n").is_err());
+    }
+
+    #[test]
+    fn status_listen_off_by_default_and_loopback_only() {
+        assert_eq!(cfg("").unwrap().server.status_listen, None);
+        assert_eq!(
+            cfg("[server]\nstatus_listen = \"\"\n")
+                .unwrap()
+                .server
+                .status_listen,
+            None
+        );
+        for ok in ["127.0.0.1:9091", "[::1]:9091", "127.0.0.2:1"] {
+            let c = cfg(&format!("[server]\nstatus_listen = \"{ok}\"\n")).unwrap();
+            assert_eq!(c.server.status_listen, Some(ok.parse().unwrap()));
+        }
+        for bad in [
+            "0.0.0.0:9091",
+            "[::]:9091",
+            "10.0.0.5:9091",
+            "[fd00::1]:9091",
+        ] {
+            let m = err(&format!("[server]\nstatus_listen = \"{bad}\"\n"));
+            assert!(m.contains("must be a loopback address"), "{bad}: {m}");
+        }
+        assert!(cfg("[server]\nstatus_listen = \"localhost:9091\"\n").is_err());
+        assert!(cfg("[server]\nstatus_listen = \"9091\"\n").is_err());
     }
 
     #[test]

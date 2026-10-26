@@ -1,0 +1,70 @@
+# krew plugin manifest template for kubectl-pingap. The release workflow fills
+# in VERSION and the SHA256_* values and attaches the result to the GitHub
+# Release as pingap.yaml. Install it with:
+#   kubectl krew install --manifest-url=https://github.com/mehdyhaghy/pingap-k8s/releases/download/v<version>/pingap.yaml
+# It is not submitted to the central krew index.
+apiVersion: krew.googlecontainertools.github.com/v1alpha2
+kind: Plugin
+metadata:
+  name: pingap
+spec:
+  version: v${VERSION}
+  homepage: https://github.com/mehdyhaghy/pingap-k8s
+  shortDescription: Show what the pingap-k8s controller wrote to Pingap
+  description: |
+    Reads the read-only /status endpoint of the pingap-k8s controller through
+    kubectl port-forward (127.0.0.1 inside the pod) and shows each owned
+    upstream: target, Services, ready and draining endpoints, whether etcd is
+    in sync, the last write and active warnings. `explain <upstream>` says why
+    an upstream has no endpoints; `admin` port-forwards the quickstart Pingap
+    admin UI. Needs the chart value status.enabled=true and RBAC on
+    pods/portforward.
+  platforms:
+    - selector:
+        matchLabels:
+          os: linux
+          arch: amd64
+      uri: https://github.com/mehdyhaghy/pingap-k8s/releases/download/v${VERSION}/kubectl-pingap_${VERSION}_linux_amd64.tar.gz
+      sha256: ${SHA256_LINUX_AMD64}
+      bin: kubectl-pingap
+      files:
+        - from: kubectl-pingap
+          to: .
+        - from: LICENSE
+          to: .
+    - selector:
+        matchLabels:
+          os: linux
+          arch: arm64
+      uri: https://github.com/mehdyhaghy/pingap-k8s/releases/download/v${VERSION}/kubectl-pingap_${VERSION}_linux_arm64.tar.gz
+      sha256: ${SHA256_LINUX_ARM64}
+      bin: kubectl-pingap
+      files:
+        - from: kubectl-pingap
+          to: .
+        - from: LICENSE
+          to: .
+    - selector:
+        matchLabels:
+          os: darwin
+          arch: amd64
+      uri: https://github.com/mehdyhaghy/pingap-k8s/releases/download/v${VERSION}/kubectl-pingap_${VERSION}_darwin_amd64.tar.gz
+      sha256: ${SHA256_DARWIN_AMD64}
+      bin: kubectl-pingap
+      files:
+        - from: kubectl-pingap
+          to: .
+        - from: LICENSE
+          to: .
+    - selector:
+        matchLabels:
+          os: darwin
+          arch: arm64
+      uri: https://github.com/mehdyhaghy/pingap-k8s/releases/download/v${VERSION}/kubectl-pingap_${VERSION}_darwin_arm64.tar.gz
+      sha256: ${SHA256_DARWIN_ARM64}
+      bin: kubectl-pingap
+      files:
+        - from: kubectl-pingap
+          to: .
+        - from: LICENSE
+          to: .

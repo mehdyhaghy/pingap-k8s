@@ -15,6 +15,11 @@ path = "src/lib.rs"
 name = "pingap-k8s"
 path = "src/main.rs"
 
+# kubectl plugin. Not part of the controller image.
+[[bin]]
+name = "kubectl-pingap"
+path = "src/bin/kubectl-pingap.rs"
+
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
@@ -34,6 +39,7 @@ opentelemetry_sdk = { version = "0.33", default-features = false, features = ["m
 prometheus = { version = "0.14", default-features = false }
 rand = "0.10"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
 tokio = { version = "~1.53", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net"] }
 toml = "1"

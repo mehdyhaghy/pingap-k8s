@@ -432,6 +432,16 @@ impl Inner {
     }
 }
 
+/// Read-only state of the two watchers of one Service.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceWatchState {
+    pub key: ServiceKey,
+    /// Both watchers completed their first list.
+    pub synced: bool,
+    /// Both watchers are up (no error since their last successful event).
+    pub up: bool,
+}
+
 /// Holds the Service and EndpointSlice watchers of every referenced Service.
 /// Cheap to clone; the watchers stop when the last clone is dropped.
 #[derive(Clone)]
@@ -510,6 +520,20 @@ impl WatchRegistry {
             .iter()
             .filter(|(_, w)| !w.is_synced())
             .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    /// Per watched Service: whether both watchers have listed once and whether
+    /// both are currently up (for the status endpoint, the design notes).
+    pub fn watch_states(&self) -> Vec<ServiceWatchState> {
+        self.inner
+            .watches()
+            .iter()
+            .map(|(key, w)| ServiceWatchState {
+                key: key.clone(),
+                synced: w.is_synced(),
+                up: w.shared.state().health.all_up(),
+            })
             .collect()
     }
 

@@ -243,10 +243,18 @@ cluster_domain = {{ .Values.config.kubernetes.cluster_domain | default "cluster.
 
 [defaults]
 {{- include "pingap-k8s.tomlTable" .Values.config.defaults }}
-{{- if .Values.config.server }}
+{{- if and .Values.config.server (hasKey .Values.config.server "status_listen") }}
+{{- fail "config.server.status_listen: use status.enabled and status.port instead" }}
+{{- end }}
+{{- if or .Values.config.server .Values.status.enabled }}
 
 [server]
-{{- include "pingap-k8s.tomlTable" .Values.config.server }}
+{{- with .Values.config.server }}
+{{- include "pingap-k8s.tomlTable" . }}
+{{- end }}
+{{- if .Values.status.enabled }}
+status_listen = {{ printf "127.0.0.1:%d" (int .Values.status.port) | include "pingap-k8s.tomlString" }}
+{{- end }}
 {{- end }}
 {{- range $name := keys .Values.config.upstreams | sortAlpha }}
 {{- if not (regexMatch "^[A-Za-z0-9_-]+$" $name) }}

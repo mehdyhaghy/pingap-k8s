@@ -22,6 +22,7 @@ use pingap_k8s::leader;
 use pingap_k8s::metrics::Metrics;
 use pingap_k8s::reconcile::Reconciler;
 use pingap_k8s::server::{self, Readiness};
+use pingap_k8s::status::{self, StatusBoard, StatusSources};
 use pingap_k8s::telemetry::Telemetry;
 use pingap_k8s::types::{ForeignWrite, ServiceKey, UpstreamTarget};
 use pingap_k8s::watch::WatchRegistry;
@@ -433,6 +434,20 @@ async fn run(
         readiness.clone(),
         shutdown_signal(shutdown_rx.clone()),
     ));
+    // Optional read-only /status, loopback only.
+    let status_board = StatusBoard::new();
+    if let Some(addr) = config.server.status_listen {
+        let listener = status::bind(addr).await?;
+        let identity = detect_identity(std::env::var_os("POD_NAME"), hostname);
+        let sources =
+            StatusSources::new(identity, &target, status_board.clone(), readiness.clone());
+        let stop = shutdown_signal(shutdown_rx.clone());
+        tokio::spawn(async move {
+            if let Err(err) = status::serve_listener(listener, sources, stop).await {
+                error!("{err:#}");
+            }
+        });
+    }
 
     let client = kube_client(&config.kubernetes).await?;
 
@@ -448,6 +463,7 @@ async fn run(
 
     let registry = WatchRegistry::new(client, metrics.clone());
     registry.set_services(config.service_keys());
+    status_board.set_watches(Arc::new(registry.clone()));
     // never write a partial set, so nothing starts before every watcher listed once.
     if !wait_synced(&registry, &readiness, &mut reload_drain(), &shutdown_rx).await {
         return finish(server_task, None, None).await;
@@ -489,7 +505,8 @@ async fn run(
         Arc::new(registry.clone()),
         metrics.clone(),
         readiness.clone(),
-    );
+    )
+    .with_status(status_board);
     reconciler.set_upstreams(config.upstreams.clone());
     let reconcile_task = tokio::spawn(reconciler.clone().run(
         registry.subscribe(),

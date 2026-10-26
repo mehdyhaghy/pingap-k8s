@@ -45,6 +45,7 @@ resources is planned for later phases.
 - [Graceful shutdown of application pods (preStop)](#graceful-shutdown-of-application-pods-prestop)
 - [Production checklist](#production-checklist)
 - [Operating it with kubectl](#operating-it-with-kubectl)
+  - [kubectl plugin](#kubectl-plugin)
 - [Observability](#observability)
   - [Telemetry](#telemetry)
 - [Security](#security)
@@ -381,6 +382,7 @@ drain_terminating = true # any [defaults] key can be overridden per upstream
 | `resync` | `5m` | reconcile every upstream at this interval even without events |
 | `ipv4_only` | `false` | ignore IPv6 EndpointSlices. On dual-stack clusters each pod has one slice per family, so it is written twice (`10.x:port` and `[fd00::x]:port`); set `true` unless the Pingap pods can reach app pods over IPv6 |
 | `target` | `pods` | `pods` writes ready pod IPs, `service` writes the Service DNS name and port ([Upstream target](#upstream-target)); also per upstream |
+| `server.status_listen` | `""` (off) | loopback address of the read-only `/status` endpoint used by the [kubectl plugin](#kubectl-plugin), e.g. `127.0.0.1:9091` (restart required). Non-loopback addresses are rejected. The chart sets it with `status.enabled` |
 | `server.listen` | `[::]:9090` | address for `/metrics`, `/healthz` and `/readyz` (restart required). `[::]` also accepts IPv4 on Linux unless the node sets `net.ipv6.bindv6only=1`; on nodes with IPv6 disabled at boot use `0.0.0.0:9090` |
 | `upstreams.<name>.services` | (required) | list of `<service>[.<namespace>]:<port> [weight]` |
 
@@ -603,6 +605,48 @@ kubectl auth can-i list endpointslices.discovery.k8s.io -n <app-namespace> \
 kubectl auth can-i watch services -n <app-namespace> --as=system:serviceaccount:pingap-k8s:pingap-k8s
 ```
 
+### kubectl plugin
+
+`kubectl pingap` shows what the controller sees and wrote, per upstream, from the leader pod. It
+reads the controller's `/status` endpoint, which is off by default. Turn it on in the chart:
+
+```yaml
+status:
+  enabled: true   # /status on 127.0.0.1:9091 inside the pod; restarts the controller pods
+```
+
+Install the plugin from the [release assets](https://github.com/mehdyhaghy/pingap-k8s/releases)
+(`kubectl-pingap_<version>_<os>_<arch>.tar.gz` for linux/darwin and amd64/arm64, checked against
+`kubectl-pingap_<version>_checksums.txt`): put `kubectl-pingap` on your `PATH`. Or with krew, from
+the manifest attached to the release:
+
+```sh
+kubectl krew install --manifest-url=https://github.com/mehdyhaghy/pingap-k8s/releases/download/v0.1.0/pingap.yaml
+```
+
+```sh
+kubectl pingap status -n pingap-k8s          # one row per upstream: target, Services, ready/draining, in sync, last write
+kubectl pingap explain web -n pingap-k8s     # warnings, watch state and why an upstream has no endpoints
+kubectl pingap admin -n pingap-k8s           # port-forward the quickstart admin UI, print the URL and the password command
+```
+
+```text
+controller pingap-k8s-6d4f9c7b8-x2kqp (leader) v0.1.0, phase running, ready yes, etcd prefix /pingap, watchers 2/2 synced
+UPSTREAM  TARGET   SERVICES                      READY  DRAINING  IN SYNC  LAST WRITE  NOTES
+api       pods     api.prod:http                 2      0         yes      ok 12s ago
+web       service  web.prod:80 9,gone.prod:80 1  0      0         no       -           no endpoints, 1 warning
+```
+
+It runs `kubectl` underneath, so `--context`, `--kubeconfig` and your credentials apply as usual.
+`admin` prints the password only with `--show-password`. Security model:
+
+- `/status` listens on `127.0.0.1` inside the controller pod only, on its own port; no Service or
+  container port exposes it, and a non-loopback address is rejected.
+- It is reached only with `kubectl port-forward`, so who may use it is decided by RBAC on
+  `pods/portforward` in the controller's namespace.
+- It is read-only and never contains secrets: no etcd URL or credentials, no certificate paths, no
+  tokens, no admin password.
+
 ## Observability
 
 The controller serves on port `9090` (cluster-internal only):
@@ -705,6 +749,8 @@ make check         # fmt check, clippy -D warnings, tests, helm lint/template, e
 make manifests     # regenerate deploy/pingap-k8s.yaml from the chart
 make docker        # build the image for the local platform
 make docker-multiarch PLATFORMS=linux/amd64,linux/arm64
+STATUS=1 scripts/smoke-local.sh   # local binary + local etcd + kind, including /status
+make docker && scripts/plugin-kind.sh   # kubectl plugin against the chart on kind
 ```
 
 Building needs `protoc` and the protobuf well-known types (Debian/Ubuntu:

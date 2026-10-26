@@ -24,7 +24,12 @@ spec:
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- with .Values.podAnnotations }}
+      {{- $annotations := .Values.podAnnotations | default dict }}
+      {{- if .Values.status.enabled }}
+      {{- /* Read by the kubectl plugin; also restarts the pods ([server] is not hot-reloaded). */}}
+      {{- $annotations = merge (dict "pingap-k8s/status-port" (toString (int .Values.status.port))) $annotations }}
+      {{- end }}
+      {{- with $annotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}

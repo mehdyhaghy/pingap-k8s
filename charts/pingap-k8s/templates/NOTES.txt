@@ -7,6 +7,9 @@ Read access granted in: {{ include "pingap-k8s.rbacNamespaces" . | fromJsonArray
 Controller status:
   kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/component=controller,app.kubernetes.io/instance={{ .Release.Name }}
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "pingap-k8s.fullname" . }}-metrics {{ .Values.metrics.service.port }}   # then /metrics, /readyz
+{{- if .Values.status.enabled }}
+  kubectl pingap status -n {{ .Release.Namespace }}   # kubectl plugin; /status on 127.0.0.1:{{ .Values.status.port }} in the pod
+{{- end }}
 {{- if .Values.pingap.deploy }}
 
 Quickstart Pingap:

@@ -8,10 +8,12 @@
 #  4. a foreign write to the new upstream is corrected (owned-key watch restarted)
 #  5. config edited (in an unwatched subdir) + SIGHUP -> SIGHUP reload
 #  6. SIGTERM -> clean exit (code 0)
+# With STATUS=1 it also enables the loopback /status endpoint and checks its
+# JSON after step 1 (shape, leader, in sync, no etcd address in it).
 # The cluster, etcd and temp files are always removed on exit.
 #
 # Usage: scripts/smoke-local.sh
-# Env:   KIND_CLUSTER (default pk8s-t11), KIND_NODE_IMAGE (optional)
+# Env:   KIND_CLUSTER (default pk8s-t11), KIND_NODE_IMAGE (optional), STATUS=1 (optional)
 set -euo pipefail
 
 CLUSTER="${KIND_CLUSTER:-pk8s-t11}"
@@ -115,6 +117,9 @@ k rollout status deploy/smoke --timeout=120s
 
 # ---- config (ConfigMap-like layout: config.toml -> ..data/config.toml) ----
 METRICS_PORT=$(free_port)
+STATUS_PORT=$(free_port)
+STATUS_LINE=""
+[[ "${STATUS:-0}" == 1 ]] && STATUS_LINE="status_listen = \"127.0.0.1:${STATUS_PORT}\""
 write_config() { # $1 = dir, $2 = extra upstream TOML
   mkdir -p "$1"
   cat >"$1/config.toml" <<EOF
@@ -126,6 +131,7 @@ kubeconfig = "$KCFG"
 
 [server]
 listen = "127.0.0.1:${METRICS_PORT}"
+${STATUS_LINE}
 
 [defaults]
 debounce = "200ms"
@@ -184,6 +190,28 @@ ectl get /pingap/upstreams/app.toml --print-value-only
 curl -fsS "http://127.0.0.1:${METRICS_PORT}/readyz" >/dev/null || fail "/readyz not 200"
 curl -fsS "http://127.0.0.1:${METRICS_PORT}/metrics" | grep -q '^pingap_k8s_is_leader 1' || fail "not leader"
 pass "/readyz 200, is_leader 1"
+
+if [[ "${STATUS:-0}" == 1 ]]; then
+  step "1b. /status (loopback only)"
+  curl -fsS "http://127.0.0.1:${STATUS_PORT}/status" >"$WORK/status.json" || fail "/status not 200"
+  python3 - "$WORK/status.json" "$client_port" <<'PY' || fail "/status content"
+import json, sys
+text = open(sys.argv[1]).read()
+doc = json.loads(text)
+assert doc["version"] == 1 and doc["phase"] == "running", doc
+assert doc["is_leader"] and doc["ready"] and doc["watchers"]["synced"], doc
+assert doc["etcd"] == {"prefix": "/pingap"}, doc["etcd"]
+assert sys.argv[2] not in text, "etcd address leaked"
+(app,) = [u for u in doc["upstreams"] if u["name"] == "app"]
+assert app["target"] == "pods" and app["services"] == ["smoke.default:http"], app
+assert app["ready"] == 2 and app["in_sync"] and len(app["desired"]) == 2, app
+assert app["stored"] == app["desired"] and app["last_write"]["result"] == "ok", app
+print(json.dumps(app, indent=2))
+PY
+  code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${METRICS_PORT}/status")
+  [[ "$code" == 404 ]] || fail "/status served on the metrics port ($code)"
+  pass "/status JSON ok; not served on the metrics port"
+fi
 
 step "2. scale to 3"
 k scale deploy/smoke --replicas=3 >/dev/null

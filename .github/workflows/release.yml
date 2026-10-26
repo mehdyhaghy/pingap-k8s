@@ -1,7 +1,9 @@
 name: release
 
 # Publishes a release from a `v<version>` tag: the multi-arch image, the Helm
-# chart (OCI) and a GitHub Release with the chart package and plain manifests.
+# chart (OCI) and a GitHub Release with the chart package, plain manifests, the
+# kubectl-pingap plugin (linux/darwin, amd64/arm64, with checksums) and a krew
+# manifest for it. The plugin is not part of the image.
 # A manual run defaults to a dry run that builds everything and publishes nothing.
 
 on:
@@ -176,9 +178,71 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  # kubectl plugin, built natively on each platform (protoc is needed by the
+  # crate's etcd-client build script even though the plugin does not use it).
+  # Linux builds use Ubuntu 22.04 for an older glibc baseline.
+  plugin:
+    name: kubectl-pingap (${{ matrix.os }}/${{ matrix.arch }})
+    needs: [verify, rust]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { os: linux, arch: amd64, runner: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { os: linux, arch: arm64, runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: darwin, arch: amd64, runner: macos-15-intel, target: x86_64-apple-darwin }
+          - { os: darwin, arch: arm64, runner: macos-15, target: aarch64-apple-darwin }
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      OS: ${{ matrix.os }}
+      ARCH: ${{ matrix.arch }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: plugin-${{ matrix.target }}
+
+      - name: build
+        run: cargo build --release --locked --bin kubectl-pingap --target "$TARGET"
+
+      - name: package
+        run: |
+          set -euo pipefail
+          name="kubectl-pingap_${VERSION}_${OS}_${ARCH}"
+          mkdir -p staging dist
+          cp "target/$TARGET/release/kubectl-pingap" LICENSE staging/
+          ./staging/kubectl-pingap --version
+          tar -czf "dist/$name.tar.gz" -C staging kubectl-pingap LICENSE
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+          cat "dist/$name.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plugin-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
   release:
     name: chart and GitHub Release
-    needs: [verify, image]
+    needs: [verify, image, plugin]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -216,6 +280,31 @@ jobs:
           } > dist/pingap-k8s.yaml
           grep -n "image: $IMAGE:$VERSION" dist/pingap-k8s.yaml
 
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: plugin-*
+          path: dist
+          merge-multiple: true
+
+      - name: plugin checksums and krew manifest
+        run: |
+          set -euo pipefail
+          cd dist
+          cat kubectl-pingap_"$VERSION"_*.tar.gz.sha256 > "kubectl-pingap_${VERSION}_checksums.txt"
+          sha256sum -c "kubectl-pingap_${VERSION}_checksums.txt"
+          sha() { cut -d' ' -f1 "kubectl-pingap_${VERSION}_$1.tar.gz.sha256"; }
+          SHA256_LINUX_AMD64=$(sha linux_amd64)
+          SHA256_LINUX_ARM64=$(sha linux_arm64)
+          SHA256_DARWIN_AMD64=$(sha darwin_amd64)
+          SHA256_DARWIN_ARM64=$(sha darwin_arm64)
+          export SHA256_LINUX_AMD64 SHA256_LINUX_ARM64 SHA256_DARWIN_AMD64 SHA256_DARWIN_ARM64
+          # shellcheck disable=SC2016 # the variable names are envsubst's argument
+          envsubst '${VERSION} ${SHA256_LINUX_AMD64} ${SHA256_LINUX_ARM64} ${SHA256_DARWIN_AMD64} ${SHA256_DARWIN_ARM64}' \
+            < ../krew/pingap.yaml > pingap.yaml
+          if grep -n '[$]{' pingap.yaml; then echo "::error::unfilled placeholder in pingap.yaml"; exit 1; fi
+          [ "$(grep -c 'sha256: [0-9a-f]\{64\}$' pingap.yaml)" = 4 ] || { echo "::error::expected 4 sha256 lines"; exit 1; }
+          ls -l
+
       - name: push chart to ${{ env.CHART_REPO }}
         if: env.PUBLISH == 'true'
         env:
@@ -237,7 +326,10 @@ jobs:
             --title "$TAG" \
             --generate-notes \
             "dist/pingap-k8s-$VERSION.tgz" \
-            "dist/pingap-k8s.yaml#pingap-k8s.yaml"
+            "dist/pingap-k8s.yaml#pingap-k8s.yaml" \
+            dist/kubectl-pingap_"$VERSION"_*.tar.gz \
+            "dist/kubectl-pingap_${VERSION}_checksums.txt" \
+            "dist/pingap.yaml#pingap.yaml (krew manifest)"
 
       - name: dry run summary
         if: env.PUBLISH != 'true'
@@ -247,6 +339,7 @@ jobs:
             echo "- image: $IMAGE:$VERSION (built, not pushed)"
             echo "- chart: dist/pingap-k8s-$VERSION.tgz (not pushed to $CHART_REPO)"
             echo "- manifests: dist/pingap-k8s.yaml"
+            echo "- kubectl plugin: dist/kubectl-pingap_${VERSION}_*.tar.gz, krew manifest dist/pingap.yaml"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

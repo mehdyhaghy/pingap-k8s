@@ -170,6 +170,15 @@ metrics:
     port: 9090
     annotations: {}
 
+# Read-only /status endpoint for the kubectl plugin (`kubectl pingap status`).
+# When enabled the controller listens on 127.0.0.1:<port> inside the pod only:
+# no Service, no containerPort, not reachable from the network. Access is via
+# `kubectl port-forward` to a pod, so it is gated by RBAC on pods/portforward.
+# The JSON holds no secrets. Enabling it restarts the controller pods.
+status:
+  enabled: false
+  port: 9091
+
 # Optional NetworkPolicy for the controller pods. When enabled, the
 # metrics/health port accepts traffic only from the sources below; everything
 # else is denied. Kubelet probes keep working (node-to-pod traffic is always
