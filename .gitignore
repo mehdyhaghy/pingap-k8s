@@ -7,7 +7,7 @@
 *.pdb
 # Cargo.lock is committed: this is a binary crate.
 
-# Coverage, profiling, benchmarks
+# Coverage, profiling, benchmarks (scripts/bench-local.sh keeps results in target/bench/)
 *.profraw
 *.profdata
 lcov.info
@@ -79,6 +79,13 @@ values-*.local.yaml
 default.etcd/
 *.etcd/
 etcd-data/
+
+# Release staging (plugin tarballs, checksums, rendered manifests; see release.yml)
+/dist/
+/staging/
+*.tar.gz
+*.tar.gz.sha256
+kubectl-pingap_*_checksums.txt
 
 # ---------------------------------------------------------------------------
 # Container builds
