@@ -38,7 +38,14 @@
 //!
 //! etcd failures keep the desired state in memory and retry with exponential
 //! backoff (500 ms doubling to 30 s, +-20 % jitter); every retry recomputes
-//! the desired state, so the latest one wins.
+//! the desired state, so the latest one wins. Errors are classified best
+//! effort by looking for an [`EtcdError`] in the error chain:
+//! `Conflict` (CAS retries exhausted in the writer) counts as
+//! `result="conflict"` and uses the normal backoff; a malformed stored entry
+//! (`Toml`, `MissingTable`, `InvalidAddrs`, `NotUtf8`, `InvalidName`, spec
+//! 5.6) is logged as an error once per episode and retried only slowly
+//! ([`MALFORMED_RETRY`]) or on the next event or resync, never in a tight
+//! loop; anything else uses the normal backoff.
 //!
 //! Startup : the caller must wait for the watchers' first list before
 //! calling [`Reconciler::run`]; `run` reconciles every upstream right away.
@@ -54,6 +61,7 @@ use tokio::task::{Id, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior, sleep_until};
 
 use crate::config::UpstreamConfig;
+use crate::etcd::EtcdError;
 use crate::metrics::{Metrics, WriteResult};
 use crate::resolve::{self, ResolveWarning, ServiceInput};
 use crate::server::Readiness;
@@ -63,6 +71,9 @@ use crate::types::{AddrsWriter, ForeignWrite, ServiceKey, SnapshotSource, WriteO
 pub const RETRY_MIN: Duration = Duration::from_millis(500);
 /// Maximum retry delay after repeated failed writes.
 pub const RETRY_MAX: Duration = Duration::from_secs(30);
+/// Retry delay for a malformed stored entry. An event or resync
+/// retries earlier.
+pub const MALFORMED_RETRY: Duration = Duration::from_secs(300);
 
 /// Inputs that can be handed to a running [`Reconciler`] from another task.
 struct Shared {
@@ -301,6 +312,8 @@ struct UpstreamState {
     backoff: Duration,
     inflight: bool,
     empty: bool,
+    /// The stored entry is malformed; logged once per episode.
+    malformed: bool,
     fallback: bool,
     warnings: BTreeSet<ResolveWarning>,
 }
@@ -317,6 +330,7 @@ impl UpstreamState {
             backoff: RETRY_MIN,
             inflight: false,
             empty: false,
+            malformed: false,
             fallback: false,
             warnings: BTreeSet::new(),
         }
@@ -652,6 +666,10 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
                 {
                     self.metrics.observe_event_to_write(now - since);
                 }
+                if st.malformed {
+                    tracing::info!(upstream = %name, "stored upstream entry is writable again");
+                    st.malformed = false;
+                }
                 st.event_since = None;
                 st.last_written = Some(addrs);
                 st.backoff = RETRY_MIN;
@@ -664,8 +682,17 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
     }
 
     fn write_failed(&mut self, name: &str, err: &anyhow::Error, now: Instant) {
-        self.metrics.record_write(name, WriteResult::Error);
-        self.metrics.set_etcd_up(false);
+        let kind = classify(err);
+        self.metrics.record_write(
+            name,
+            if kind == FailureKind::Conflict {
+                WriteResult::Conflict
+            } else {
+                WriteResult::Error
+            },
+        );
+        // A malformed entry or a CAS conflict means etcd answered.
+        self.metrics.set_etcd_up(kind != FailureKind::Other);
         // A write that finishes after demotion is not retried and does not
         // affect readiness (followers never write).
         if !self.leader {
@@ -675,15 +702,52 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
             return;
         };
         self.failing.insert(name.to_string());
-        let delay = jitter(st.backoff);
-        st.backoff = (st.backoff * 2).min(RETRY_MAX);
-        st.retry_at = Some(now + delay);
+        let err = format!("{err:#}");
+        if kind == FailureKind::Malformed {
+            // Retrying fast cannot fix a broken entry: retry slowly, or
+            // earlier when the next event or resync fires.
+            st.retry_at = Some(now + jitter(MALFORMED_RETRY));
+            if !st.malformed {
+                st.malformed = true;
+                tracing::error!(upstream = %name, error = %err, "stored upstream entry is malformed; not written until it is fixed");
+            }
+        } else {
+            let delay = jitter(st.backoff);
+            st.backoff = (st.backoff * 2).min(RETRY_MAX);
+            st.retry_at = Some(now + delay);
+            tracing::warn!(upstream = %name, error = %err, retry_in = ?delay, "writing addrs failed; will retry");
+        }
         self.update_readiness();
-        tracing::warn!(upstream = %name, error = %format!("{err:#}"), retry_in = ?delay, "writing addrs failed; will retry");
     }
 
     fn update_readiness(&self) {
         self.readiness.set_last_write_ok(self.failing.is_empty());
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailureKind {
+    /// CAS retries exhausted inside the writer.
+    Conflict,
+    /// The stored entry cannot be edited.
+    Malformed,
+    /// etcd unreachable, timeouts and anything unclassified.
+    Other,
+}
+
+/// Best-effort classification: the reconciler stays generic over
+/// [`AddrsWriter`], so only errors that carry an [`EtcdError`] are refined.
+fn classify(err: &anyhow::Error) -> FailureKind {
+    match err.chain().find_map(|e| e.downcast_ref::<EtcdError>()) {
+        Some(EtcdError::Conflict { .. }) => FailureKind::Conflict,
+        Some(
+            EtcdError::Toml(_)
+            | EtcdError::MissingTable(_)
+            | EtcdError::InvalidAddrs(_)
+            | EtcdError::NotUtf8(_)
+            | EtcdError::InvalidName(_),
+        ) => FailureKind::Malformed,
+        _ => FailureKind::Other,
     }
 }
 
@@ -766,7 +830,7 @@ mod tests {
     struct FakeWriter {
         calls: Mutex<Vec<(String, Vec<String>, Instant)>>,
         stored: Mutex<HashMap<String, Vec<String>>>,
-        fail_next: Mutex<usize>,
+        failures: Mutex<std::collections::VecDeque<anyhow::Error>>,
     }
 
     impl AddrsWriter for FakeWriter {
@@ -776,14 +840,9 @@ mod tests {
             addrs: &[String],
         ) -> impl Future<Output = anyhow::Result<WriteOutcome>> + Send {
             lock(&self.calls).push((upstream.to_string(), addrs.to_vec(), Instant::now()));
-            let fail = {
-                let mut n = lock(&self.fail_next);
-                let fail = *n > 0;
-                *n = n.saturating_sub(1);
-                fail
-            };
-            let result = if fail {
-                Err(anyhow::anyhow!("etcd unavailable"))
+            let fail = lock(&self.failures).pop_front();
+            let result = if let Some(err) = fail {
+                Err(err)
             } else {
                 let mut stored = lock(&self.stored);
                 match stored.insert(upstream.to_string(), addrs.to_vec()) {
@@ -806,6 +865,12 @@ mod tests {
                 .filter(|c| c.0 == upstream)
                 .map(|c| c.1)
                 .collect()
+        }
+        fn fail(&self, n: usize, err: impl Fn() -> anyhow::Error) {
+            let mut f = lock(&self.failures);
+            for _ in 0..n {
+                f.push_back(err());
+            }
         }
         fn clear(&self) {
             lock(&self.calls).clear();
@@ -1101,7 +1166,7 @@ mod tests {
         let h = Harness::start(&[("web", &["web"])], true, 64, |s| {
             s.set("web", &["10.0.0.1"], &[])
         });
-        *lock(&h.writer.fail_next) = 3;
+        h.writer.fail(3, || anyhow::anyhow!("etcd unavailable"));
         sleep(10).await;
         assert_eq!(h.writer.calls().len(), 1);
         assert!(!h.readiness_last_write_ok());
@@ -1195,6 +1260,58 @@ mod tests {
             .unwrap();
         sleep(3000).await;
         assert_eq!(h.writer.calls().len(), 1);
+        h.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn conflict_is_counted_and_retried() {
+        let h = Harness::start(&[("web", &["web"])], true, 64, |s| {
+            s.set("web", &["10.0.0.1"], &[])
+        });
+        h.writer.fail(1, || {
+            anyhow::Error::new(EtcdError::Conflict {
+                key: "/pingap/upstreams/web.toml".into(),
+                attempts: 5,
+            })
+            .context("writing web")
+        });
+        sleep(10).await;
+        assert_eq!(write_count(&h.metrics, "web", "conflict"), 1);
+        assert_eq!(write_count(&h.metrics, "web", "error"), 0);
+        assert_eq!(h.metrics.etcd_up.get(), 1);
+        sleep(1000).await;
+        assert_eq!(h.writer.calls().len(), 2);
+        assert_eq!(write_count(&h.metrics, "web", "ok"), 1);
+        h.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn malformed_entry_is_not_retried_in_a_tight_loop() {
+        let h = Harness::start(&[("web", &["web"])], true, 64, |s| {
+            s.set("web", &["10.0.0.1"], &[])
+        });
+        h.writer
+            .fail(100, || EtcdError::Toml("expected `=`".into()).into());
+        sleep(60_000).await;
+        assert_eq!(h.writer.calls().len(), 1);
+        assert_eq!(write_count(&h.metrics, "web", "error"), 1);
+        assert!(!h.readiness_last_write_ok());
+
+        // the next event retries
+        h.source.set("web", &["10.0.0.2"], &[]);
+        h.change("web");
+        sleep(1000).await;
+        assert_eq!(h.writer.calls().len(), 2);
+
+        // fixed: the slow retry succeeds
+        lock(&h.writer.failures).clear();
+        sleep(MALFORMED_RETRY.as_millis() as u64 * 5 / 4).await;
+        assert_eq!(
+            h.writer.calls_for("web").last().unwrap(),
+            &addrs(&["10.0.0.2"])
+        );
+        assert_eq!(write_count(&h.metrics, "web", "ok"), 1);
+        assert!(h.readiness_last_write_ok());
         h.stop().await;
     }
 
