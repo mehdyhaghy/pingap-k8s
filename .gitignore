@@ -1,0 +1,135 @@
+# ---------------------------------------------------------------------------
+# Rust
+# ---------------------------------------------------------------------------
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+# Cargo.lock is committed: this is a binary crate.
+
+# Coverage, profiling, benchmarks
+*.profraw
+*.profdata
+lcov.info
+coverage/
+tarpaulin-report.*
+cobertura.xml
+flamegraph.svg
+perf.data
+perf.data.old
+criterion/
+
+# Fuzzing
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+
+# ---------------------------------------------------------------------------
+# Secrets and credentials (never commit)
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.der
+!**/testdata/**/*.pem
+!**/testdata/**/*.key
+!**/testdata/**/*.crt
+secrets/
+*.secret.yaml
+*.secret.yml
+*-secret.yaml
+*-secret.yml
+kubeconfig
+kubeconfig*
+*.kubeconfig
+.kube/
+etcd-certs/
+id_rsa*
+id_ed25519*
+.netrc
+.htpasswd
+
+# ---------------------------------------------------------------------------
+# Kubernetes / Helm / kind
+# ---------------------------------------------------------------------------
+charts/*/charts/
+charts/*/Chart.lock
+charts/*/tmpcharts/
+*.tgz
+!charts/**/testdata/*.tgz
+helm-output/
+rendered/
+kind-config.local.yaml
+values.local.yaml
+values-*.local.yaml
+*.local.toml
+
+# Local etcd data from tests
+default.etcd/
+*.etcd/
+etcd-data/
+
+# ---------------------------------------------------------------------------
+# Container builds
+# ---------------------------------------------------------------------------
+.docker/
+docker-compose.override.yml
+*.tar
+!**/testdata/**/*.tar
+
+# ---------------------------------------------------------------------------
+# Logs, temp and local scratch
+# ---------------------------------------------------------------------------
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.swp
+*.swo
+*~
+*.orig
+*.rej
+*.bak
+
+# Local notes not meant for the repository
+ISSUE-*-RESPONSE.md
+
+# ---------------------------------------------------------------------------
+# Editors and IDEs
+# ---------------------------------------------------------------------------
+.idea/
+*.iml
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/launch.json
+.fleet/
+.zed/
+*.sublime-project
+*.sublime-workspace
+.history/
+.direnv/
+.envrc
+
+# ---------------------------------------------------------------------------
+# Operating systems
+# ---------------------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
