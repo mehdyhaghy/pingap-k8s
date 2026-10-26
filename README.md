@@ -437,3 +437,22 @@ Built with [kube-rs](https://github.com/kube-rs/kube), [k8s-openapi](https://git
 ## License
 
 Apache-2.0, the same license as Pingap. See [LICENSE](LICENSE).
+
+## Releasing
+
+1. Bump the version in three places to the same value (for example `0.2.0`): `version` in
+   `Cargo.toml`, and `version` and `appVersion` in `charts/pingap-k8s/Chart.yaml`. Run
+   `cargo check` to update `Cargo.lock`, then `make manifests` and `make check`.
+2. Commit, merge to `main`, then tag and push the tag:
+
+   ```sh
+   git tag -a v0.2.0 -m "v0.2.0"
+   git push origin v0.2.0
+   ```
+
+The `release` workflow fails if the tag does not match both files. Otherwise it runs the CI checks,
+pushes the `linux/amd64` + `linux/arm64` image to `ghcr.io/mehdyhaghy/pingap-k8s:<version>` and
+`:latest` (with SBOM and provenance attestations), pushes the chart to
+`oci://ghcr.io/mehdyhaghy/charts/pingap-k8s`, and creates a GitHub Release with generated notes,
+the chart package and `pingap-k8s.yaml` (plain manifests pinned to the release image). To test the
+pipeline without publishing, run the workflow manually with `dry-run` checked (the default).

@@ -1,0 +1,256 @@
+name: release
+
+# Publishes a release from a `v<version>` tag: the multi-arch image, the Helm
+# chart (OCI) and a GitHub Release with the chart package and plain manifests.
+# A manual run defaults to a dry run that builds everything and publishes nothing.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Build the image, chart and manifests without pushing or releasing
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  HELM_VERSION: v4.3.1
+  IMAGE: ghcr.io/mehdyhaghy/pingap-k8s
+  CHART_REPO: oci://ghcr.io/mehdyhaghy/charts
+  CHART: charts/pingap-k8s
+
+jobs:
+  verify:
+    name: verify versions
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.versions.outputs.version }}
+      tag: ${{ steps.versions.outputs.tag }}
+      publish: ${{ steps.versions.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: tag, Cargo.toml and Chart.yaml agree
+        id: versions
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          set -euo pipefail
+          cargo_version=$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p && /^version *=/{gsub(/"/,"",$3); print $3; exit}' Cargo.toml)
+          chart_version=$(sed -n 's/^version: *//p' "$CHART/Chart.yaml" | tr -d '"'"'"' ')
+          app_version=$(sed -n 's/^appVersion: *//p' "$CHART/Chart.yaml" | tr -d '"'"'"' ')
+          echo "Cargo.toml version:   $cargo_version"
+          echo "Chart.yaml version:   $chart_version"
+          echo "Chart.yaml appVersion: $app_version"
+          fail=0
+          if [ -z "$cargo_version" ]; then echo "::error::no version in Cargo.toml [package]"; fail=1; fi
+          if [ "$chart_version" != "$cargo_version" ]; then
+            echo "::error file=$CHART/Chart.yaml::version $chart_version does not match Cargo.toml $cargo_version"; fail=1
+          fi
+          if [ "$app_version" != "$cargo_version" ]; then
+            echo "::error file=$CHART/Chart.yaml::appVersion $app_version does not match Cargo.toml $cargo_version"; fail=1
+          fi
+
+          publish=false
+          if [ "$REF_TYPE" = "tag" ]; then
+            if [ "$REF_NAME" != "v$cargo_version" ]; then
+              echo "::error::tag $REF_NAME does not match v$cargo_version from Cargo.toml"; fail=1
+            fi
+            if [ "$EVENT" = "push" ] || [ "$DRY_RUN" = "false" ]; then publish=true; fi
+          elif [ "$DRY_RUN" = "false" ]; then
+            echo "::error::a non dry-run release must run on a v* tag, not $REF_TYPE $REF_NAME"; fail=1
+          fi
+          [ "$fail" = 0 ] || exit 1
+
+          {
+            echo "version=$cargo_version"
+            echo "tag=v$cargo_version"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+          echo "publish: $publish"
+
+  rust:
+    name: fmt, clippy, test
+    needs: verify
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # etcd-client generates its gRPC code with protoc at build time;
+      # libprotobuf-dev provides the well-known .proto files it imports.
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+          protoc --version
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: test
+        run: cargo test --locked
+
+  helm:
+    name: helm lint and manifests
+    needs: verify
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: helm lint
+        run: make helm-lint
+
+      - name: helm template
+        run: make helm-template
+
+      - name: plain manifests are up to date
+        run: make manifests-check
+
+      - name: no public exposure of etcd, metrics or admin; no ClusterRole
+        run: make exposure-check
+
+  image:
+    name: image (linux/amd64, linux/arm64)
+    needs: [verify, rust, helm]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: log in to ghcr.io
+        if: needs.verify.outputs.publish == 'true'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The builder stage cross-compiles on the runner's platform, so arm64
+      # needs no emulation.
+      - name: build and push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ needs.verify.outputs.publish == 'true' }}
+          tags: |
+            ${{ env.IMAGE }}:${{ needs.verify.outputs.version }}
+            ${{ env.IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.verify.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=Apache-2.0
+          provenance: true
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    name: chart and GitHub Release
+    needs: [verify, image]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      TAG: ${{ needs.verify.outputs.tag }}
+      PUBLISH: ${{ needs.verify.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: package chart
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          helm package "$CHART" --destination dist --version "$VERSION" --app-version "$VERSION"
+          ls -l dist
+
+      - name: render plain manifests
+        run: |
+          set -euo pipefail
+          {
+            echo "# pingap-k8s $VERSION plain manifests, rendered from the $CHART chart with the"
+            echo "# default values and image $IMAGE:$VERSION."
+            echo "#"
+            echo "# Before applying: create the namespace, edit the etcd URL in the ConfigMap, the"
+            echo "# upstreams, and add a Role + RoleBinding for every namespace your Services are in."
+            echo "#   kubectl create namespace pingap-k8s"
+            echo "#   kubectl apply -f pingap-k8s.yaml"
+            helm template pingap-k8s "$CHART" --namespace pingap-k8s --set "image.tag=$VERSION"
+          } > dist/pingap-k8s.yaml
+          grep -n "image: $IMAGE:$VERSION" dist/pingap-k8s.yaml
+
+      - name: push chart to ${{ env.CHART_REPO }}
+        if: env.PUBLISH == 'true'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          echo "$GHCR_TOKEN" | helm registry login ghcr.io --username "$ACTOR" --password-stdin
+          helm push "dist/pingap-k8s-$VERSION.tgz" "$CHART_REPO"
+
+      - name: create GitHub Release
+        if: env.PUBLISH == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --verify-tag \
+            --title "$TAG" \
+            --generate-notes \
+            "dist/pingap-k8s-$VERSION.tgz" \
+            "dist/pingap-k8s.yaml#pingap-k8s.yaml"
+
+      - name: dry run summary
+        if: env.PUBLISH != 'true'
+        run: |
+          {
+            echo "### Dry run: nothing was pushed or released"
+            echo "- image: $IMAGE:$VERSION (built, not pushed)"
+            echo "- chart: dist/pingap-k8s-$VERSION.tgz (not pushed to $CHART_REPO)"
+            echo "- manifests: dist/pingap-k8s.yaml"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ env.VERSION }}
+          path: dist/
+          if-no-files-found: error
