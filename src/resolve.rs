@@ -17,6 +17,12 @@
 //!   draining, the draining ones are written and `fallback` is set. With
 //!   `drain_terminating = false`, draining endpoints count as ready.
 //!
+//! - Target mode: with `target = "service"` the Service and its port
+//!   are checked as in 5.2, and each entry contributes one
+//!   `<service>.<namespace>.svc.<cluster_domain>:<service port>` address
+//!   instead of pod IPs. Slices and readiness are not consulted, `ready`
+//!   counts the addresses written, and the drain fallback never applies.
+//!
 //! Dedupe is by `ip:port` across all slices and all Services of the upstream.
 //! When the same `ip:port` is seen more than once, the first occurrence in
 //! config order keeps its weight (no warning); if any occurrence is ready, the
@@ -29,7 +35,9 @@ use std::net::{IpAddr, SocketAddr};
 use k8s_openapi::api::core::v1::{Service, ServicePort};
 use k8s_openapi::api::discovery::v1::{EndpointConditions, EndpointSlice};
 
-use crate::types::{PortRef, ServiceKey, ServiceRef, ServiceSnapshot, UpstreamOptions};
+use crate::types::{
+    PortRef, ServiceKey, ServiceRef, ServiceSnapshot, UpstreamOptions, UpstreamTarget,
+};
 
 /// One `services` entry of an upstream together with the current state of
 /// its Service.
@@ -166,6 +174,9 @@ struct Entry {
 /// Resolves the `addrs` of one upstream from its `services` entries, in
 /// config order.
 pub fn resolve(inputs: &[ServiceInput<'_>], opts: &UpstreamOptions) -> Resolved {
+    if let UpstreamTarget::Service { cluster_domain } = &opts.target {
+        return resolve_service_target(inputs, cluster_domain);
+    }
     let mut warnings = Vec::new();
     let mut seen: HashMap<SocketAddr, Entry> = HashMap::new();
 
@@ -276,6 +287,64 @@ pub fn resolve(inputs: &[ServiceInput<'_>], opts: &UpstreamOptions) -> Resolved 
     }
 }
 
+/// `target = "service"`: one Service DNS name per entry, port is the
+/// Service `port`.
+///
+/// Pingap resolves the name itself: an upstream whose `discovery` is unset
+/// and whose `addrs` hold a hostname is treated as `discovery = "dns"`
+/// (pingap-config `UpstreamConf::guess_discovery`), and DNS discovery looks
+/// the names up again every `update_frequency` (default 60 s). So a Service
+/// whose ClusterIP changes (deleted and recreated) is picked up without a
+/// controller write. An explicit `discovery = "static"` on the upstream
+/// would resolve the name only once, when the upstream is built.
+fn resolve_service_target(inputs: &[ServiceInput<'_>], cluster_domain: &str) -> Resolved {
+    let mut warnings = Vec::new();
+    // address -> weight; the first entry in config order keeps its weight.
+    let mut seen: HashMap<String, Option<u32>> = HashMap::new();
+
+    for input in inputs {
+        let sref = input.service_ref;
+        let Some(service) = input.snapshot.service.as_deref() else {
+            warnings.push(ResolveWarning::ServiceMissing(sref.key.clone()));
+            continue;
+        };
+        let Some(port) = find_service_port(service, &sref.port)
+            .and_then(|p| u16::try_from(p.port).ok())
+            .filter(|p| *p != 0)
+        else {
+            warnings.push(ResolveWarning::PortNotInService {
+                service: sref.key.clone(),
+                port: sref.port.clone(),
+            });
+            continue;
+        };
+        let addr = format!(
+            "{}.{}.svc.{cluster_domain}:{port}",
+            sref.key.name, sref.key.namespace
+        );
+        seen.entry(addr).or_insert(sref.weight);
+    }
+
+    let mut addrs: Vec<String> = seen
+        .into_iter()
+        .map(|(addr, weight)| match weight {
+            Some(w) => format!("{addr} {w}"),
+            None => addr,
+        })
+        .collect();
+    addrs.sort();
+    warnings.sort();
+    warnings.dedup();
+
+    Resolved {
+        ready: addrs.len(),
+        addrs,
+        draining: 0,
+        fallback: false,
+        warnings,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::type_complexity)] // table-test tuples
 mod tests {
@@ -295,6 +364,7 @@ mod tests {
             ipv4_only: false,
             debounce: Duration::from_millis(500),
             debounce_max: Duration::from_secs(2),
+            target: UpstreamTarget::Pods,
         }
     }
 
@@ -1042,5 +1112,168 @@ mod tests {
             ResolveWarning::ServiceMissing(key("api")).to_string(),
             "service prod/api not found"
         );
+    }
+
+    // ---- target = "service" ----
+
+    fn svc_opts(domain: &str) -> UpstreamOptions {
+        UpstreamOptions {
+            target: UpstreamTarget::Service {
+                cluster_domain: domain.into(),
+            },
+            ..opts()
+        }
+    }
+
+    #[test]
+    fn service_target_table() {
+        let web = service(&[("http", 80, "TCP"), ("admin", 9000, "TCP")]);
+        let unnamed = service(&[("", 8081, "")]);
+        // Slices are ignored: no slice, a not-ready one, a slice port mismatch.
+        let not_ready = v4(vec![ep("10.0.0.1", NOT_READY)]);
+        let other_port = slice("IPv4", &[("grpc", 1, "TCP")], vec![ep("10.0.0.2", READY)]);
+        // (name, entry, snapshot, cluster_domain, addrs, warnings)
+        let cases: Vec<(
+            &str,
+            ServiceRef,
+            ServiceSnapshot,
+            &str,
+            Vec<&str>,
+            Vec<ResolveWarning>,
+        )> = vec![
+            (
+                "named port",
+                sref("web", named("http"), None),
+                snap(Some(web.clone()), vec![]),
+                "cluster.local",
+                vec!["web.prod.svc.cluster.local:80"],
+                vec![],
+            ),
+            (
+                "numeric port is the Service port, not the pod port",
+                sref("web", PortRef::Number(9000), None),
+                snap(Some(web.clone()), vec![not_ready.clone()]),
+                "cluster.local",
+                vec!["web.prod.svc.cluster.local:9000"],
+                vec![],
+            ),
+            (
+                "single unnamed port by number",
+                sref("web", PortRef::Number(8081), None),
+                snap(Some(unnamed), vec![other_port]),
+                "cluster.local",
+                vec!["web.prod.svc.cluster.local:8081"],
+                vec![],
+            ),
+            (
+                "weight",
+                sref("web", named("http"), Some(7)),
+                snap(Some(web.clone()), vec![]),
+                "cluster.local",
+                vec!["web.prod.svc.cluster.local:80 7"],
+                vec![],
+            ),
+            (
+                "custom cluster domain",
+                sref("web", named("http"), None),
+                snap(Some(web.clone()), vec![]),
+                "k8s.example.internal",
+                vec!["web.prod.svc.k8s.example.internal:80"],
+                vec![],
+            ),
+            (
+                "missing Service",
+                sref("web", named("http"), None),
+                snap(None, vec![not_ready]),
+                "cluster.local",
+                vec![],
+                vec![ResolveWarning::ServiceMissing(key("web"))],
+            ),
+            (
+                "missing port name",
+                sref("web", named("grpc"), None),
+                snap(Some(web.clone()), vec![]),
+                "cluster.local",
+                vec![],
+                vec![ResolveWarning::PortNotInService {
+                    service: key("web"),
+                    port: named("grpc"),
+                }],
+            ),
+            (
+                "missing port number (pod port is not matched)",
+                sref("web", PortRef::Number(8080), None),
+                snap(Some(web), vec![]),
+                "cluster.local",
+                vec![],
+                vec![ResolveWarning::PortNotInService {
+                    service: key("web"),
+                    port: PortRef::Number(8080),
+                }],
+            ),
+        ];
+        for (name, r, s, domain, addrs, warnings) in cases {
+            let got = run1(&r, &s, &svc_opts(domain));
+            assert_eq!(got.addrs, addrs, "{name}");
+            assert_eq!(got.warnings, warnings, "{name}");
+            assert_eq!((got.ready, got.draining), (addrs.len(), 0), "{name}");
+            assert!(!got.fallback, "{name}");
+        }
+    }
+
+    #[test]
+    fn service_target_multiple_services_sorted_with_weights() {
+        let green = sref("web-green", named("http"), Some(1));
+        let blue = sref("web-blue", named("http"), Some(9));
+        let missing = sref("gone", named("http"), None);
+        let blue_again = sref("web-blue", PortRef::Number(80), Some(3));
+        let present = snap(http_svc(), vec![]);
+        let absent = snap(None, vec![]);
+        let got = resolve(
+            &[
+                ServiceInput {
+                    service_ref: &green,
+                    snapshot: &present,
+                },
+                ServiceInput {
+                    service_ref: &missing,
+                    snapshot: &absent,
+                },
+                ServiceInput {
+                    service_ref: &blue,
+                    snapshot: &present,
+                },
+                // Same address as `blue`: the first entry keeps its weight.
+                ServiceInput {
+                    service_ref: &blue_again,
+                    snapshot: &present,
+                },
+            ],
+            &svc_opts("cluster.local"),
+        );
+        assert_eq!(
+            got.addrs,
+            vec![
+                "web-blue.prod.svc.cluster.local:80 9",
+                "web-green.prod.svc.cluster.local:80 1",
+            ]
+        );
+        assert_eq!(got.ready, 2);
+        assert_eq!(
+            got.warnings,
+            vec![ResolveWarning::ServiceMissing(key("gone"))]
+        );
+    }
+
+    #[test]
+    fn service_target_never_falls_back_to_draining() {
+        let r = sref("web", named("http"), None);
+        let s = snap(http_svc(), vec![v4(vec![ep("10.0.0.1", DRAINING)])]);
+        let pods = run1(&r, &s, &opts());
+        assert!(pods.fallback);
+        let svc = run1(&r, &s, &svc_opts("cluster.local"));
+        assert!(!svc.fallback);
+        assert_eq!(svc.addrs, vec!["web.prod.svc.cluster.local:80"]);
+        assert_eq!((svc.ready, svc.draining), (1, 0));
     }
 }

@@ -840,7 +840,7 @@ mod tests {
         Endpoint, EndpointConditions, EndpointPort, EndpointSlice,
     };
 
-    use crate::types::{PortRef, ServiceRef, ServiceSnapshot, UpstreamOptions};
+    use crate::types::{PortRef, ServiceRef, ServiceSnapshot, UpstreamOptions, UpstreamTarget};
 
     // ---- fakes ----
 
@@ -986,6 +986,7 @@ mod tests {
                 ipv4_only: false,
                 debounce: Duration::from_millis(500),
                 debounce_max: Duration::from_secs(2),
+                target: UpstreamTarget::Pods,
             },
         }
     }
@@ -1636,6 +1637,57 @@ mod tests {
         h.change("c");
         sleep(1000).await;
         assert_eq!(h.writer.calls().len(), 2);
+        h.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn set_upstreams_switches_target() {
+        let h = Harness::start(&[("web", &["web", "api"])], true, 64, |s| {
+            s.set("web", &["10.0.0.1"], &[]);
+            s.set("api", &["10.0.0.2"], &[]);
+        });
+        sleep(10).await;
+        assert_eq!(
+            h.writer.calls_for("web"),
+            vec![addrs(&["10.0.0.1", "10.0.0.2"])]
+        );
+        h.writer.clear();
+
+        let mut service_mode = upstream(&["web", "api"]);
+        service_mode.options.target = UpstreamTarget::Service {
+            cluster_domain: "cluster.local".into(),
+        };
+        h.handle
+            .set_upstreams([("web".to_string(), service_mode)].into());
+        sleep(1000).await;
+        let service_addrs = vec![
+            "api.prod.svc.cluster.local:80".to_string(),
+            "web.prod.svc.cluster.local:80".to_string(),
+        ];
+        assert_eq!(h.writer.calls_for("web"), vec![service_addrs.clone()]);
+        assert_eq!(
+            h.metrics.value(
+                "pingap_k8s_endpoints",
+                &[("upstream", "web"), ("class", "ready")]
+            ),
+            2
+        );
+
+        // Pod churn does not change the Service addresses: no write.
+        h.writer.clear();
+        h.source.set("web", &["10.0.0.9"], &["10.0.0.1"]);
+        h.change("web");
+        sleep(3000).await;
+        assert!(h.writer.calls().is_empty());
+
+        // And back to pods.
+        h.handle
+            .set_upstreams([("web".to_string(), upstream(&["web", "api"]))].into());
+        sleep(1000).await;
+        assert_eq!(
+            h.writer.calls_for("web"),
+            vec![addrs(&["10.0.0.2", "10.0.0.9"])]
+        );
         h.stop().await;
     }
 

@@ -57,6 +57,18 @@ pub struct UpstreamOptions {
     pub ipv4_only: bool,
     pub debounce: Duration,
     pub debounce_max: Duration,
+    pub target: UpstreamTarget,
+}
+
+/// What an upstream's `addrs` point at.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum UpstreamTarget {
+    /// Ready pod IPs from EndpointSlices.
+    #[default]
+    Pods,
+    /// One `<service>.<namespace>.svc.<cluster_domain>:<service port>` per
+    /// Service; `cluster_domain` comes from `[kubernetes]`.
+    Service { cluster_domain: String },
 }
 
 /// The current view of one Service, as held by the watchers.

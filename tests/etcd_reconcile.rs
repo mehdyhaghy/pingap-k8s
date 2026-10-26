@@ -16,6 +16,7 @@ use pingap_k8s::reconcile::Reconciler;
 use pingap_k8s::server::Readiness;
 use pingap_k8s::types::{
     PortRef, ServiceKey, ServiceRef, ServiceSnapshot, SnapshotSource, UpstreamOptions,
+    UpstreamTarget,
 };
 use tokio::sync::{broadcast, oneshot, watch};
 
@@ -81,6 +82,34 @@ fn desired() -> Vec<String> {
     vec!["10.0.0.1:8080".to_string(), "10.0.0.2:8080".to_string()]
 }
 
+/// The owned upstream `api` -> `prod/api:http`, with the given target.
+fn upstreams(target: UpstreamTarget) -> BTreeMap<String, UpstreamConfig> {
+    let options = UpstreamOptions {
+        include_not_ready: false,
+        drain_terminating: true,
+        ipv4_only: false,
+        debounce: Duration::from_millis(500),
+        debounce_max: Duration::from_secs(2),
+        target,
+    };
+    let mut upstreams = BTreeMap::new();
+    upstreams.insert(
+        "api".to_string(),
+        UpstreamConfig {
+            services: vec![ServiceRef {
+                key: ServiceKey {
+                    namespace: "prod".into(),
+                    name: "api".into(),
+                },
+                port: PortRef::Name("http".into()),
+                weight: None,
+            }],
+            options,
+        },
+    );
+    upstreams
+}
+
 async fn stored(w: &EtcdWriter, upstream: &str) -> Option<String> {
     let resp = w
         .client()
@@ -133,28 +162,7 @@ async fn stale_admin_save_is_corrected_and_deleted_key_recreated() {
         metrics.clone(),
         Readiness::new(),
     );
-    let options = UpstreamOptions {
-        include_not_ready: false,
-        drain_terminating: true,
-        ipv4_only: false,
-        debounce: Duration::from_millis(500),
-        debounce_max: Duration::from_secs(2),
-    };
-    let mut upstreams = BTreeMap::new();
-    upstreams.insert(
-        "api".to_string(),
-        UpstreamConfig {
-            services: vec![ServiceRef {
-                key: ServiceKey {
-                    namespace: "prod".into(),
-                    name: "api".into(),
-                },
-                port: PortRef::Name("http".into()),
-                weight: None,
-            }],
-            options,
-        },
-    );
+    let upstreams = upstreams(UpstreamTarget::Pods);
     reconciler.set_upstreams(upstreams);
     let (_changes_tx, changes) = broadcast::channel(16);
     let (_leader_tx, leader) = watch::channel(true);
@@ -199,6 +207,95 @@ async fn stale_admin_save_is_corrected_and_deleted_key_recreated() {
     kv.delete(key.as_str(), None).await.unwrap();
     let text = wait_desired(&w, Duration::from_secs(3)).await;
     assert!(!text.contains("health_check"), "{text}");
+
+    let _ = stop.send(());
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("reconciler stops")
+        .unwrap();
+}
+
+/// Polls until the stored `addrs` of `api` equal `want`; returns the stored entry.
+async fn wait_addrs(w: &EtcdWriter, want: &[&str], within: Duration) -> String {
+    let start = Instant::now();
+    loop {
+        if let Some(text) = stored(w, "api").await
+            && read_addrs(&text, "api")
+                .unwrap()
+                .is_some_and(|addrs| addrs == want)
+        {
+            return text;
+        }
+        assert!(
+            start.elapsed() < within,
+            "addrs not {want:?} within {within:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// the design notes: `target = "service"` writes the Service DNS name and port, only
+/// `addrs` is touched (no `discovery`: Pingap treats hostname addrs as DNS
+/// discovery by itself), and switching back to `pods` at runtime works.
+#[tokio::test]
+async fn service_target_writes_service_address_and_switches_back() {
+    let Some(w) = writer("target").await else {
+        return;
+    };
+    let key = w.upstream_key("api");
+    let mut kv = w.client().kv_client();
+    kv.put(
+        key.as_str(),
+        "[upstreams.api]\naddrs = [\"10.0.0.9:80\"]\nhealth_check = \"http://api/ping\"\n",
+        None,
+    )
+    .await
+    .unwrap();
+
+    let reconciler = Reconciler::new(
+        Arc::new(w.clone()),
+        Arc::new(Fixed),
+        Arc::new(Metrics::new()),
+        Readiness::new(),
+    );
+    reconciler.set_upstreams(upstreams(UpstreamTarget::Service {
+        cluster_domain: "cluster.local".into(),
+    }));
+    let handle = reconciler.clone();
+    let (_changes_tx, changes) = broadcast::channel(16);
+    let (_foreign_tx, foreign) = tokio::sync::mpsc::channel(16);
+    let (_leader_tx, leader) = watch::channel(true);
+    let (stop, stopped) = oneshot::channel::<()>();
+    let task =
+        tokio::spawn(
+            reconciler.run(changes, foreign, leader, Duration::from_secs(300), async {
+                let _ = stopped.await;
+            }),
+        );
+
+    let text = wait_addrs(
+        &w,
+        &["api.prod.svc.cluster.local:80"],
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        text.contains("health_check = \"http://api/ping\""),
+        "{text}"
+    );
+    assert!(!text.contains("discovery"), "{text}");
+
+    handle.set_upstreams(upstreams(UpstreamTarget::Pods));
+    let text = wait_addrs(
+        &w,
+        &["10.0.0.1:8080", "10.0.0.2:8080"],
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        text.contains("health_check = \"http://api/ping\""),
+        "{text}"
+    );
 
     let _ = stop.send(());
     tokio::time::timeout(Duration::from_secs(2), task)

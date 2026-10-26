@@ -13,6 +13,8 @@
 //!   allows is accepted.
 //! - Service port names are DNS-1123 labels too (the apiserver's rule for
 //!   `spec.ports[].name`). A port made only of digits is a port number (1-65535).
+//! - `[kubernetes] cluster_domain` is a DNS-1123 subdomain: dot-separated
+//!   DNS-1123 labels, at most 253 chars, no trailing dot.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -21,10 +23,16 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::types::{PortRef, ServiceKey, ServiceRef, UpstreamOptions};
+use crate::types::{PortRef, ServiceKey, ServiceRef, UpstreamOptions, UpstreamTarget};
 
 /// Maximum length of a DNS label.
 const DNS_LABEL_MAX: usize = 63;
+
+/// Maximum length of a DNS-1123 subdomain.
+const DNS_SUBDOMAIN_MAX: usize = 253;
+
+/// Default `[kubernetes] cluster_domain`.
+pub const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
 
 /// Default listen address of the metrics/health server: all IPv6 and, on
 /// Linux, all IPv4 addresses too. Neither std nor tokio sets `IPV6_V6ONLY`,
@@ -78,7 +86,7 @@ pub struct EtcdSection {
     pub url: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct KubernetesSection {
     /// Empty: in-cluster, then `$KUBECONFIG`, then `~/.kube/config`.
@@ -87,6 +95,19 @@ pub struct KubernetesSection {
     pub context: String,
     /// Empty: the controller pod's own namespace.
     pub default_namespace: String,
+    /// Used for `target = "service"` addresses.
+    pub cluster_domain: String,
+}
+
+impl Default for KubernetesSection {
+    fn default() -> Self {
+        Self {
+            kubeconfig: String::new(),
+            context: String::new(),
+            default_namespace: String::new(),
+            cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -116,6 +137,7 @@ pub struct Defaults {
     pub debounce_max: Duration,
     pub resync: Duration,
     pub ipv4_only: bool,
+    pub target: UpstreamTarget,
 }
 
 impl Default for Defaults {
@@ -127,6 +149,7 @@ impl Default for Defaults {
             debounce_max: Duration::from_secs(2),
             resync: Duration::from_secs(300),
             ipv4_only: false,
+            target: UpstreamTarget::Pods,
         }
     }
 }
@@ -140,6 +163,7 @@ impl Defaults {
             ipv4_only: self.ipv4_only,
             debounce: self.debounce,
             debounce_max: self.debounce_max,
+            target: self.target.clone(),
         }
     }
 }
@@ -180,6 +204,7 @@ struct RawDefaults {
     #[serde(default, with = "humantime_serde")]
     resync: Option<Duration>,
     ipv4_only: Option<bool>,
+    target: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -193,6 +218,7 @@ struct RawUpstream {
     #[serde(default, with = "humantime_serde")]
     debounce_max: Option<Duration>,
     ipv4_only: Option<bool>,
+    target: Option<String>,
 }
 
 impl Config {
@@ -205,7 +231,17 @@ impl Config {
             return Err(ConfigError::Invalid("etcd.url must not be empty".into()));
         }
 
+        validate_cluster_domain(&raw.kubernetes.cluster_domain).map_err(|reason| {
+            ConfigError::Invalid(format!("kubernetes.cluster_domain: {reason}"))
+        })?;
+        let cluster_domain = raw.kubernetes.cluster_domain.as_str();
+
         let built = Defaults::default();
+        let target = match raw.defaults.target.as_deref() {
+            Some(value) => parse_target(value, cluster_domain)
+                .map_err(|reason| ConfigError::Invalid(format!("defaults.target: {reason}")))?,
+            None => built.target.clone(),
+        };
         let defaults = Defaults {
             include_not_ready: raw
                 .defaults
@@ -219,6 +255,7 @@ impl Config {
             debounce_max: raw.defaults.debounce_max.unwrap_or(built.debounce_max),
             resync: raw.defaults.resync.unwrap_or(built.resync),
             ipv4_only: raw.defaults.ipv4_only.unwrap_or(built.ipv4_only),
+            target,
         };
         if defaults.resync.is_zero() {
             return Err(ConfigError::Invalid(
@@ -241,7 +278,8 @@ impl Config {
 
         let mut upstreams = BTreeMap::new();
         for (name, raw_up) in raw.upstreams {
-            let upstream = build_upstream(&name, raw_up, &defaults, default_namespace)?;
+            let upstream =
+                build_upstream(&name, raw_up, &defaults, default_namespace, cluster_domain)?;
             upstreams.insert(name, upstream);
         }
 
@@ -285,6 +323,7 @@ fn build_upstream(
     raw: RawUpstream,
     defaults: &Defaults,
     default_namespace: &str,
+    cluster_domain: &str,
 ) -> Result<UpstreamConfig, ConfigError> {
     let upstream_err = |reason: String| ConfigError::Upstream {
         upstream: name.to_string(),
@@ -300,12 +339,19 @@ fn build_upstream(
         return Err(upstream_err("services must not be empty".into()));
     }
 
+    let target = match raw.target.as_deref() {
+        Some(value) => {
+            parse_target(value, cluster_domain).map_err(|r| upstream_err(format!("target: {r}")))?
+        }
+        None => defaults.target.clone(),
+    };
     let options = UpstreamOptions {
         include_not_ready: raw.include_not_ready.unwrap_or(defaults.include_not_ready),
         drain_terminating: raw.drain_terminating.unwrap_or(defaults.drain_terminating),
         ipv4_only: raw.ipv4_only.unwrap_or(defaults.ipv4_only),
         debounce: raw.debounce.unwrap_or(defaults.debounce),
         debounce_max: raw.debounce_max.unwrap_or(defaults.debounce_max),
+        target,
     };
     check_debounce(&options).map_err(upstream_err)?;
 
@@ -336,6 +382,36 @@ fn build_upstream(
     }
 
     Ok(UpstreamConfig { services, options })
+}
+
+/// `target = "pods" | "service"`.
+fn parse_target(value: &str, cluster_domain: &str) -> Result<UpstreamTarget, String> {
+    match value {
+        "pods" => Ok(UpstreamTarget::Pods),
+        "service" => Ok(UpstreamTarget::Service {
+            cluster_domain: cluster_domain.to_string(),
+        }),
+        other => Err(format!(
+            "unknown value {other:?}; expected \"pods\" or \"service\""
+        )),
+    }
+}
+
+/// A DNS-1123 subdomain without a trailing dot, e.g. `cluster.local`.
+fn validate_cluster_domain(s: &str) -> Result<(), String> {
+    if s.is_empty() {
+        return Err("must not be empty".into());
+    }
+    if s.len() > DNS_SUBDOMAIN_MAX {
+        return Err(format!(
+            "must be a DNS name of at most {DNS_SUBDOMAIN_MAX} characters"
+        ));
+    }
+    for label in s.split('.') {
+        check_dns_label(label, false)
+            .map_err(|r| format!("{s:?} is not a DNS name (label {label:?}: {r})"))?;
+    }
+    Ok(())
 }
 
 fn check_debounce(opts: &UpstreamOptions) -> Result<(), String> {
@@ -779,6 +855,7 @@ debounce_max = "1m"
                 ipv4_only: false,
                 debounce: Duration::from_millis(100),
                 debounce_max: Duration::from_secs(1),
+                target: UpstreamTarget::Pods,
             }
         );
         assert_eq!(
@@ -789,8 +866,91 @@ debounce_max = "1m"
                 ipv4_only: true,
                 debounce: Duration::from_secs(1),
                 debounce_max: Duration::from_secs(60),
+                target: UpstreamTarget::Pods,
             }
         );
+    }
+
+    #[test]
+    fn target_defaults_to_pods() {
+        let c = cfg("[upstreams.a]\nservices = [\"a:80\"]\n").unwrap();
+        assert_eq!(c.defaults.target, UpstreamTarget::Pods);
+        assert_eq!(c.upstreams["a"].options.target, UpstreamTarget::Pods);
+        assert_eq!(c.kubernetes.cluster_domain, "cluster.local");
+    }
+
+    #[test]
+    fn target_from_defaults_and_per_upstream() {
+        let svc = |d: &str| UpstreamTarget::Service {
+            cluster_domain: d.into(),
+        };
+        let c = cfg(r#"
+[defaults]
+target = "service"
+
+[upstreams.a]
+services = ["a:80"]
+
+[upstreams.b]
+services = ["b:80"]
+target = "pods"
+"#)
+        .unwrap();
+        assert_eq!(c.defaults.target, svc("cluster.local"));
+        assert_eq!(c.upstreams["a"].options.target, svc("cluster.local"));
+        assert_eq!(c.upstreams["b"].options.target, UpstreamTarget::Pods);
+
+        let c = cfg(r#"
+[kubernetes]
+cluster_domain = "k8s.example.internal"
+
+[upstreams.a]
+services = ["a:80"]
+target = "service"
+"#)
+        .unwrap();
+        assert_eq!(c.defaults.target, UpstreamTarget::Pods);
+        assert_eq!(c.upstreams["a"].options.target, svc("k8s.example.internal"));
+    }
+
+    #[test]
+    fn unknown_target_rejected() {
+        let m = err("[defaults]\ntarget = \"Service\"\n");
+        assert!(
+            m.contains("defaults.target") && m.contains("\"Service\"") && m.contains("\"pods\""),
+            "{m}"
+        );
+        let m = err("[upstreams.a]\nservices = [\"a:80\"]\ntarget = \"endpoints\"\n");
+        assert!(
+            m.contains("upstream \"a\"") && m.contains("target") && m.contains("\"endpoints\""),
+            "{m}"
+        );
+        assert!(cfg("[defaults]\ntarget = 1\n").is_err());
+    }
+
+    #[test]
+    fn cluster_domain_validation() {
+        for ok in ["cluster.local", "local", "k8s.example-1.internal", "1a.b"] {
+            let c = cfg(&format!("[kubernetes]\ncluster_domain = \"{ok}\"\n")).unwrap();
+            assert_eq!(c.kubernetes.cluster_domain, ok);
+        }
+        let long = format!("{}.local", vec!["a".repeat(63); 4].join("."));
+        for bad in [
+            "",
+            "cluster.local.",
+            ".cluster.local",
+            "cluster..local",
+            "Cluster.local",
+            "cluster_local",
+            "-a.local",
+            "a b",
+            long.as_str(),
+        ] {
+            let m = err(&format!("[kubernetes]\ncluster_domain = \"{bad}\"\n"));
+            assert!(m.contains("kubernetes.cluster_domain"), "{bad:?}: {m}");
+        }
+        // Checked even when no upstream uses `service`.
+        assert!(cfg("[kubernetes]\ncluster_domain = \"x.\"\n").is_err());
     }
 
     #[test]

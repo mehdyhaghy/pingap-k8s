@@ -859,7 +859,8 @@ fn restart_required(boot: &Config, new: &Config) -> Vec<&'static str> {
     if boot.etcd != new.etcd {
         fields.push("[etcd]");
     }
-    // default_namespace is already applied through the upstreams' Service keys.
+    // default_namespace and cluster_domain are already applied through the
+    // upstreams' Service keys and targets.
     if boot.kubernetes.kubeconfig != new.kubernetes.kubeconfig
         || boot.kubernetes.context != new.kubernetes.context
     {
@@ -1051,6 +1052,9 @@ services = ["api.prod:http"]
         );
         assert!(
             restart_required(&base, &cfg("[kubernetes]\ndefault_namespace = \"x\"\n")).is_empty()
+        );
+        assert!(
+            restart_required(&base, &cfg("[kubernetes]\ncluster_domain = \"x.y\"\n")).is_empty()
         );
         assert_eq!(
             restart_required(&base, &cfg("[server]\nlisten = \"127.0.0.1:1\"\n")),
