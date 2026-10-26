@@ -158,15 +158,15 @@ mod tests {
     fn reads_metrics() {
         let text = "# HELP x\n\
             pingap_k8s_is_leader 1\n\
-            pingap_k8s_watch_errors_total{namespace=\"a\",service=\"echo\",reason=\"forbidden\"} 2\n\
-            pingap_k8s_watch_errors_total{namespace=\"a\",service=\"echo\",reason=\"other\"} 1\n\
-            pingap_k8s_watch_errors_total{namespace=\"a\",service=\"echo-ws\",reason=\"other\"} 5\n";
+            pingap_k8s_watch_errors_total{error_type=\"forbidden\",k8s_namespace_name=\"a\",k8s_service_name=\"echo\"} 2\n\
+            pingap_k8s_watch_errors_total{error_type=\"other\",k8s_namespace_name=\"a\",k8s_service_name=\"echo\"} 1\n\
+            pingap_k8s_watch_errors_total{error_type=\"other\",k8s_namespace_name=\"a\",k8s_service_name=\"echo-ws\"} 5\n";
         assert_eq!(metric(text, "pingap_k8s_is_leader", &[]), Some(1.0));
         assert_eq!(
             metric(
                 text,
                 "pingap_k8s_watch_errors_total",
-                &[("service", "echo")]
+                &[("k8s_service_name", "echo")]
             ),
             Some(3.0)
         );

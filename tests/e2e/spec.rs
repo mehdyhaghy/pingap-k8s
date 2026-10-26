@@ -1015,7 +1015,7 @@ async fn e2e_05_role_deleted() {
                             return Ok(None);
                         };
                         let text = controller::scrape(&env, &ip).await?;
-                        let svc = [("service", "echo")];
+                        let svc = [("k8s_service_name", "echo")];
                         let up = controller::metric(&text, "pingap_k8s_watch_up", &svc);
                         let errors =
                             controller::metric(&text, "pingap_k8s_watch_errors_total", &svc)
@@ -1096,7 +1096,7 @@ async fn e2e_05_role_deleted() {
                         let up = controller::metric(
                             &text,
                             "pingap_k8s_watch_up",
-                            &[("service", "echo")],
+                            &[("k8s_service_name", "echo")],
                         );
                         if up != Some(1.0) {
                             return Ok(None);
