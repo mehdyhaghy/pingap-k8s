@@ -501,6 +501,18 @@ impl WatchRegistry {
         self.inner.watches().values().all(ServiceWatch::is_synced)
     }
 
+    /// Watched Services with at least one watcher (Service or
+    /// EndpointSlices) that has not completed its first list yet. Empty when
+    /// [`is_synced`](Self::is_synced).
+    pub fn unsynced(&self) -> BTreeSet<ServiceKey> {
+        self.inner
+            .watches()
+            .iter()
+            .filter(|(_, w)| !w.is_synced())
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
     /// Waits until [`is_synced`](Self::is_synced) or `timeout`. Returns
     /// whether all current watchers have listed once. Watchers added by a
     /// concurrent `set_services` are included; removed ones are ignored.
@@ -677,6 +689,7 @@ mod tests {
         let metrics = Arc::new(Metrics::new());
         let registry = WatchRegistry::new(unreachable_client(), metrics.clone());
         assert!(registry.is_synced(), "empty set is synced");
+        assert!(registry.unsynced().is_empty());
         assert!(registry.wait_ready(Duration::from_millis(10)).await);
 
         let k = key("prod", "echo");
@@ -684,6 +697,7 @@ mod tests {
         assert_eq!(registry.services(), [k.clone()].into());
         assert!(!registry.is_synced());
         assert!(!registry.wait_ready(Duration::from_millis(300)).await);
+        assert_eq!(registry.unsynced(), [k.clone()].into());
 
         // Errors are counted and the watch is reported down.
         let errors = || {
@@ -718,6 +732,7 @@ mod tests {
         registry.set_services(BTreeSet::new());
         assert!(registry.services().is_empty());
         assert!(registry.is_synced());
+        assert!(registry.unsynced().is_empty());
         assert!(!metrics.encode().contains("pingap_k8s_watch_up{"));
     }
 }

@@ -400,15 +400,7 @@ async fn run(
     let registry = WatchRegistry::new(client, metrics.clone());
     registry.set_services(config.service_keys());
     // never write a partial set, so nothing starts before every watcher listed once.
-    if !wait_synced(
-        &registry,
-        &metrics,
-        &readiness,
-        &mut reload_drain(),
-        &shutdown_rx,
-    )
-    .await
-    {
+    if !wait_synced(&registry, &readiness, &mut reload_drain(), &shutdown_rx).await {
         return finish(server_task, None, None).await;
     }
 
@@ -461,7 +453,6 @@ async fn run(
         registry,
         reconciler,
         writer,
-        metrics,
         readiness,
         owned_watch_pending: false,
     };
@@ -538,20 +529,18 @@ enum Flow {
 /// are still missing every [`SYNC_WAIT`]. Returns false on shutdown.
 async fn wait_synced(
     registry: &WatchRegistry,
-    metrics: &Metrics,
     readiness: &Readiness,
     triggers: &mut mpsc::Receiver<Trigger>,
     shutdown: &watch::Receiver<bool>,
 ) -> bool {
     matches!(
-        wait_synced_or_reload(registry, metrics, readiness, triggers, shutdown).await,
+        wait_synced_or_reload(registry, readiness, triggers, shutdown).await,
         Flow::Done
     )
 }
 
 async fn wait_synced_or_reload(
     registry: &WatchRegistry,
-    metrics: &Metrics,
     readiness: &Readiness,
     triggers: &mut mpsc::Receiver<Trigger>,
     shutdown: &watch::Receiver<bool>,
@@ -571,51 +560,18 @@ async fn wait_synced_or_reload(
             info!(services = registry.services().len(), "all watchers synced");
             return Flow::Done;
         }
-        let missing = services_not_up(registry, metrics);
+        let missing = registry.unsynced();
         warn!(
             waited = ?SYNC_WAIT,
-            not_up = %join_keys(&missing),
+            not_synced = %join_keys(&missing),
             "watchers have not completed their first list; not writing until they have , still waiting"
         );
     }
 }
 
-/// Watched Services whose watch is not up (watch_up != 1). Approximates "not
-/// listed yet", which the registry does not expose per Service.
-fn services_not_up(registry: &WatchRegistry, metrics: &Metrics) -> Vec<ServiceKey> {
-    let mut up = BTreeSet::new();
-    for family in metrics.registry.gather() {
-        if family.name() != "pingap_k8s_watch_up" {
-            continue;
-        }
-        for metric in family.get_metric() {
-            if metric.get_gauge().get_value() != 1.0 {
-                continue;
-            }
-            let label = |n: &str| {
-                metric
-                    .get_label()
-                    .iter()
-                    .find(|l| l.name() == n)
-                    .map(|l| l.value().to_string())
-                    .unwrap_or_default()
-            };
-            up.insert(ServiceKey {
-                namespace: label("namespace"),
-                name: label("service"),
-            });
-        }
-    }
-    registry
-        .services()
-        .into_iter()
-        .filter(|k| !up.contains(k))
-        .collect()
-}
-
-fn join_keys(keys: &[ServiceKey]) -> String {
+fn join_keys(keys: &BTreeSet<ServiceKey>) -> String {
     if keys.is_empty() {
-        return "(all up, first list pending)".to_string();
+        return "(none; synced meanwhile)".to_string();
     }
     keys.iter()
         .map(ToString::to_string)
@@ -682,7 +638,6 @@ struct Controller {
     registry: WatchRegistry,
     reconciler: AppReconciler,
     writer: EtcdWriter,
-    metrics: Arc<Metrics>,
     readiness: Readiness,
     /// The owned upstream set changed but restarting the owned-key watch failed.
     owned_watch_pending: bool,
@@ -772,14 +727,8 @@ impl Controller {
         self.registry.set_services(union);
         if !self.registry.is_synced() {
             self.readiness.set_watchers_synced(false);
-            let flow = wait_synced_or_reload(
-                &self.registry,
-                &self.metrics,
-                &self.readiness,
-                triggers,
-                shutdown,
-            )
-            .await;
+            let flow =
+                wait_synced_or_reload(&self.registry, &self.readiness, triggers, shutdown).await;
             if flow != Flow::Done {
                 return flow;
             }

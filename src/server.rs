@@ -33,8 +33,10 @@ struct ReadinessInner {
 /// Readiness state shared between the reconciler, the watchers and the HTTP
 /// server. Cheap to clone (one `Arc`).
 ///
-/// Ready means: every watcher has listed once, and the last etcd write
-/// succeeded or no write has been attempted yet (followers never write).
+/// Ready means: every watcher has listed once, and no write has been
+/// attempted yet (followers never write) or the last write did not fail
+/// because etcd could not be reached. The reconciler reports malformed
+/// entries and CAS conflicts as OK here: they only affect metrics and logs.
 #[derive(Clone, Debug)]
 pub struct Readiness {
     inner: Arc<ReadinessInner>,
@@ -61,6 +63,8 @@ impl Readiness {
         self.inner.watchers_synced.store(synced, Ordering::Relaxed);
     }
 
+    /// `false` only when the last write failed because etcd could not be
+    /// reached.
     pub fn set_last_write_ok(&self, ok: bool) {
         let v = if ok { WRITE_OK } else { WRITE_FAILED };
         self.inner.last_write.store(v, Ordering::Relaxed);
@@ -76,7 +80,7 @@ impl Readiness {
             return Err("watchers not synced");
         }
         if self.inner.last_write.load(Ordering::Relaxed) == WRITE_FAILED {
-            return Err("last etcd write failed");
+            return Err("etcd unreachable on last write");
         }
         Ok(())
     }
@@ -161,7 +165,7 @@ mod tests {
         assert!(r.is_ready(), "no write attempted yet counts as ready");
 
         r.set_last_write_ok(false);
-        assert_eq!(r.check(), Err("last etcd write failed"));
+        assert_eq!(r.check(), Err("etcd unreachable on last write"));
 
         r.set_last_write_ok(true);
         assert!(r.is_ready());
@@ -232,7 +236,7 @@ mod tests {
         readiness.set_last_write_ok(false);
         let (status, body) = get(addr, "/readyz").await;
         assert_eq!(status, 503);
-        assert_eq!(body, "last etcd write failed");
+        assert_eq!(body, "etcd unreachable on last write");
 
         let (status, body) = get(addr, "/metrics").await;
         assert_eq!(status, 200);

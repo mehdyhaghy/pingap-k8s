@@ -47,6 +47,12 @@
 //! ([`MALFORMED_RETRY`]) or on the next event or resync, never in a tight
 //! loop; anything else uses the normal backoff.
 //!
+//! Readiness: only a write that failed because etcd could not be reached
+//! (transport, timeout, anything unclassified) marks the replica not ready,
+//! until that upstream's next write gets an answer from etcd. Malformed
+//! entries and CAS conflicts affect metrics and logs only: one broken
+//! upstream must not block rollouts of the controller.
+//!
 //! Startup : the caller must wait for the watchers' first list before
 //! calling [`Reconciler::run`]; `run` reconciles every upstream right away.
 
@@ -163,7 +169,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Reconciler<W, S> {
             leader: is_leader,
             inflight: JoinSet::new(),
             inflight_ids: HashMap::new(),
-            failing: BTreeSet::new(),
+            unreachable: BTreeSet::new(),
         };
         engine.metrics.set_leader(is_leader);
         if let Some(upstreams) = lock(&self.shared.upstreams).take() {
@@ -372,8 +378,10 @@ struct Engine<W: AddrsWriter, S: SnapshotSource> {
     leader: bool,
     inflight: JoinSet<WriteMsg>,
     inflight_ids: HashMap<Id, String>,
-    /// Upstreams whose last write attempt failed (drives readiness).
-    failing: BTreeSet<String>,
+    /// Upstreams whose last write attempt failed because etcd could not be
+    /// reached (drives readiness). Malformed entries and conflicts are not
+    /// in here.
+    unreachable: BTreeSet<String>,
 }
 
 impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
@@ -388,7 +396,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
             tracing::info!(upstream = %name, "upstream removed from config; no longer managed");
             self.upstreams.remove(&name);
             self.metrics.remove_upstream(&name);
-            self.failing.remove(&name);
+            self.unreachable.remove(&name);
         }
         for (name, config) in new {
             match self.upstreams.get_mut(&name) {
@@ -501,7 +509,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
                 st.retry_at = None;
                 st.backoff = RETRY_MIN;
             }
-            self.failing.clear();
+            self.unreachable.clear();
             self.update_readiness();
         }
     }
@@ -602,7 +610,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
             st.event_since = None;
             if self.leader {
                 st.backoff = RETRY_MIN;
-                if self.failing.remove(name) {
+                if self.unreachable.remove(name) {
                     self.update_readiness();
                 }
             }
@@ -674,7 +682,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
                 st.last_written = Some(addrs);
                 st.backoff = RETRY_MIN;
                 self.metrics.set_etcd_up(true);
-                self.failing.remove(&name);
+                self.unreachable.remove(&name);
                 self.update_readiness();
             }
             Err(err) => self.write_failed(&name, &err, now),
@@ -701,7 +709,13 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
         let Some(st) = self.upstreams.get_mut(name) else {
             return;
         };
-        self.failing.insert(name.to_string());
+        // Only a connectivity failure affects readiness; etcd answered a
+        // malformed entry or a conflict.
+        if kind == FailureKind::Other {
+            self.unreachable.insert(name.to_string());
+        } else {
+            self.unreachable.remove(name);
+        }
         let err = format!("{err:#}");
         if kind == FailureKind::Malformed {
             // Retrying fast cannot fix a broken entry: retry slowly, or
@@ -721,7 +735,8 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
     }
 
     fn update_readiness(&self) {
-        self.readiness.set_last_write_ok(self.failing.is_empty());
+        self.readiness
+            .set_last_write_ok(self.unreachable.is_empty());
     }
 }
 
@@ -1279,6 +1294,7 @@ mod tests {
         assert_eq!(write_count(&h.metrics, "web", "conflict"), 1);
         assert_eq!(write_count(&h.metrics, "web", "error"), 0);
         assert_eq!(h.metrics.etcd_up.get(), 1);
+        assert!(h.readiness_last_write_ok());
         sleep(1000).await;
         assert_eq!(h.writer.calls().len(), 2);
         assert_eq!(write_count(&h.metrics, "web", "ok"), 1);
@@ -1295,7 +1311,9 @@ mod tests {
         sleep(60_000).await;
         assert_eq!(h.writer.calls().len(), 1);
         assert_eq!(write_count(&h.metrics, "web", "error"), 1);
-        assert!(!h.readiness_last_write_ok());
+        // etcd answered: a malformed entry does not fail readiness
+        assert!(h.readiness_last_write_ok());
+        assert_eq!(h.metrics.etcd_up.get(), 1);
 
         // the next event retries
         h.source.set("web", &["10.0.0.2"], &[]);
@@ -1311,6 +1329,25 @@ mod tests {
             &addrs(&["10.0.0.2"])
         );
         assert_eq!(write_count(&h.metrics, "web", "ok"), 1);
+        assert!(h.readiness_last_write_ok());
+        h.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_connectivity_failures_affect_readiness() {
+        let h = Harness::start(&[("web", &["web"])], true, 64, |s| {
+            s.set("web", &["10.0.0.1"], &[])
+        });
+        h.writer.fail(1, || anyhow::anyhow!("connection refused"));
+        sleep(10).await;
+        assert!(!h.readiness_last_write_ok());
+
+        // the retry reaches etcd but finds a malformed entry: ready again
+        h.writer
+            .fail(100, || EtcdError::MissingTable("web".into()).into());
+        sleep(1000).await;
+        assert_eq!(h.writer.calls().len(), 2);
+        assert_eq!(write_count(&h.metrics, "web", "error"), 2);
         assert!(h.readiness_last_write_ok());
         h.stop().await;
     }
