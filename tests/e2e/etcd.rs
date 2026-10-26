@@ -166,6 +166,22 @@ impl Etcd {
     }
 }
 
+impl Etcd {
+    /// `etcdctl watch -w json <key>` from revision `from`, streamed: every output line is
+    /// timestamped when it arrives (see [`crate::track::LineStream`]).
+    pub fn watch_stream(&self, key: &str, from: i64) -> anyhow::Result<crate::track::LineStream> {
+        let rev = format!("--rev={from}");
+        let cmd = ["etcdctl", "watch", "-w", "json", key, rev.as_str()];
+        crate::track::LineStream::exec(
+            &self.kubectl,
+            &self.namespace,
+            &self.pod,
+            Some("etcd"),
+            &cmd,
+        )
+    }
+}
+
 /// A running `etcdctl watch`. For counting writes over a period (e.g. during a rollout),
 /// prefer comparing [`KeyValue::version`] before and after: it needs no background process.
 pub struct EtcdWatch {
@@ -220,7 +236,7 @@ fn kvs(v: &Value) -> anyhow::Result<Vec<KeyValue>> {
 }
 
 /// `etcdctl watch -w json` prints one JSON object per watch response, one per line.
-fn parse_watch_output(stdout: &str) -> anyhow::Result<Vec<WatchEvent>> {
+pub fn parse_watch_output(stdout: &str) -> anyhow::Result<Vec<WatchEvent>> {
     let mut events = Vec::new();
     for line in stdout.lines().map(str::trim).filter(|l| l.starts_with('{')) {
         let v: Value = serde_json::from_str(line)?;

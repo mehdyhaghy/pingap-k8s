@@ -241,3 +241,89 @@ pub fn is_timeout(err: &anyhow::Error) -> bool {
         )
     })
 }
+
+/// One echo round trip of a [`WsProbe`]: when it finished and how.
+#[derive(Debug, Clone)]
+pub struct ProbeResult {
+    pub at: std::time::SystemTime,
+    pub result: Result<(), String>,
+}
+
+/// A WebSocket connection kept busy on its own thread: an echo round trip every `every`
+/// until one fails (connection closed or no echo within 3 s) or the probe is stopped.
+/// Every round trip is recorded with its time.
+pub struct WsProbe {
+    pub served_by: String,
+    log: std::sync::Arc<std::sync::Mutex<Vec<ProbeResult>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WsProbe {
+    pub fn start(addr: &str, path: &str, every: Duration) -> anyhow::Result<WsProbe> {
+        use std::sync::atomic::Ordering;
+        let mut client = WsClient::connect(addr, path, Duration::from_secs(5))?;
+        let served_by = client.served_by.clone();
+        let log: std::sync::Arc<std::sync::Mutex<Vec<ProbeResult>>> = Default::default();
+        let stop: std::sync::Arc<std::sync::atomic::AtomicBool> = Default::default();
+        let handle = {
+            let log = log.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut n = 0u64;
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        client.close();
+                        return;
+                    }
+                    n += 1;
+                    let r = client
+                        .echo(&format!("ping {n}"), Duration::from_secs(3))
+                        .map_err(|e| format!("{e:#}"));
+                    let failed = r.is_err();
+                    log.lock().unwrap().push(ProbeResult {
+                        at: std::time::SystemTime::now(),
+                        result: r,
+                    });
+                    if failed {
+                        return;
+                    }
+                    std::thread::sleep(every);
+                }
+            })
+        };
+        Ok(WsProbe {
+            served_by,
+            log,
+            stop,
+            handle: Some(handle),
+        })
+    }
+
+    pub fn results(&self) -> Vec<ProbeResult> {
+        self.log.lock().unwrap().clone()
+    }
+
+    /// The first failed round trip, if any.
+    pub fn failure(&self) -> Option<ProbeResult> {
+        self.results().into_iter().find(|r| r.result.is_err())
+    }
+
+    /// Time of the last successful round trip.
+    pub fn last_ok(&self) -> Option<std::time::SystemTime> {
+        self.results()
+            .into_iter()
+            .filter(|r| r.result.is_ok())
+            .map(|r| r.at)
+            .max()
+    }
+}
+
+impl Drop for WsProbe {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}

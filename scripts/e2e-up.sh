@@ -21,15 +21,18 @@
 #   E2E_IMAGE            controller image tag to build and load (default pingap-k8s:e2e)
 #   E2E_SKIP_BUILD=1     do not build the image (it must already exist locally)
 #   E2E_WAIT_CONTROLLER  1: also wait for the controller Deployment to be Ready
-#                        (default 0 while src/main.rs is a stub)
+#                        (default 1; 0 skips it, e.g. to debug a broken controller)
 #   E2E_TIMEOUT          per-wait timeout (default 300s)
+#   E2E_PRELOAD          1 (default): load the third-party images that exist in the
+#                        local Docker cache into kind instead of pulling them in the
+#                        cluster (slow, and rate-limited on Docker Hub); 0: always pull
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLUSTER="${E2E_CLUSTER:-pk8s-e2e}"
 IMAGE="${E2E_IMAGE:-pingap-k8s:e2e}"
 TIMEOUT="${E2E_TIMEOUT:-300s}"
-WAIT_CONTROLLER="${E2E_WAIT_CONTROLLER:-0}"
+WAIT_CONTROLLER="${E2E_WAIT_CONTROLLER:-1}"
 STATE_DIR="$ROOT/target/e2e"
 KUBECONFIG_FILE="$STATE_DIR/kubeconfig"
 STATE_FILE="$STATE_DIR/state.env"
@@ -68,6 +71,27 @@ fi
 log "loading $IMAGE into kind"
 kind load docker-image "$IMAGE" --name "$CLUSTER"
 
+# Third-party images of the chart (etcd, Pingap) and of the test app, as pinned in
+# charts/pingap-k8s/values.yaml and tests/e2e/manifests/app.yaml. Loaded only when
+# already cached locally, and only the node's platform: `kind load` imports with
+# --all-platforms, which fails for a multi-platform image pulled for one platform.
+# A failed import falls back to the in-cluster pull.
+if [[ "${E2E_PRELOAD:-1}" == "1" ]]; then
+  node="$CLUSTER-control-plane"
+  platform="linux/$(docker version -f '{{.Server.Arch}}')"
+  for img in quay.io/coreos/etcd:v3.6.12 vicanso/pingap:0.16.1 \
+      registry.k8s.io/e2e-test-images/agnhost:2.66.1 jmalloc/echo-server:v0.3.7 \
+      fortio/fortio:1.75.3; do
+    if docker image inspect "$img" >/dev/null 2>&1; then
+      log "preloading $img ($platform)"
+      docker save "$img" | docker exec -i "$node" \
+          ctr -n k8s.io images import --platform "$platform" --digests \
+          --snapshotter=overlayfs - >/dev/null 2>&1 \
+        || log "preloading $img failed; it will be pulled"
+    fi
+  done
+fi
+
 # --- test app (before the chart: its RoleBinding goes into e2e-app) -------------
 log "applying the test app"
 kubectl apply -f "$ROOT/tests/e2e/manifests/app.yaml"
@@ -89,6 +113,24 @@ helm upgrade --install "$RELEASE" "$ROOT/charts/pingap-k8s" \
   --set "image.tag=${IMAGE##*:}"
 
 # --- readiness ------------------------------------------------------------------
+# On a failed wait, show what the cluster was doing before the script exits.
+diagnose() {
+  local status=$?
+  if [[ $status -ne 0 ]]; then
+    log "setup failed ($status); cluster state:"
+    kubectl get pods -A -o wide >&2 || true
+    kubectl get events -A --sort-by=.lastTimestamp 2>/dev/null | tail -40 >&2 || true
+    for ns in "$NS" "$APP_NS"; do
+      for pod in $(kubectl -n "$ns" get pods --no-headers 2>/dev/null \
+          | awk '$2 !~ /^([0-9]+)\/\1$/ {print $1}'); do
+        log "not ready: $ns/$pod"
+        kubectl -n "$ns" describe pod "$pod" 2>/dev/null | tail -25 >&2 || true
+        kubectl -n "$ns" logs "$pod" --all-containers --tail=30 >&2 2>/dev/null || true
+      done
+    done
+  fi
+}
+trap diagnose EXIT
 log "waiting for etcd"
 kubectl -n "$NS" rollout status "statefulset/$RELEASE-etcd" --timeout "$TIMEOUT"
 log "waiting for Pingap"
@@ -102,6 +144,8 @@ if [[ "$WAIT_CONTROLLER" == "1" ]]; then
 else
   log "not waiting for the controller (E2E_WAIT_CONTROLLER=0)"
 fi
+
+trap - EXIT
 
 ETCD_POD="$(kubectl -n "$NS" get pod -l app.kubernetes.io/name=etcd,app.kubernetes.io/instance=$RELEASE \
   -o jsonpath='{.items[0].metadata.name}')"

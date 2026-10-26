@@ -51,7 +51,11 @@ spec:
               path: /hostname
               port: http
             periodSeconds: 2
-            failureThreshold: 1
+            # Tolerant of a loaded host (a 1 s probe timeout made pods flap NotReady,
+            # and the controller rightly removed them): readiness only gates new pods
+            # here, removal comes from deletion.
+            timeoutSeconds: 3
+            failureThreshold: 3
           lifecycle:
             preStop:
               sleep:
@@ -72,7 +76,8 @@ spec:
             tcpSocket:
               port: ws
             periodSeconds: 2
-            failureThreshold: 1
+            timeoutSeconds: 3
+            failureThreshold: 3
           lifecycle:
             preStop:
               sleep:

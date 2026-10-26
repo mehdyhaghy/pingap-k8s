@@ -24,17 +24,25 @@
 //!
 //! Helpers: [`k8s`] (scale, rollout, waits, pods, Role), [`etcd`] (etcdctl in the etcd pod),
 //! [`pingap`] (curl from the client pod, admin API), [`load`] (fortio), [`ws`] (WebSocket
-//! through a port-forward to Pingap), [`harness::wait_for`] (polling).
+//! through a port-forward to Pingap), [`harness::wait_for`] (polling), [`controller`]
+//! (per-pod metrics, leader, logs, config), [`track`] (timestamped etcd watch, request
+//! loop and pod tracker for the timing tests).
+//!
+//! The e2e integration tests 1–11 are in [`spec`] (`spec::e2e_01_initial_sync` ...
+//! `spec::e2e_11_quickstart_install`); filter with e.g. `scripts/e2e-run.sh e2e_04`.
 
 // Helpers are shared with the e2e tests (T12); not every one is used by every test.
 #![allow(dead_code)]
 
+mod controller;
 mod etcd;
 mod harness;
 mod k8s;
 mod kubectl;
 mod load;
 mod pingap;
+mod spec;
+mod track;
 mod ws;
 
 use std::time::Duration;

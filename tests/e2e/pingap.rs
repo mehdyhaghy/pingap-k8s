@@ -145,31 +145,113 @@ impl Pingap {
         Ok(parse_sample(&out.stdout))
     }
 
-    /// Calls the Pingap admin API (`path` like "/api/..."), with basic auth. `body` is sent
-    /// as JSON. Pingap's admin routes are not part of this harness's contract: check them
-    /// against the Pingap version in the chart.
+    /// Calls the Pingap admin API (`path` like "/api/configs/upstream"). `body` is sent as
+    /// JSON.
+    ///
+    /// Pingap 0.16.1 does not take basic auth: like its web UI (web/src/states/token.ts),
+    /// every request carries `Authorization: <sha256 hex of "user:password:ts">:<ts>` with
+    /// `ts` the current Unix time in seconds (src/plugin/admin.rs `auth_validate`). The
+    /// token is computed in the client pod, so the password never leaves the cluster in a
+    /// command line of the test host. Routes (src/plugin/admin.rs): `GET /api/configs`
+    /// (what the UI loads), `GET /api/configs/<category>`, `POST
+    /// /api/configs/<category>/<name>` (the whole entry as JSON, what the UI saves).
     pub async fn admin(
         &self,
         method: &str,
         path: &str,
         body: Option<&str>,
     ) -> anyhow::Result<HttpResponse> {
-        let mut args = vec![
-            "-X".to_string(),
-            method.to_string(),
-            "-u".into(),
-            format!("{}:{}", self.admin_user, self.admin_password),
+        let data = if body.is_some() {
+            "-H 'Content-Type: application/json' --data-binary @-"
+        } else {
+            ""
+        };
+        let script = format!(
+            "ts=$(date +%s); \
+             tok=$(printf '%s' \"$1:$2:$ts\" | sha256sum | cut -d' ' -f1); \
+             curl -s -m 5 -w '\\n%{{http_code}}' -X '{method}' -H \"Authorization: $tok:$ts\" \
+               {data} '{url}{path}'",
+            url = self.admin_url,
+        );
+        let cmd = [
+            "sh",
+            "-c",
+            &script,
+            "sh",
+            &self.admin_user,
+            &self.admin_password,
         ];
-        if body.is_some() {
-            args.extend([
-                "-H".to_string(),
-                "Content-Type: application/json".into(),
-                "--data-binary".into(),
-                "@-".into(),
-            ]);
+        let out = match body {
+            Some(b) => {
+                self.kubectl
+                    .exec_stdin(
+                        &self.client_namespace,
+                        &self.client_pod,
+                        None,
+                        &cmd,
+                        b.as_bytes(),
+                    )
+                    .await?
+            }
+            None => {
+                self.kubectl
+                    .exec(&self.client_namespace, &self.client_pod, None, &cmd)
+                    .await?
+            }
+        };
+        parse_curl(&out.stdout).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unexpected admin curl output {:?} (stderr {:?})",
+                out.stdout,
+                out.stderr
+            )
+        })
+    }
+
+    /// The upstream entry `name` as the admin UI loads it (`GET /api/configs`, then
+    /// `upstreams.<name>`): a JSON object.
+    pub async fn admin_upstream(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<k8s_openapi::serde_json::Value> {
+        let r = self.admin("GET", "/api/configs", None).await?;
+        if r.status != 200 {
+            anyhow::bail!("admin GET /api/configs: {} {:?}", r.status, r.body);
         }
-        args.push(format!("{}{path}", self.admin_url));
-        self.curl(&args, body.map(str::as_bytes)).await
+        let v: k8s_openapi::serde_json::Value = k8s_openapi::serde_json::from_str(&r.body)?;
+        v.get("upstreams")
+            .and_then(|u| u.get(name))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("admin config has no upstreams.{name}: {}", r.body))
+    }
+
+    /// Saves upstream `name` the way the admin UI does: `POST /api/configs/upstream/<name>`
+    /// with the whole entry (null fields dropped).
+    pub async fn admin_save_upstream(
+        &self,
+        name: &str,
+        entry: &k8s_openapi::serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let mut entry = entry.clone();
+        if let Some(m) = entry.as_object_mut() {
+            m.retain(|_, v| !v.is_null());
+        }
+        let body = k8s_openapi::serde_json::to_string(&entry)?;
+        let r = self
+            .admin(
+                "POST",
+                &format!("/api/configs/upstream/{name}"),
+                Some(&body),
+            )
+            .await?;
+        if !r.is_success() {
+            anyhow::bail!(
+                "admin POST /api/configs/upstream/{name}: {} {:?}",
+                r.status,
+                r.body
+            );
+        }
+        Ok(())
     }
 
     /// GET a URL from the client pod (e.g. an echo pod IP, or the controller's metrics
