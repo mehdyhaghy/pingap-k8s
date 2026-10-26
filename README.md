@@ -36,6 +36,7 @@ resources is planned for later phases.
   - [Prerequisites](#prerequisites)
   - [Helm](#helm)
   - [Quickstart: everything in one install](#quickstart-everything-in-one-install)
+  - [Try it](#try-it)
   - [Plain manifests](#plain-manifests)
   - [etcd client certificates](#etcd-client-certificates)
 - [Configuration reference](#configuration-reference)
@@ -43,6 +44,7 @@ resources is planned for later phases.
 - [Upstream target](#upstream-target)
 - [Graceful shutdown of application pods (preStop)](#graceful-shutdown-of-application-pods-prestop)
 - [Production checklist](#production-checklist)
+- [Operating it with kubectl](#operating-it-with-kubectl)
 - [Observability](#observability)
   - [Telemetry](#telemetry)
 - [Security](#security)
@@ -157,6 +159,8 @@ Main chart values:
 | `rbac.fromConfig` | `true` | also grant access in every namespace referenced by `config.upstreams` |
 | `logFormat` / `logLevel` | `text` / `info` | log output (`text` or `json`) and filter |
 | `podDisruptionBudget.minAvailable` | `1` | |
+| `networkPolicy.enabled` | `false` | NetworkPolicy on the controller pods: only the sources below may reach the metrics port (none when both are empty); probes are not affected |
+| `networkPolicy.allowSameNamespace` / `networkPolicy.metricsFrom` | `false` / `[]` | allow pods of the release namespace / extra NetworkPolicy `from` peers (e.g. a monitoring namespace) |
 | `etcd.deploy` | `false` | deploy a bundled etcd (below) |
 | `pingap.deploy` | `false` | deploy a quickstart Pingap (below) |
 
@@ -234,6 +238,71 @@ helm install pingap-k8s ./charts/pingap-k8s --namespace edge -f quickstart.yaml
   kubectl -n edge port-forward svc/pingap-k8s-pingap-admin 3018:3018
   # http://localhost:3018, user "admin"
   ```
+
+### Try it
+
+A demo app (`traefik/whoami`, which answers with its pod name and the request headers) behind
+the quickstart Pingap, in a few commands. First the app, 3 replicas:
+
+```sh
+kubectl create namespace demo
+kubectl -n demo create deployment whoami --image=traefik/whoami:v1.12.0 --replicas=3 --port=80
+kubectl -n demo expose deployment whoami --port=80
+```
+
+Then the chart, with a seed whose location sends everything to the upstream `whoami` and adds
+the forwarded headers, and the controller entry that keeps that upstream equal to the app's pods:
+
+```yaml
+# try.yaml
+etcd:
+  deploy: true
+pingap:
+  deploy: true
+  seed:
+    config: |
+      [basic]
+      grace_period = "30s"
+      graceful_shutdown_timeout = "10s"
+
+      [servers.quickstart]
+      addr = "[::]:8080"
+      locations = ["quickstart"]
+
+      [locations.quickstart]
+      upstream = "whoami"
+      # X-Real-IP, X-Forwarded-For, -Proto, -Host and -Port to the app.
+      enable_reverse_proxy_headers = true
+
+      [upstreams.whoami]
+      addrs = ["127.0.0.1:9"]   # placeholder, replaced by the controller
+config:
+  upstreams:
+    whoami:
+      services: ["whoami.demo:80"]
+```
+
+```sh
+kubectl create namespace pingap-k8s
+helm install pingap-k8s ./charts/pingap-k8s --namespace pingap-k8s -f try.yaml --wait
+kubectl -n pingap-k8s port-forward svc/pingap-k8s-pingap 8080:80 &
+for i in 1 2 3 4 5 6; do curl -s localhost:8080 | grep -E '^(Hostname|X-Forwarded-For|X-Real-Ip):'; done
+```
+
+Each response comes from the next pod (round robin), and the forwarded headers carry the
+client address Pingap saw (`127.0.0.1` through a port-forward):
+
+```text
+Hostname: whoami-6c9f8d7b5-4kq2x
+X-Forwarded-For: 127.0.0.1
+X-Real-Ip: 127.0.0.1
+Hostname: whoami-6c9f8d7b5-9wz7m
+...
+```
+
+`kubectl -n demo scale deployment whoami --replicas=5` and the new pod names show up in the
+responses within seconds. The seed is written only into an empty etcd prefix: on an existing
+install, set "reverse proxy headers" on the location in the admin UI instead.
 
 ### Plain manifests
 
@@ -452,14 +521,87 @@ round-robin position). The debounce keeps the number of writes during a rollout 
       disk space: run `etcdctl defrag` now and then, one member at a time; take regular
       `etcdctl snapshot save` backups; size `--quota-backend-bytes` (via `etcd.extraArgs`) and
       the volume together, and watch for the `NOSPACE` alarm.
-- [ ] **Long-lived connections are rebalanced**: gRPC, HTTP/2 and WebSocket connections stay on
-      the pod they were opened to, and new pods only get new connections. Cap the connection age
-      in the app (for gRPC, the server's max connection age) if load must even out after scaling.
+- [ ] **Long-lived connections are rebalanced**: Pingap balances each HTTP/2 or gRPC request on
+      its own, even when a client sends them all over one connection, but a WebSocket or a
+      long-running stream stays on the pod it was opened to, and new pods only get new ones. Cap
+      the connection or stream age in the app if load must even out after scaling.
 - [ ] **Sticky sessions use consistent hashing**: `algo = "hash:cookie:<name>"` (or `hash:ip`,
       `hash:header:<name>`). Pingora's consistent hash moves only the keys of the pods that
       changed during a rollout; round robin has no affinity.
 - [ ] **Quickstart Pingap runs 2 or more replicas** (`pingap.replicas`), so its
       PodDisruptionBudget applies.
+- [ ] **Streaming workloads** (server-sent events, long polling, gRPC streams):
+  - Pingap's upstream `read_timeout` applies to each read, so a quiet stream is cut after it.
+    Set a longer `read_timeout` / `write_timeout` on the location of the streaming paths only,
+    and server `downstream_read_timeout` / `downstream_write_timeout` on the client side.
+  - Prefer heartbeats from the app (an SSE comment line every 15–30 s, gRPC keepalive pings) to
+    raising every timeout: load balancers and NAT drop idle connections anyway.
+  - An app rollout ends the streams of each pod as it stops: size the app's
+    `terminationGracePeriodSeconds` and make clients reconnect (SSE resumes with
+    `Last-Event-ID`).
+  - Pingap's own rollout: the quickstart budget (`preStop` 15 s + `grace_period` 30 s +
+    `graceful_shutdown_timeout` 10 s) cuts the streams of a terminating Pingap pod after about
+    45 s. For longer streams raise seed `grace_period` and `pingap.terminationGracePeriodSeconds`
+    together (Pingap rollouts get slower).
+  - Do not enable the response cache plugin on streaming routes. The compression plugin already
+    skips `text/event-stream`.
+
+## Operating it with kubectl
+
+For release `pingap-k8s` in namespace `pingap-k8s` (as in [`deploy/`](deploy/)); change both to
+yours.
+
+Controller pods, logs, readiness and the leader:
+
+```sh
+kubectl -n pingap-k8s get pods -l app.kubernetes.io/component=controller -o wide
+kubectl -n pingap-k8s logs -l app.kubernetes.io/component=controller --tail=100 -f --prefix
+kubectl -n pingap-k8s port-forward deploy/pingap-k8s 9090 &
+curl -s localhost:9090/readyz; echo
+curl -s localhost:9090/metrics | grep -E '^pingap_k8s_(is_leader|watch_up)'
+```
+
+`deploy/pingap-k8s` picks one pod. The leader is the pod with `pingap_k8s_is_leader 1`:
+
+```sh
+for p in $(kubectl -n pingap-k8s get pods -l app.kubernetes.io/component=controller -o name); do
+  kubectl -n pingap-k8s port-forward "$p" 19090:9090 >/dev/null & pf=$!; sleep 1
+  echo "$p $(curl -s localhost:19090/metrics | grep '^pingap_k8s_is_leader')"; kill $pf
+done
+```
+
+Quickstart Pingap admin UI (ClusterIP only), user `admin`:
+
+```sh
+kubectl -n pingap-k8s get secret pingap-k8s-pingap-admin -o jsonpath='{.data.password}' | base64 -d; echo
+kubectl -n pingap-k8s port-forward svc/pingap-k8s-pingap-admin 3018:3018   # http://localhost:3018
+```
+
+What the controller sees, and what it stored (bundled etcd: its pod already has the `etcdctl`
+endpoint and client certificate set):
+
+```sh
+kubectl -n <app-namespace> get endpointslices -l kubernetes.io/service-name=<service> -o wide
+kubectl -n pingap-k8s exec pingap-k8s-etcd-0 -c etcd -- etcdctl get --prefix /pingap/upstreams/
+```
+
+Validate a config before rolling it out (the image runs the controller binary):
+
+```sh
+helm template pingap-k8s charts/pingap-k8s -f values.yaml --show-only templates/configmap.yaml \
+  | yq '.data["config.toml"]' > config.toml
+docker run --rm -v "$PWD/config.toml:/config.toml:ro" ghcr.io/mehdyhaghy/pingap-k8s:0.1.0 \
+  --check --config /config.toml
+```
+
+RBAC: the controller may read EndpointSlices and Services only in the namespaces it was granted
+(`yes` expected for each namespace in `config.upstreams`):
+
+```sh
+kubectl auth can-i list endpointslices.discovery.k8s.io -n <app-namespace> \
+  --as=system:serviceaccount:pingap-k8s:pingap-k8s
+kubectl auth can-i watch services -n <app-namespace> --as=system:serviceaccount:pingap-k8s:pingap-k8s
+```
 
 ## Observability
 
@@ -531,7 +673,9 @@ Service), never a public address. Use `https://` for TLS (system roots).
 - **Only addresses from configured Services are written**: pod IPs from the EndpointSlices of
   explicitly listed Services. A workload cannot inject an arbitrary address.
 - **Cluster-internal endpoints**: the metrics/health port, etcd and the quickstart Pingap admin UI
-  are `ClusterIP` only. CI fails if the chart renders a `LoadBalancer` or `NodePort` Service other
+  are `ClusterIP` only. `networkPolicy.enabled: true` also limits who may reach the controller's
+  metrics port (`networkPolicy.allowSameNamespace`, `networkPolicy.metricsFrom`); kubelet probes
+  keep working. CI fails if the chart renders a `LoadBalancer` or `NodePort` Service other
   than the quickstart proxy listener, or any cluster-wide RBAC.
 - **Hardened pods**: non-root (UID 65532), read-only root filesystem, no privilege escalation, all
   capabilities dropped, `RuntimeDefault` seccomp, for the controller, the bundled etcd and the
