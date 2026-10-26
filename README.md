@@ -134,7 +134,11 @@ The chart creates:
 
 Config changes are applied without restarting the pods: the controller reloads its config file
 when the mounted ConfigMap changes (and on `SIGHUP`). Watches are started or stopped only for the
-Services that were added or removed.
+Services that were added or removed. An invalid new config is rejected and the running one stays.
+
+A few settings are read only at startup: `[etcd]`, `[server]`, `[kubernetes]` `kubeconfig` and
+`context`, and `defaults.resync`. A change to them logs "restart required" and keeps the running
+value; apply it with `kubectl -n <namespace> rollout restart deployment/pingap-k8s`.
 
 Main chart values:
 
@@ -294,6 +298,7 @@ drain_terminating = true # any [defaults] key can be overridden per upstream
 | `debounce_max` | `2s` | write at the latest this long after the first pending event |
 | `resync` | `5m` | reconcile every upstream at this interval even without events |
 | `ipv4_only` | `false` | ignore IPv6 EndpointSlices |
+| `server.listen` | `0.0.0.0:9090` | address for `/metrics`, `/healthz` and `/readyz` (restart required) |
 | `upstreams.<name>.services` | (required) | list of `<service>[.<namespace>]:<port> [weight]` |
 
 - `<port>` is a Service port **name** or **number** (the `port` field, not `targetPort`).
@@ -307,8 +312,18 @@ drain_terminating = true # any [defaults] key can be overridden per upstream
   FQDN slices are ignored; only the first address of each endpoint is used. `ExternalName`
   Services are not supported (use Pingap's `dns` discovery for those).
 
-Command line flags: `--config <path>` (env `PINGAP_K8S_CONFIG`) and `--log-format text|json`.
-The log filter comes from `RUST_LOG`.
+Command line flags: `--config <path>` (env `PINGAP_K8S_CONFIG`, default
+`/etc/pingap-k8s/config/config.toml`), `--log-format text|json` and `--check`. The log filter comes
+from `RUST_LOG`.
+
+`--check` validates the config and the etcd URL without connecting anywhere, prints a summary and
+exits 0 (valid) or 1 (invalid). Use it in CI on the rendered config:
+
+```sh
+helm template pingap-k8s charts/pingap-k8s -f values.yaml --show-only templates/configmap.yaml \
+  | yq '.data["config.toml"]' > config.toml
+pingap-k8s --check --config config.toml
+```
 
 ## Pingap side
 
@@ -353,8 +368,10 @@ round-robin position). The debounce keeps the number of writes during a rollout 
 
 The controller serves on port `9090` (cluster-internal only):
 
-- `/metrics` (Prometheus), `/healthz` (process alive), `/readyz` (all watchers synced and the last
-  etcd write succeeded).
+- `/metrics` (Prometheus), `/healthz` (process alive), `/readyz` (all watchers synced, and etcd
+  was reachable on the last write; followers never write). A malformed upstream entry or a CAS
+  conflict does not fail `/readyz`: it shows in `pingap_k8s_writes_total` and the logs, and is
+  retried on the next event or resync, or every 5 minutes.
 
 | Metric | Labels |
 |---|---|
@@ -378,8 +395,8 @@ The chart's metrics Service is `pingap-k8s-metrics` (`ClusterIP`, release `pinga
     that admits only Pingap and pingap-k8s pods. Never give it a public address. The bundled etcd
     does exactly this.
   - Use client-certificate authentication (mTLS). On a shared etcd, give the controller its own
-    etcd user limited to `<prefix>/upstreams/` and the election prefix
-    `<prefix>-k8s-election/`, for example:
+    etcd user with a role that has `readwrite` on exactly two prefixes: `<prefix>/upstreams/`
+    (the owned upstreams) and `<prefix>-k8s-election/` (leader election). For prefix `/pingap`:
 
     ```sh
     etcdctl role add pingap-k8s
