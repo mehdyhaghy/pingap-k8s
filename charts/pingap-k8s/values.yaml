@@ -1,0 +1,294 @@
+# Default values for pingap-k8s.
+
+nameOverride: ""
+fullnameOverride: ""
+
+# ---------------------------------------------------------------------------
+# Controller
+# ---------------------------------------------------------------------------
+
+image:
+  repository: ghcr.io/mehdyhaghy/pingap-k8s
+  # Defaults to the chart appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# Two replicas: only the elected leader writes, the follower keeps its watches warm.
+replicaCount: 2
+
+# Log output of the controller: "text" or "json".
+logFormat: text
+# RUST_LOG style filter, e.g. "info" or "info,pingap_k8s=debug".
+logLevel: info
+
+serviceAccount:
+  create: true
+  # Defaults to the full name of the release.
+  name: ""
+  annotations: {}
+
+rbac:
+  # Create one Role + RoleBinding (read-only: get/list/watch on services and
+  # endpointslices) in each namespace the controller reads. Never a ClusterRole.
+  create: true
+  # Namespaces to grant read access in.
+  namespaces: []
+  # Also add every namespace referenced by config.upstreams[*].services
+  # (entries "<service>.<namespace>:<port>"; entries without a namespace use
+  # config.kubernetes.default_namespace, or the release namespace when that is empty).
+  fromConfig: true
+
+etcd:
+  # Pingap's etcd URL, the same string Pingap gets with --conf:
+  #   etcd://host:port[,host:port]/<prefix>?ca=..&cert=..&key=..
+  # When empty: built for the bundled etcd if etcd.deploy is true, otherwise
+  # "etcd://etcd:2379/pingap" (a Service named etcd in the release namespace).
+  # Do not put passwords in it: it is stored in the ConfigMap. Use client
+  # certificates (etcd.tlsSecret) instead.
+  url: ""
+  # Name of an existing Secret with the controller's etcd client TLS files.
+  # It is mounted read-only at /etc/pingap-k8s/etcd, so the URL can reference
+  # e.g. ca=/etc/pingap-k8s/etcd/ca.crt&cert=/etc/pingap-k8s/etcd/tls.crt&key=/etc/pingap-k8s/etcd/tls.key
+  # When empty and etcd.deploy is true with tls.autoGenerate, a generated one is used.
+  tlsSecret: ""
+  # File names inside the TLS Secrets (controller, Pingap and etcd server).
+  tlsKeys:
+    ca: ca.crt
+    cert: tls.crt
+    key: tls.key
+
+  # --- Optional bundled etcd (off by default) -------------------------------
+  # A StatefulSet with a ClusterIP Service, client certificate auth, and a
+  # NetworkPolicy admitting only Pingap and pingap-k8s pods. It is never
+  # exposed outside the cluster.
+  deploy: false
+  # 1 or 3.
+  replicas: 1
+  # Key prefix used when the URL is built for the bundled etcd.
+  prefix: pingap
+  image:
+    repository: quay.io/coreos/etcd
+    tag: v3.6.12
+    pullPolicy: IfNotPresent
+  tls:
+    # Generate a CA, the etcd server certificate and client certificates for the
+    # controller and the quickstart Pingap. Existing Secrets are reused on upgrade.
+    autoGenerate: true
+    validityDays: 3650
+    # When autoGenerate is false: existing Secrets (files named by etcd.tlsKeys).
+    # Server certificate, also used for peer traffic; it needs serverAuth and
+    # clientAuth usages and SANs for the Services (see README).
+    serverSecret: ""
+    # Client certificate for the quickstart Pingap (pingap.etcdTlsSecret wins).
+    pingapClientSecret: ""
+  persistence:
+    enabled: true
+    size: 2Gi
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+  # Extra command line flags for etcd, e.g. ["--quota-backend-bytes=2147483648"].
+  extraArgs: []
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  networkPolicy:
+    enabled: true
+    # Pods (in the release namespace) that may connect to etcd as clients, in
+    # addition to the controller and the quickstart Pingap. Label your own
+    # Pingap pods with these labels, or change them.
+    pingapPodLabels:
+      app.kubernetes.io/name: pingap
+    # Set to a namespace selector when your Pingap runs in another namespace,
+    # e.g. {matchLabels: {kubernetes.io/metadata.name: edge}}.
+    pingapNamespaceSelector: null
+    # Extra raw NetworkPolicy "from" peers for the client port.
+    extraFrom: []
+  podDisruptionBudget:
+    # Only rendered for 3 replicas (minAvailable: 2).
+    enabled: true
+
+# ---------------------------------------------------------------------------
+# Controller config, rendered as TOML into the ConfigMap (see README).
+# ---------------------------------------------------------------------------
+config:
+  kubernetes:
+    # Empty: in-cluster, then $KUBECONFIG, then ~/.kube/config.
+    kubeconfig: ""
+    context: ""
+    # Empty: the controller pod's own namespace.
+    default_namespace: ""
+  defaults:
+    include_not_ready: false
+    drain_terminating: true
+    debounce: "500ms"
+    debounce_max: "2s"
+    # Full re-list and re-reconcile, corrects drift.
+    resync: "5m"
+    ipv4_only: false
+  # One entry per Pingap upstream the controller owns. Any [defaults] key can be
+  # overridden per upstream. Example:
+  #   upstreams:
+  #     api:
+  #       services: ["api.prod:http"]
+  #     web:
+  #       services: ["web-blue.prod:http 9", "web-green.prod:http 1"]
+  #       drain_terminating: true
+  upstreams: {}
+  # Optional [server] table (metrics/health listener), passed through as is.
+  # Leave empty for the built-in default (0.0.0.0:9090).
+  server: {}
+  # Store the rendered config in a Secret instead of a ConfigMap.
+  useSecret: false
+
+# Port of /metrics, /healthz and /readyz. Must match config.server when that is set.
+metricsPort: 9090
+
+metrics:
+  service:
+    # Always ClusterIP: metrics are reachable inside the cluster only.
+    port: 9090
+    annotations: {}
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    memory: 128Mi
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: metrics
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: metrics
+  periodSeconds: 5
+  failureThreshold: 3
+
+terminationGracePeriodSeconds: 30
+priorityClassName: ""
+nodeSelector: {}
+tolerations: []
+# When empty, a soft anti-affinity spreads replicas over nodes.
+affinity: {}
+topologySpreadConstraints: []
+
+extraEnv: []
+
+# ---------------------------------------------------------------------------
+# Optional quickstart Pingap (off by default): the stock Pingap image, unchanged,
+# started with --conf etcd://... --autoreload.
+# ---------------------------------------------------------------------------
+pingap:
+  deploy: false
+  replicas: 1
+  image:
+    # The Debian based image: the seed step below needs its shell.
+    repository: vicanso/pingap
+    tag: "0.16.1"
+    pullPolicy: IfNotPresent
+  # etcd URL for Pingap. Empty: the controller's URL (etcd.url, or the one built
+  # for the bundled etcd). Pingap's client TLS Secret is mounted at the same
+  # path as the controller's (/etc/pingap-k8s/etcd), so the same URL works.
+  etcdUrl: ""
+  # Existing Secret with Pingap's etcd client TLS files. Empty: the generated
+  # one (bundled etcd), else etcd.tlsSecret.
+  etcdTlsSecret: ""
+  # Proxy listener. Must match the server addr in seed.config.
+  httpPort: 8080
+  service:
+    # The proxy Service. ClusterIP by default; set LoadBalancer or NodePort to
+    # expose Pingap's listener.
+    type: ClusterIP
+    port: 80
+    nodePort: null
+    annotations: {}
+    loadBalancerSourceRanges: []
+    externalTrafficPolicy: ""
+  admin:
+    # Admin UI listener; its Service is always ClusterIP (use kubectl port-forward).
+    port: 3018
+    user: admin
+    # Empty: a random password is generated and kept in the Secret across upgrades.
+    password: ""
+    # Use an existing Secret with keys "user" and "password" instead.
+    existingSecret: ""
+  # Seed Pingap's etcd prefix once, before Pingap starts, when it has no server
+  # yet. Servers (listeners) are only read at Pingap start, so the listener has
+  # to exist first. It is skipped when any server already exists.
+  seed:
+    enabled: true
+    # Pingap TOML. The upstream "quickstart" starts with a placeholder address;
+    # map it to a Service in config.upstreams and the controller fills it.
+    config: |
+      [servers.quickstart]
+      addr = "0.0.0.0:8080"
+      locations = ["quickstart"]
+
+      [locations.quickstart]
+      upstream = "quickstart"
+
+      [upstreams.quickstart]
+      addrs = ["127.0.0.1:9"]
+  extraArgs: []
+  extraEnv: []
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    capabilities:
+      drop:
+        - ALL
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 512Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}

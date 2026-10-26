@@ -1,0 +1,28 @@
+{{- /*
+The controller config. The controller reloads it when the mounted file changes
+(and on SIGHUP), so a config change does not restart the pods.
+*/ -}}
+{{- if .Values.config.useSecret }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "pingap-k8s.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pingap-k8s.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  config.toml: |
+    {{- include "pingap-k8s.configToml" . | nindent 4 }}
+{{- else }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pingap-k8s.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pingap-k8s.labels" . | nindent 4 }}
+data:
+  config.toml: |
+    {{- include "pingap-k8s.configToml" . | nindent 4 }}
+{{- end }}

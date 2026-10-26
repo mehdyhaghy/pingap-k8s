@@ -1,0 +1,141 @@
+{{- /*
+Optional quickstart: the stock Pingap image, unchanged, reading its config from
+etcd and hot-reloading it (--conf etcd://... --autoreload).
+*/ -}}
+{{- if .Values.pingap.deploy }}
+{{- $p := .Values.pingap }}
+{{- $etcdSecret := include "pingap-k8s.pingap.etcdSecret" . }}
+{{- $image := printf "%s:%s" $p.image.repository $p.image.tag }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pingap-k8s.pingap.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pingap-k8s.pingap.labels" . | nindent 4 }}
+spec:
+  replicas: {{ $p.replicas }}
+  selector:
+    matchLabels:
+      {{- include "pingap-k8s.pingap.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pingap-k8s.pingap.selectorLabels" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml $p.podSecurityContext | nindent 8 }}
+      {{- if $p.seed.enabled }}
+      initContainers:
+        - name: seed
+          image: {{ $image }}
+          imagePullPolicy: {{ $p.image.pullPolicy }}
+          command: ["bash", "/etc/pingap-seed/seed.sh"]
+          env:
+            - name: PINGAP_ETCD_URL
+              value: {{ include "pingap-k8s.pingap.etcdUrl" . | quote }}
+          securityContext:
+            {{- toYaml $p.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml $p.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: seed
+              mountPath: /etc/pingap-seed
+              readOnly: true
+            {{- if $etcdSecret }}
+            - name: etcd-tls
+              mountPath: {{ include "pingap-k8s.etcd.tlsDir" . }}
+              readOnly: true
+            {{- end }}
+      {{- end }}
+      containers:
+        - name: pingap
+          image: {{ $image }}
+          imagePullPolicy: {{ $p.image.pullPolicy }}
+          command: ["pingap"]
+          args:
+            - --conf
+            - {{ include "pingap-k8s.pingap.etcdUrl" . | quote }}
+            - --autoreload
+            {{- range $p.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          env:
+            - name: PINGAP_ADMIN_ADDR
+              value: "0.0.0.0:{{ $p.admin.port }}"
+            - name: PINGAP_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pingap-k8s.pingap.adminSecret" . }}
+                  key: user
+            - name: PINGAP_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pingap-k8s.pingap.adminSecret" . }}
+                  key: password
+            {{- with $p.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ $p.httpPort }}
+              protocol: TCP
+            - name: admin
+              containerPort: {{ $p.admin.port }}
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: admin
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          securityContext:
+            {{- toYaml $p.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml $p.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if $etcdSecret }}
+            - name: etcd-tls
+              mountPath: {{ include "pingap-k8s.etcd.tlsDir" . }}
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if $p.seed.enabled }}
+        - name: seed
+          configMap:
+            name: {{ include "pingap-k8s.pingap.fullname" . }}-seed
+        {{- end }}
+        {{- if $etcdSecret }}
+        - name: etcd-tls
+          secret:
+            secretName: {{ $etcdSecret }}
+            defaultMode: 0440
+        {{- end }}
+      {{- with $p.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $p.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $p.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

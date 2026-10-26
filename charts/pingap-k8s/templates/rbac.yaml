@@ -1,0 +1,41 @@
+{{- /*
+Read-only access to Services and EndpointSlices, one Role + RoleBinding per
+namespace the controller reads. Never a ClusterRole.
+*/ -}}
+{{- if .Values.rbac.create }}
+{{- $fullname := include "pingap-k8s.fullname" . }}
+{{- $sa := include "pingap-k8s.serviceAccountName" . }}
+{{- range $ns := include "pingap-k8s.rbacNamespaces" . | fromJsonArray }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "pingap-k8s.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "pingap-k8s.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- end }}

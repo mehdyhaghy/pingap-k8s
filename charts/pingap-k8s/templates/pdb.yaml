@@ -1,0 +1,14 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "pingap-k8s.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pingap-k8s.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "pingap-k8s.selectorLabels" . | nindent 6 }}
+{{- end }}

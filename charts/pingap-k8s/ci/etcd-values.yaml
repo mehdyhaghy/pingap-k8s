@@ -1,0 +1,14 @@
+# Controller + bundled 3-node etcd with generated TLS.
+etcd:
+  deploy: true
+  replicas: 3
+config:
+  upstreams:
+    api:
+      services: ["api.prod:http"]
+    web:
+      services: ["web-blue.prod:http 9", "web-green.prod:http 1"]
+      drain_terminating: true
+      debounce: "1s"
+rbac:
+  namespaces: ["staging"]

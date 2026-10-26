@@ -1,0 +1,46 @@
+{{- /*
+Bundled etcd Services. Both are cluster-internal only: a ClusterIP Service for
+clients and a headless one for peer discovery. etcd is never exposed publicly.
+*/ -}}
+{{- if .Values.etcd.deploy }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pingap-k8s.etcd.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pingap-k8s.etcd.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "pingap-k8s.etcd.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: client
+      port: 2379
+      targetPort: client
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pingap-k8s.etcd.headless" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pingap-k8s.etcd.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  # Members must resolve each other before they are ready.
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "pingap-k8s.etcd.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: client
+      port: 2379
+      targetPort: client
+      protocol: TCP
+    - name: peer
+      port: 2380
+      targetPort: peer
+      protocol: TCP
+{{- end }}

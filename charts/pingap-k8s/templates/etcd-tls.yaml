@@ -1,0 +1,74 @@
+{{- /*
+Generated TLS material for the bundled etcd: a CA, the server (and peer)
+certificate, and client certificates for the controller and for Pingap.
+Existing Secrets are looked up and reused, so an upgrade does not rotate them.
+*/ -}}
+{{- if and .Values.etcd.deploy .Values.etcd.tls.autoGenerate }}
+{{- $etcd := include "pingap-k8s.etcd.fullname" . }}
+{{- $hl := include "pingap-k8s.etcd.headless" . }}
+{{- $ns := .Release.Namespace }}
+{{- $days := int .Values.etcd.tls.validityDays }}
+{{- $k := .Values.etcd.tlsKeys }}
+{{- $caName := printf "%s-ca" $etcd }}
+{{- $ca := dict }}
+{{- $caReused := false }}
+{{- $existingCa := lookup "v1" "Secret" $ns $caName }}
+{{- if and $existingCa $existingCa.data (hasKey (default (dict) $existingCa.data) "ca.crt") (hasKey (default (dict) $existingCa.data) "ca.key") }}
+{{- $ca = buildCustomCert (index $existingCa.data "ca.crt") (index $existingCa.data "ca.key") }}
+{{- $caReused = true }}
+{{- else }}
+{{- $ca = genCA (printf "%s-ca" $etcd) $days }}
+{{- end }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $caName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "pingap-k8s.etcd.labels" . | nindent 4 }}
+type: Opaque
+data:
+  ca.crt: {{ $ca.Cert | b64enc }}
+  ca.key: {{ $ca.Key | b64enc }}
+{{- $serverSans := list
+  $etcd
+  (printf "%s.%s" $etcd $ns)
+  (printf "%s.%s.svc" $etcd $ns)
+  (printf "%s.%s.svc.cluster.local" $etcd $ns)
+  (printf "*.%s" $hl)
+  (printf "*.%s.%s" $hl $ns)
+  (printf "*.%s.%s.svc" $hl $ns)
+  (printf "*.%s.%s.svc.cluster.local" $hl $ns)
+  "localhost" }}
+{{- $leaves := list
+  (dict "name" (printf "%s-server" $etcd) "cn" $etcd "ips" (list "127.0.0.1") "sans" $serverSans)
+  (dict "name" (printf "%s-client" $etcd) "cn" "pingap-k8s" "ips" (list) "sans" (list))
+  (dict "name" (printf "%s-pingap-client" $etcd) "cn" "pingap" "ips" (list) "sans" (list)) }}
+{{- range $leaf := $leaves }}
+{{- $crt := "" }}
+{{- $key := "" }}
+{{- $existing := lookup "v1" "Secret" $ns $leaf.name }}
+{{- $data := default (dict) (and $existing $existing.data) }}
+{{- if and $caReused (hasKey $data $k.cert) (hasKey $data $k.key) }}
+{{- $crt = index $data $k.cert }}
+{{- $key = index $data $k.key }}
+{{- else }}
+{{- $cert := genSignedCert $leaf.cn $leaf.ips $leaf.sans $days $ca }}
+{{- $crt = $cert.Cert | b64enc }}
+{{- $key = $cert.Key | b64enc }}
+{{- end }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $leaf.name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "pingap-k8s.etcd.labels" $ | nindent 4 }}
+type: Opaque
+data:
+  {{ $k.ca }}: {{ $ca.Cert | b64enc }}
+  {{ $k.cert }}: {{ $crt }}
+  {{ $k.key }}: {{ $key }}
+{{- end }}
+{{- end }}

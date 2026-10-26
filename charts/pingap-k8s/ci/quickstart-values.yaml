@@ -1,0 +1,12 @@
+# Everything in one install: controller, single-node etcd, and the stock Pingap
+# image seeded with one listener whose upstream follows the "echo" Service.
+etcd:
+  deploy: true
+pingap:
+  deploy: true
+  service:
+    type: LoadBalancer
+config:
+  upstreams:
+    quickstart:
+      services: ["echo:http"]

@@ -1,0 +1,25 @@
+{{- if and .Values.pingap.deploy .Values.pingap.seed.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pingap-k8s.pingap.fullname" . }}-seed
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pingap-k8s.pingap.labels" . | nindent 4 }}
+data:
+  pingap.toml: |
+    {{- .Values.pingap.seed.config | nindent 4 }}
+  # Writes pingap.toml into the etcd prefix, only when the prefix has no
+  # server yet. "--sync" replaces the whole prefix, so it never runs on a
+  # prefix that is already in use.
+  seed.sh: |
+    set -eu
+    mkdir -p /tmp/pingap-current
+    pingap --conf "$PINGAP_ETCD_URL" --sync /tmp/pingap-current
+    if [ -s /tmp/pingap-current/servers.toml ]; then
+      echo "pingap seed: the etcd prefix already has servers, nothing to do"
+      exit 0
+    fi
+    echo "pingap seed: writing the seed config into the empty etcd prefix"
+    pingap --conf /etc/pingap-seed/pingap.toml --sync "$PINGAP_ETCD_URL"
+{{- end }}

@@ -1,0 +1,20 @@
+pingap-k8s is installed in namespace {{ .Release.Namespace }}.
+
+etcd URL: {{ include "pingap-k8s.etcd.url" . }}
+Upstreams managed: {{ if .Values.config.upstreams }}{{ keys .Values.config.upstreams | sortAlpha | join ", " }}{{ else }}none yet (set config.upstreams){{ end }}
+Read access granted in: {{ include "pingap-k8s.rbacNamespaces" . | fromJsonArray | join ", " }}
+
+Controller status:
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/component=controller,app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "pingap-k8s.fullname" . }}-metrics {{ .Values.metrics.service.port }}   # then /metrics, /readyz
+{{- if .Values.pingap.deploy }}
+
+Quickstart Pingap:
+  Admin password:
+    kubectl -n {{ .Release.Namespace }} get secret {{ include "pingap-k8s.pingap.adminSecret" . }} -o jsonpath='{.data.password}' | base64 -d; echo
+  Admin UI (cluster-internal only):
+    kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "pingap-k8s.pingap.fullname" . }}-admin {{ .Values.pingap.admin.port }}:{{ .Values.pingap.admin.port }}
+  Proxy Service: {{ include "pingap-k8s.pingap.fullname" . }} (type {{ .Values.pingap.service.type }}, port {{ .Values.pingap.service.port }})
+{{- end }}
+
+Application pods behind managed upstreams need a preStop delay (see the README).

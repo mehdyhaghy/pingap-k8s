@@ -1,0 +1,15 @@
+{{- if and .Values.etcd.deploy .Values.etcd.podDisruptionBudget.enabled (eq (int .Values.etcd.replicas) 3) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "pingap-k8s.etcd.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pingap-k8s.etcd.labels" . | nindent 4 }}
+spec:
+  # Keep quorum during voluntary disruptions.
+  minAvailable: 2
+  selector:
+    matchLabels:
+      {{- include "pingap-k8s.etcd.selectorLabels" . | nindent 6 }}
+{{- end }}
