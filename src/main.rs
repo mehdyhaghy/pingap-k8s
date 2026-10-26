@@ -260,7 +260,7 @@ async fn kube_client(
         context: non_empty(section.context.clone().into()),
         ..Default::default()
     };
-    let config = if !section.kubeconfig.is_empty() {
+    let mut config = if !section.kubeconfig.is_empty() {
         let kubeconfig = Kubeconfig::read_from(&section.kubeconfig)
             .with_context(|| format!("reading kubeconfig {}", section.kubeconfig))?;
         kube::Config::from_custom_kubeconfig(kubeconfig, &options)
@@ -282,8 +282,20 @@ async fn kube_client(
                 })?,
         }
     };
+    if enforce_tls_verify(&mut config) {
+        warn!(
+            "the kubeconfig disables TLS verification (insecure-skip-tls-verify); \
+             ignored: the API server certificate is always verified"
+        );
+    }
     info!(cluster = %config.cluster_url, "Kubernetes API");
     kube::Client::try_from(config).context("creating Kubernetes client")
+}
+
+/// the design notes: API server TLS is always verified, whatever the kubeconfig says.
+/// Returns true when verification had been turned off.
+fn enforce_tls_verify(config: &mut kube::Config) -> bool {
+    std::mem::replace(&mut config.accept_invalid_certs, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -990,6 +1002,16 @@ mod tests {
         );
         assert_eq!(detect_identity(None, || Some("host".into())), "host");
         assert!(detect_identity(None, || None).starts_with("pingap-k8s-"));
+    }
+
+    #[test]
+    fn tls_verification_is_always_on() {
+        let mut config = kube::Config::new("https://127.0.0.1:6443".parse().unwrap());
+        assert!(!enforce_tls_verify(&mut config));
+        assert!(!config.accept_invalid_certs);
+        config.accept_invalid_certs = true;
+        assert!(enforce_tls_verify(&mut config));
+        assert!(!config.accept_invalid_certs);
     }
 
     #[test]
