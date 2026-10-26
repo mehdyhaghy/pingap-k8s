@@ -37,6 +37,8 @@ use crate::ws;
 const HTTP_PORT: u16 = 8080;
 const WS_PORT: u16 = 8090;
 const ECHO_REPLICAS: i32 = 3;
+/// The echo containers' preStop sleep (tests/e2e/manifests/app.yaml).
+const PRESTOP: Duration = Duration::from_secs(10);
 /// A rollout of 3 echo pods takes about 40 s (preStop 10 s per pod).
 const ROLLOUT: Duration = Duration::from_secs(240);
 const CONVERGE: Duration = Duration::from_secs(30);
@@ -763,8 +765,10 @@ async fn e2e_03_rolling_restart_under_load() {
 ///
 /// Without a delay the replacement pod is Ready about 0.6 s after the deletion, inside
 /// the 500 ms debounce, and the controller never sees zero ready endpoints (no fallback
-/// needed, nothing to test). A 6 s initial readiness delay on the http container
-/// (restored afterwards) opens the window the fallback is for.
+/// needed, nothing to test). A 3 s initial readiness delay on the http container
+/// (restored afterwards) opens the window the fallback is for, and leaves the new pod
+/// Ready well before the old one's preStop ends even on a slow runner (with 6 s it was
+/// Ready 9.8 s after the deletion once, too late for the debounce).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_04_single_replica_fallback() {
     let Some(env) = Env::setup("e2e_04_single_replica_fallback").await else {
@@ -772,7 +776,7 @@ async fn e2e_04_single_replica_fallback() {
     };
     baseline(&env).await;
     scale_echo(&env, 1).await.unwrap();
-    set_http_ready_delay(&env, Some(6)).await.unwrap();
+    set_http_ready_delay(&env, Some(3)).await.unwrap();
     scale_echo(&env, 1).await.unwrap();
     guarded(single_replica_fallback(&env), async {
         set_http_ready_delay(&env, None).await?;
@@ -906,7 +910,8 @@ async fn single_replica_fallback(env: &Env) {
         );
     }
 
-    // Serving: the old pod until it is gone, the new one from Ready.
+    // Serving: the old pod until its preStop ends (its server stops on SIGTERM, before
+    // the pod object is gone), the new one from Ready.
     let serving = |t: SystemTime| {
         seen.values().any(|p| {
             let from = if p.preexisting {
@@ -914,7 +919,12 @@ async fn single_replica_fallback(env: &Env) {
             } else {
                 p.ready
             };
-            from.is_some_and(|f| f <= t) && p.gone.is_none_or(|g| t < g)
+            let until = match (p.terminating, p.gone) {
+                (Some(d), Some(g)) => Some(g.min(d + PRESTOP)),
+                (Some(d), None) => Some(d + PRESTOP),
+                (None, g) => g,
+            };
+            from.is_some_and(|f| f <= t) && until.is_none_or(|u| t < u)
         })
     };
     let failed = track::failures(&hits);
