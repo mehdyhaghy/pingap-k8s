@@ -760,7 +760,8 @@ fn classify(err: &anyhow::Error) -> FailureKind {
             | EtcdError::MissingTable(_)
             | EtcdError::InvalidAddrs(_)
             | EtcdError::NotUtf8(_)
-            | EtcdError::InvalidName(_),
+            | EtcdError::InvalidName(_)
+            | EtcdError::EmptyAddrs(_),
         ) => FailureKind::Malformed,
         _ => FailureKind::Other,
     }

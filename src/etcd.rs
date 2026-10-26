@@ -67,6 +67,10 @@ pub enum EtcdError {
     MissingTable(String),
     #[error("upstreams.{0}.addrs is not a list of strings")]
     InvalidAddrs(String),
+    /// Pingap rejects an upstream without addresses; the controller keeps the last
+    /// `addrs` instead , so an empty list is never written.
+    #[error("refusing to write an empty addrs list for upstream {0}")]
+    EmptyAddrs(String),
     #[error("value of etcd key {0} is not UTF-8")]
     NotUtf8(String),
     #[error("etcd TLS: {0}")]
@@ -599,6 +603,9 @@ impl EtcdWriter {
         addrs: &[String],
     ) -> anyhow::Result<WriteOutcome> {
         check_name(upstream)?;
+        if addrs.is_empty() {
+            return Err(EtcdError::EmptyAddrs(upstream.to_string()).into());
+        }
         let key = self.upstream_key(upstream);
         let mut kv = self.client.kv_client();
         for attempt in 0..=MAX_CAS_RETRIES {

@@ -161,6 +161,30 @@ async fn malformed_toml_not_written() {
 }
 
 #[tokio::test]
+async fn empty_addrs_never_written() {
+    let Some(w) = writer("empty").await else {
+        return;
+    };
+    // neither an existing entry nor a missing key gets an empty list.
+    let key = w.upstream_key("api");
+    let before = put(&w.client(), &key, ENTRY).await;
+    let err = w.write_addrs("api", &[]).await.unwrap_err();
+    assert!(
+        matches!(
+            err.downcast_ref::<EtcdError>(),
+            Some(EtcdError::EmptyAddrs(_))
+        ),
+        "{err:#}"
+    );
+    assert_eq!(
+        get(&w.client(), &key).await.unwrap(),
+        (ENTRY.to_string(), before)
+    );
+    assert!(w.write_addrs("missing", &[]).await.is_err());
+    assert_eq!(get(&w.client(), &w.upstream_key("missing")).await, None);
+}
+
+#[tokio::test]
 async fn cas_conflict_retry_keeps_concurrent_edit() {
     let Some(mut w) = writer("cas").await else {
         return;
