@@ -4,6 +4,8 @@ etcd:
   deploy: true
 pingap:
   deploy: true
+  # Two replicas: renders the Pingap PodDisruptionBudget.
+  replicas: 2
   service:
     type: LoadBalancer
 config:

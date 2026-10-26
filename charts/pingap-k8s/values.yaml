@@ -230,6 +230,7 @@ extraEnv: []
 # ---------------------------------------------------------------------------
 pingap:
   deploy: false
+  # Use 2 or more in production: the PodDisruptionBudget below only applies then.
   replicas: 1
   image:
     # The Debian based image: the seed step below needs its shell.
@@ -269,9 +270,28 @@ pingap:
     enabled: true
     # Pingap TOML. The upstream "quickstart" starts with a placeholder address;
     # map it to a Service in config.upstreams and the controller fills it.
+    #
+    # Listener: "[::]:8080" alone, not "0.0.0.0:8080,[::]:8080". Pingap passes
+    # each comma-separated address to pingora, which opens an IPv6 socket for
+    # "[::]" without setting IPV6_V6ONLY (Pingap never sets pingora's
+    # ipv6_only option). On Linux that socket is dual-stack and also takes
+    # IPv4, so binding 0.0.0.0 as well would fail with "address in use".
+    # On nodes booted with IPv6 disabled (ipv6.disable=1) use "0.0.0.0:8080".
+    #
+    # [basic]: on SIGTERM pingora closes its listeners, lets in-flight requests
+    # finish, sleeps the whole grace_period (pingora default 5m, longer than any
+    # pod grace period) and then gives its runtimes graceful_shutdown_timeout
+    # (default 5s). Keep preStopSleepSeconds + grace_period +
+    # graceful_shutdown_timeout below terminationGracePeriodSeconds:
+    # 15s + 30s + 10s = 55s < 60s. Basic settings, like servers, are read at
+    # Pingap start only, and the seed does not run on a prefix that has servers.
     config: |
+      [basic]
+      grace_period = "30s"
+      graceful_shutdown_timeout = "10s"
+
       [servers.quickstart]
-      addr = "0.0.0.0:8080"
+      addr = "[::]:8080"
       locations = ["quickstart"]
 
       [locations.quickstart]
@@ -301,6 +321,26 @@ pingap:
       memory: 64Mi
     limits:
       memory: 512Mi
+  # Pod lifecycle. Order on deletion: the pod leaves the Service endpoints and
+  # preStop sleeps preStopSleepSeconds (native sleep action, Kubernetes >= 1.32)
+  # while kube-proxy and load balancers catch up; then Pingap gets SIGTERM and
+  # shuts down gracefully (seed.config [basic]); SIGKILL comes at
+  # terminationGracePeriodSeconds, counted from the start of preStop.
+  terminationGracePeriodSeconds: 60
+  # 0 disables the preStop hook.
+  preStopSleepSeconds: 15
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  podDisruptionBudget:
+    # Rendered only when replicas > 1.
+    enabled: true
+    minAvailable: 1
   nodeSelector: {}
   tolerations: []
   affinity: {}
+  # Empty: spread replicas over nodes (maxSkew 1, kubernetes.io/hostname,
+  # ScheduleAnyway). Set a list to replace that default.
+  topologySpreadConstraints: []

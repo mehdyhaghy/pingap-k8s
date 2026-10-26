@@ -35,7 +35,7 @@ pingap:
     # Deployment and start with a placeholder address the controller replaces.
     config: |
       [servers.e2e]
-      addr = "0.0.0.0:8080"
+      addr = "[::]:8080"
       locations = ["echo-ws", "echo"]
 
       [locations.echo]

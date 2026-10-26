@@ -1,0 +1,14 @@
+{{- if and .Values.pingap.deploy .Values.pingap.podDisruptionBudget.enabled (gt (int .Values.pingap.replicas) 1) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "pingap-k8s.pingap.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pingap-k8s.pingap.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.pingap.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "pingap-k8s.pingap.selectorLabels" . | nindent 6 }}
+{{- end }}
