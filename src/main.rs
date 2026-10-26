@@ -23,7 +23,7 @@ use pingap_k8s::metrics::Metrics;
 use pingap_k8s::reconcile::Reconciler;
 use pingap_k8s::server::{self, Readiness};
 use pingap_k8s::telemetry::Telemetry;
-use pingap_k8s::types::{ForeignWrite, ServiceKey};
+use pingap_k8s::types::{ForeignWrite, ServiceKey, UpstreamTarget};
 use pingap_k8s::watch::WatchRegistry;
 
 /// Default config path; matches the image's CMD and the Helm chart mount.
@@ -164,6 +164,9 @@ fn check(path: &Path, namespace: &str) -> ExitCode {
                 target.endpoints,
                 target.prefix
             );
+            for line in target_lines(&config) {
+                println!("{line}");
+            }
             ExitCode::SUCCESS
         }
         Err(err) => {
@@ -171,6 +174,20 @@ fn check(path: &Path, namespace: &str) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `--check`: one line per upstream with its target mode.
+fn target_lines(config: &Config) -> Vec<String> {
+    config
+        .upstreams
+        .iter()
+        .map(|(name, up)| match &up.options.target {
+            UpstreamTarget::Pods => format!("  upstream {name:?}: target pods"),
+            UpstreamTarget::Service { cluster_domain } => {
+                format!("  upstream {name:?}: target service (*.svc.{cluster_domain})")
+            }
+        })
+        .collect()
 }
 
 /// Where the pod namespace came from.
@@ -906,6 +923,25 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Args, clap::Error> {
         Args::try_parse_from(std::iter::once("pingap-k8s").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn check_prints_each_upstream_target() {
+        let config = Config::from_toml_str(
+            "[etcd]\nurl = \"etcd://e:2379/p\"\n\
+             [kubernetes]\ncluster_domain = \"k.internal\"\n\
+             [upstreams.a]\nservices = [\"a:80\"]\n\
+             [upstreams.b]\nservices = [\"b:80\"]\ntarget = \"service\"\n",
+            "ns",
+        )
+        .unwrap();
+        assert_eq!(
+            target_lines(&config),
+            vec![
+                "  upstream \"a\": target pods".to_string(),
+                "  upstream \"b\": target service (*.svc.k.internal)".to_string(),
+            ]
+        );
     }
 
     fn env_free(var: &str) -> bool {

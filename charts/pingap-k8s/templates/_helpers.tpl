@@ -239,6 +239,7 @@ url = {{ include "pingap-k8s.tomlString" (include "pingap-k8s.etcd.url" .) }}
 kubeconfig = {{ .Values.config.kubernetes.kubeconfig | default "" | include "pingap-k8s.tomlString" }}
 context = {{ .Values.config.kubernetes.context | default "" | include "pingap-k8s.tomlString" }}
 default_namespace = {{ .Values.config.kubernetes.default_namespace | default "" | include "pingap-k8s.tomlString" }}
+cluster_domain = {{ .Values.config.kubernetes.cluster_domain | default "cluster.local" | include "pingap-k8s.tomlString" }}
 
 [defaults]
 {{- include "pingap-k8s.tomlTable" .Values.config.defaults }}

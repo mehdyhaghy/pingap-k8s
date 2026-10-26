@@ -25,6 +25,13 @@ spec:
     metadata:
       labels:
         {{- include "pingap-k8s.pingap.selectorLabels" . | nindent 8 }}
+        {{- with $p.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with $p.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
       automountServiceAccountToken: false
       enableServiceLinks: false

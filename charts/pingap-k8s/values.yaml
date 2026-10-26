@@ -126,6 +126,9 @@ config:
     context: ""
     # Empty: the controller pod's own namespace.
     default_namespace: ""
+    # Cluster DNS domain used for target = "service" addresses
+    # (<service>.<namespace>.svc.<cluster_domain>:<port>). Applies live.
+    cluster_domain: cluster.local
   defaults:
     include_not_ready: false
     drain_terminating: true
@@ -134,6 +137,10 @@ config:
     # Full re-list and re-reconcile, corrects drift.
     resync: "5m"
     ipv4_only: false
+    # What the controller writes into Pingap's addrs: "pods" (ready pod IPs
+    # from EndpointSlices) or "service" (the Service DNS name; see README,
+    # "Upstream target"). Can be set per upstream as well.
+    target: pods
   # One entry per Pingap upstream the controller owns. Any [defaults] key can be
   # overridden per upstream. Example:
   #   upstreams:
@@ -142,6 +149,9 @@ config:
   #     web:
   #       services: ["web-blue.prod:http 9", "web-green.prod:http 1"]
   #       drain_terminating: true
+  #     legacy:
+  #       services: ["legacy.prod:http"]
+  #       target: service
   upstreams: {}
   # Optional [server] table (metrics/health listener), passed through as is.
   # Leave empty for the built-in default ([::]:9090, which also accepts IPv4 on
@@ -301,6 +311,10 @@ pingap:
       addrs = ["127.0.0.1:9"]
   extraArgs: []
   extraEnv: []
+  # Extra labels and annotations on the Pingap pods, for example, labels or
+  # annotations a service mesh needs to include this pod.
+  podLabels: {}
+  podAnnotations: {}
   podSecurityContext:
     runAsNonRoot: true
     runAsUser: 65532

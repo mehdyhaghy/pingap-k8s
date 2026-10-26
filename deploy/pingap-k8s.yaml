@@ -69,6 +69,7 @@ data:
     kubeconfig = ""
     context = ""
     default_namespace = ""
+    cluster_domain = "cluster.local"
     
     [defaults]
     debounce = "500ms"
@@ -77,6 +78,7 @@ data:
     include_not_ready = false
     ipv4_only = false
     resync = "5m"
+    target = "pods"
 
 ---
 # Source: pingap-k8s/templates/rbac.yaml
