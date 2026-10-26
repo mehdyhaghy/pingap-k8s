@@ -1,0 +1,177 @@
+{{- if .Values.etcd.deploy }}
+{{- $replicas := int .Values.etcd.replicas }}
+{{- if not (or (eq $replicas 1) (eq $replicas 3)) }}
+{{- fail "etcd.replicas must be 1 or 3" }}
+{{- end }}
+{{- $etcd := include "pingap-k8s.etcd.fullname" . }}
+{{- $hl := include "pingap-k8s.etcd.headless" . }}
+{{- $ns := .Release.Namespace }}
+{{- $k := .Values.etcd.tlsKeys }}
+{{- $peers := list }}
+{{- range $i := until $replicas }}
+{{- $peers = append $peers (printf "%s-%d=https://%s-%d.%s.%s.svc:2380" $etcd $i $etcd $i $hl $ns) }}
+{{- end }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $etcd }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "pingap-k8s.etcd.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ $hl }}
+  replicas: {{ $replicas }}
+  # All members have to start together to form the initial quorum.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "pingap-k8s.etcd.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pingap-k8s.etcd.selectorLabels" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: etcd
+          image: "{{ .Values.etcd.image.repository }}:{{ .Values.etcd.image.tag }}"
+          imagePullPolicy: {{ .Values.etcd.image.pullPolicy }}
+          command:
+            - /usr/local/bin/etcd
+          args:
+            - --name=$(POD_NAME)
+            - --data-dir=/var/lib/etcd/data
+            - --listen-client-urls=https://0.0.0.0:2379
+            - --advertise-client-urls=https://$(POD_NAME).{{ $hl }}.{{ $ns }}.svc:2379
+            - --listen-peer-urls=https://0.0.0.0:2380
+            - --initial-advertise-peer-urls=https://$(POD_NAME).{{ $hl }}.{{ $ns }}.svc:2380
+            - --initial-cluster={{ join "," $peers }}
+            - --initial-cluster-state=new
+            - --initial-cluster-token={{ $etcd }}
+            # Plain HTTP health/metrics, for the kubelet probes only (no Service exposes it).
+            - --listen-metrics-urls=http://0.0.0.0:2381
+            - --client-cert-auth=true
+            - --trusted-ca-file=/etc/etcd/tls/{{ $k.ca }}
+            - --cert-file=/etc/etcd/tls/{{ $k.cert }}
+            - --key-file=/etc/etcd/tls/{{ $k.key }}
+            - --peer-client-cert-auth=true
+            - --peer-trusted-ca-file=/etc/etcd/tls/{{ $k.ca }}
+            - --peer-cert-file=/etc/etcd/tls/{{ $k.cert }}
+            - --peer-key-file=/etc/etcd/tls/{{ $k.key }}
+            - --auto-compaction-mode=periodic
+            - --auto-compaction-retention=1h
+            {{- range .Values.etcd.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # For "kubectl exec ... -- etcdctl ..." inside the pod.
+            - name: ETCDCTL_ENDPOINTS
+              value: https://127.0.0.1:2379
+            - name: ETCDCTL_CACERT
+              value: /etc/etcd/tls/{{ $k.ca }}
+            - name: ETCDCTL_CERT
+              value: /etc/etcd/tls/{{ $k.cert }}
+            - name: ETCDCTL_KEY
+              value: /etc/etcd/tls/{{ $k.key }}
+          ports:
+            - name: client
+              containerPort: 2379
+              protocol: TCP
+            - name: peer
+              containerPort: 2380
+              protocol: TCP
+            - name: health
+              containerPort: 2381
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: health
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: health
+            periodSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            {{- toYaml .Values.etcd.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/etcd
+            - name: tls
+              mountPath: /etc/etcd/tls
+              readOnly: true
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ include "pingap-k8s.etcd.serverSecret" . }}
+            defaultMode: 0440
+        {{- if not .Values.etcd.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+      {{- with .Values.etcd.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.etcd.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+        {{- if .Values.etcd.affinity }}
+        {{- toYaml .Values.etcd.affinity | nindent 8 }}
+        {{- else }}
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "pingap-k8s.etcd.selectorLabels" . | nindent 20 }}
+        {{- end }}
+  {{- if .Values.etcd.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "pingap-k8s.etcd.selectorLabels" . | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.etcd.persistence.accessModes | nindent 10 }}
+        {{- with .Values.etcd.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.etcd.persistence.size }}
+  {{- end }}
+{{- end }}

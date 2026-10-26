@@ -1,0 +1,55 @@
+{{- /*
+Only the controller and Pingap pods may reach etcd's client port, and only etcd
+members may reach the peer port. Everything else is denied.
+*/ -}}
+{{- if and .Values.etcd.deploy .Values.etcd.networkPolicy.enabled }}
+{{- $np := .Values.etcd.networkPolicy }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pingap-k8s.etcd.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pingap-k8s.etcd.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "pingap-k8s.etcd.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # pingap-k8s controller
+        - podSelector:
+            matchLabels:
+              {{- include "pingap-k8s.selectorLabels" . | nindent 14 }}
+        {{- if .Values.pingap.deploy }}
+        # quickstart Pingap
+        - podSelector:
+            matchLabels:
+              {{- include "pingap-k8s.pingap.selectorLabels" . | nindent 14 }}
+        {{- end }}
+        {{- with $np.pingapPodLabels }}
+        # Pingap pods
+        - podSelector:
+            matchLabels:
+              {{- toYaml . | nindent 14 }}
+          {{- with $np.pingapNamespaceSelector }}
+          namespaceSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- end }}
+        {{- with $np.extraFrom }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      ports:
+        - port: 2379
+          protocol: TCP
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "pingap-k8s.etcd.selectorLabels" . | nindent 14 }}
+      ports:
+        - port: 2380
+          protocol: TCP
+{{- end }}

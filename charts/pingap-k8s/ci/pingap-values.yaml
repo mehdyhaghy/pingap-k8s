@@ -1,0 +1,12 @@
+# Controller + quickstart Pingap against an existing etcd (no bundled etcd).
+etcd:
+  url: "etcd://etcd.edge.svc:2379/pingap?ca=/etc/pingap-k8s/etcd/ca.crt&cert=/etc/pingap-k8s/etcd/tls.crt&key=/etc/pingap-k8s/etcd/tls.key"
+  tlsSecret: pingap-k8s-etcd
+pingap:
+  deploy: true
+  etcdTlsSecret: pingap-etcd
+config:
+  useSecret: true
+  upstreams:
+    quickstart:
+      services: ["echo.apps:8080"]
