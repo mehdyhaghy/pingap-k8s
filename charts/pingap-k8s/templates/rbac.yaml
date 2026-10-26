@@ -1,11 +1,15 @@
 {{- /*
 Read-only access to Services and EndpointSlices, one Role + RoleBinding per
 namespace the controller reads. Never a ClusterRole.
+With events.enabled, the only write permission: create and patch on
+events.k8s.io events in those namespaces (Service Events) and in the release
+namespace (Events about the controller Pod).
 */ -}}
 {{- if .Values.rbac.create }}
 {{- $fullname := include "pingap-k8s.fullname" . }}
 {{- $sa := include "pingap-k8s.serviceAccountName" . }}
-{{- range $ns := include "pingap-k8s.rbacNamespaces" . | fromJsonArray }}
+{{- $namespaces := include "pingap-k8s.rbacNamespaces" . | fromJsonArray }}
+{{- range $ns := $namespaces }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -21,6 +25,11 @@ rules:
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get", "list", "watch"]
+  {{- if $.Values.events.enabled }}
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -37,5 +46,35 @@ subjects:
   - kind: ServiceAccount
     name: {{ $sa }}
     namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- if and .Values.events.enabled (not (has .Release.Namespace $namespaces)) }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}-events
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pingap-k8s.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-events
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pingap-k8s.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}-events
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ .Release.Namespace }}
 {{- end }}
 {{- end }}

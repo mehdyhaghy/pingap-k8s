@@ -70,6 +70,7 @@ data:
     context = ""
     default_namespace = ""
     cluster_domain = "cluster.local"
+    events = false
     
     [defaults]
     debounce = "500ms"

@@ -16,6 +16,8 @@ use opentelemetry_sdk::metrics::{MeterProviderBuilder, SdkMeterProvider};
 use prometheus::proto::MetricType;
 use prometheus::{Encoder, Registry, TextEncoder};
 
+use crate::events::{Events, Notice};
+
 /// Buckets for `pingap_k8s_event_to_write_seconds`, 50 ms to 30 s. Dense
 /// around the default debounce window (500 ms .. 2 s).
 pub const EVENT_TO_WRITE_BUCKETS: &[f64] = &[
@@ -73,7 +75,8 @@ struct Gauges {
     drain_fallback: BTreeMap<String, u64>,
     watch_up: BTreeMap<(String, String), u64>,
     is_leader: u64,
-    etcd_up: u64,
+    /// `None` until the first etcd interaction (reported as 0).
+    etcd_up: Option<bool>,
 }
 
 pub struct Metrics {
@@ -159,8 +162,8 @@ impl Metrics {
         let g = gauges.clone();
         meter
             .u64_observable_gauge("pingap_k8s.etcd_up")
-            .with_description("1 when the last etcd operation succeeded, else 0.")
-            .with_callback(move |o| o.observe(lock(&g).etcd_up, &[]))
+            .with_description("1 when the last etcd interaction got an answer, else 0.")
+            .with_callback(move |o| o.observe(u64::from(lock(&g).etcd_up == Some(true)), &[]))
             .build();
 
         Metrics {
@@ -293,8 +296,10 @@ impl Metrics {
         lock(&self.gauges).is_leader = u64::from(leader);
     }
 
-    pub fn set_etcd_up(&self, up: bool) {
-        lock(&self.gauges).etcd_up = u64::from(up);
+    /// Sets `etcd_up` and returns the previous value (`None` before the
+    /// first call). Use [`EtcdHealth::report`] rather than this directly.
+    pub fn set_etcd_up(&self, up: bool) -> Option<bool> {
+        lock(&self.gauges).etcd_up.replace(up)
     }
 
     /// Drops the per-upstream gauge series of an upstream removed from the
@@ -311,6 +316,42 @@ impl Metrics {
         lock(&self.gauges)
             .watch_up
             .remove(&(namespace.to_string(), service.to_string()));
+    }
+}
+
+/// The one place that reports etcd reachability (`pingap_k8s_etcd_up`,
+/// the design notes): the gauge holds the result of the most recent etcd interaction
+/// of any kind (writes, the owned-key watch, the election's lease grant,
+/// keep-alives and campaign), so a follower shows 0 while etcd is down too.
+/// `reachable` is true whenever etcd answered, even with an error (a
+/// malformed entry, a CAS conflict, permission denied); false for transport
+/// errors and timeouts. A change after the first report posts an
+/// `EtcdUnreachable` or `EtcdRecovered` Event when Events are on.
+///
+/// Cheap to clone; every clone built on the same [`Metrics`] shares the state.
+#[derive(Clone)]
+pub struct EtcdHealth {
+    metrics: Arc<Metrics>,
+    events: Events,
+}
+
+impl EtcdHealth {
+    pub fn new(metrics: Arc<Metrics>, events: Events) -> Self {
+        Self { metrics, events }
+    }
+
+    pub fn report(&self, reachable: bool) {
+        match self.metrics.set_etcd_up(reachable) {
+            Some(previous) if previous != reachable => {
+                if reachable {
+                    tracing::info!("etcd is reachable again");
+                } else {
+                    tracing::warn!("etcd cannot be reached");
+                }
+                self.events.post(Notice::etcd(reachable));
+            }
+            _ => {}
+        }
     }
 }
 
@@ -437,6 +478,29 @@ mod tests {
             m.encode()
                 .contains(r#"pingap_k8s_endpoints{class="ready",upstream="web"} 1"#)
         );
+    }
+
+    #[test]
+    fn etcd_health_reports_latest_result_and_posts_changes() {
+        let m = Arc::new(Metrics::new());
+        let (events, mut rx) = Events::channel(8);
+        let a = EtcdHealth::new(m.clone(), events.clone());
+        let b = EtcdHealth::new(m.clone(), events);
+        // Before the first report: 0, and the first report is not a change.
+        assert_eq!(m.value("pingap_k8s_etcd_up", &[]), 0);
+        a.report(true);
+        assert_eq!(m.value("pingap_k8s_etcd_up", &[]), 1);
+        assert!(rx.try_recv().is_err());
+        // Any source flips the one gauge; only changes post an Event.
+        b.report(false);
+        b.report(false);
+        assert_eq!(m.value("pingap_k8s_etcd_up", &[]), 0);
+        assert_eq!(rx.try_recv().unwrap(), Notice::etcd(false));
+        assert!(rx.try_recv().is_err());
+        a.report(true);
+        assert_eq!(m.value("pingap_k8s_etcd_up", &[]), 1);
+        assert_eq!(rx.try_recv().unwrap(), Notice::etcd(true));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

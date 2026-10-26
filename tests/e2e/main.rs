@@ -31,8 +31,8 @@
 //! (per-pod metrics, leader, logs, config), [`track`] (timestamped etcd watch, request
 //! loop and pod tracker for the timing tests).
 //!
-//! The e2e integration tests 1–13 are in [`spec`] (`spec::e2e_01_initial_sync` ...
-//! `spec::e2e_13_sse_stream`); filter with e.g. `scripts/e2e-run.sh e2e_04`.
+//! The e2e integration tests 1–14 are in [`spec`] (`spec::e2e_01_initial_sync` ...
+//! `spec::e2e_14_events`); filter with e.g. `scripts/e2e-run.sh e2e_04`.
 
 // Helpers are shared with the e2e tests (T12); not every one is used by every test.
 #![allow(dead_code)]

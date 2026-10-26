@@ -1,0 +1,8 @@
+# CI render check for opt-in Kubernetes Events: an events rule in each app
+# namespace Role plus a Role in the release namespace, never a ClusterRole.
+events:
+  enabled: true
+config:
+  upstreams:
+    api:
+      services: ["api.prod:http"]

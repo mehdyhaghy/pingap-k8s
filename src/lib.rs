@@ -1,5 +1,6 @@
 pub mod config;
 pub mod etcd;
+pub mod events;
 pub mod leader;
 pub mod metrics;
 pub mod reconcile;

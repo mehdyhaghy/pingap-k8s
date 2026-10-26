@@ -240,6 +240,7 @@ kubeconfig = {{ .Values.config.kubernetes.kubeconfig | default "" | include "pin
 context = {{ .Values.config.kubernetes.context | default "" | include "pingap-k8s.tomlString" }}
 default_namespace = {{ .Values.config.kubernetes.default_namespace | default "" | include "pingap-k8s.tomlString" }}
 cluster_domain = {{ .Values.config.kubernetes.cluster_domain | default "cluster.local" | include "pingap-k8s.tomlString" }}
+events = {{ ternary "true" "false" (.Values.events.enabled | default false) }}
 
 [defaults]
 {{- include "pingap-k8s.tomlTable" .Values.config.defaults }}

@@ -1,11 +1,14 @@
 //! `run_election` against a real etcd. Skipped unless `PINGAP_K8S_TEST_ETCD` is set to an
 //! endpoint such as `http://127.0.0.1:23790` (see scripts/test-etcd.sh).
 
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use etcd_client::{Client, GetOptions};
 use pingap_k8s::etcd::{EtcdWriter, parse_etcd_url};
-use pingap_k8s::leader::run_election;
+use pingap_k8s::events::Events;
+use pingap_k8s::leader::{run_election, run_election_with_health};
+use pingap_k8s::metrics::{EtcdHealth, Metrics};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, timeout};
@@ -358,4 +361,101 @@ async fn long_campaign_outlives_request_timeout() {
     assert_eq!(kv.lease(), queued.1);
     assert_eq!(kv.value_str().unwrap(), "pod-b");
     follower.shutdown().await;
+}
+
+/// A TCP proxy to etcd that can be cut: every connection through it is closed
+/// and no new one is accepted.
+struct Proxy {
+    addr: std::net::SocketAddr,
+    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+impl Proxy {
+    async fn start(upstream: String) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tasks = Arc::new(Mutex::new(Vec::new()));
+        let accepted = tasks.clone();
+        let acceptor = tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                let upstream = upstream.clone();
+                let conn = tokio::spawn(async move {
+                    if let Ok(mut outbound) = tokio::net::TcpStream::connect(&upstream).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+                accepted.lock().unwrap().push(conn);
+            }
+        });
+        tasks.lock().unwrap().push(acceptor);
+        Self { addr, tasks }
+    }
+
+    fn cut(&self) {
+        for task in self.tasks.lock().unwrap().drain(..) {
+            task.abort();
+        }
+    }
+}
+
+/// A follower never writes, so only the election tells it whether etcd is
+/// reachable: its keep-alives set `etcd_up` to 1 while campaigning and to 0
+/// within a few keep-alive intervals once etcd cannot be reached.
+#[tokio::test]
+async fn follower_reports_etcd_up_from_the_election() {
+    let Some(direct) = client("follower_reports_etcd_up_from_the_election").await else {
+        return;
+    };
+    let endpoint = std::env::var("PINGAP_K8S_TEST_ETCD").unwrap();
+    let host = endpoint
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+    let proxy = Proxy::start(host).await;
+    let via_proxy = Client::connect([proxy.addr.to_string()], None)
+        .await
+        .unwrap();
+
+    let name = election_name("etcd-up");
+    let leader = Candidate::start(&direct, &name, "leader").await;
+    wait_value(&leader.rx, true, Duration::from_secs(10)).await;
+
+    let metrics = Arc::new(Metrics::new());
+    let health = EtcdHealth::new(metrics.clone(), Events::disabled());
+    let (tx, rx) = watch::channel(false);
+    let (stop, stopped) = oneshot::channel::<()>();
+    let follower = tokio::spawn(run_election_with_health(
+        via_proxy,
+        name.clone(),
+        TTL,
+        "follower".into(),
+        tx,
+        async move {
+            let _ = stopped.await;
+        },
+        Some(health),
+    ));
+    let wait_etcd_up = |want: u64, within: Duration| {
+        let metrics = metrics.clone();
+        async move {
+            let deadline = Instant::now() + within;
+            while metrics.value("pingap_k8s_etcd_up", &[]) != want {
+                assert!(
+                    Instant::now() < deadline,
+                    "etcd_up did not become {want} within {within:?}"
+                );
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+    wait_etcd_up(1, Duration::from_secs(5)).await;
+    assert!(!*rx.borrow(), "the follower must not be leader");
+
+    proxy.cut();
+    wait_etcd_up(0, Duration::from_secs(10)).await;
+    assert!(!*rx.borrow());
+
+    let _ = stop.send(());
+    let _ = timeout(Duration::from_secs(10), follower).await;
+    leader.shutdown().await;
 }

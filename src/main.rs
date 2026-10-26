@@ -18,8 +18,9 @@ use tracing::{error, info, warn};
 
 use pingap_k8s::config::{Config, ConfigError};
 use pingap_k8s::etcd::{EtcdError, EtcdTarget, EtcdWriter, parse_etcd_url};
+use pingap_k8s::events::Events;
 use pingap_k8s::leader;
-use pingap_k8s::metrics::Metrics;
+use pingap_k8s::metrics::{EtcdHealth, Metrics};
 use pingap_k8s::reconcile::Reconciler;
 use pingap_k8s::server::{self, Readiness};
 use pingap_k8s::status::{self, StatusBoard, StatusSources};
@@ -450,6 +451,8 @@ async fn run(
     }
 
     let client = kube_client(&config.kubernetes).await?;
+    let events = kube_events(&config, &client, &namespace);
+    let etcd_health = EtcdHealth::new(metrics.clone(), events.clone());
 
     let Some(writer) = retry("connecting to etcd", &shutdown_rx, || {
         EtcdWriter::connect(&target)
@@ -458,7 +461,8 @@ async fn run(
     else {
         return finish(server_task, None, None).await;
     };
-    metrics.set_etcd_up(true);
+    let writer = writer.with_etcd_health(etcd_health.clone());
+    etcd_health.report(true);
     info!(endpoints = ?target.endpoints, prefix = writer.prefix(), "connected to etcd");
 
     let registry = WatchRegistry::new(client, metrics.clone());
@@ -479,13 +483,14 @@ async fn run(
         return finish(server_task, None, None).await;
     };
     let (leader_tx, leader_rx) = watch::channel(false);
-    let election = tokio::spawn(leader::run_election(
+    let election = tokio::spawn(leader::run_election_with_health(
         election_client,
         election_name(writer.prefix()),
         leader::DEFAULT_TTL,
         detect_identity(std::env::var_os("POD_NAME"), hostname),
         leader_tx,
         shutdown_signal(shutdown_rx.clone()),
+        Some(etcd_health),
     ));
     spawn_leader_metric(leader_rx.clone(), metrics.clone());
 
@@ -506,7 +511,8 @@ async fn run(
         metrics.clone(),
         readiness.clone(),
     )
-    .with_status(status_board);
+    .with_status(status_board)
+    .with_events(events);
     reconciler.set_upstreams(config.upstreams.clone());
     let reconcile_task = tokio::spawn(reconciler.clone().run(
         registry.subscribe(),
@@ -533,6 +539,19 @@ async fn run(
     controller.run(reload_rx, &shutdown_rx).await;
 
     finish(server_task, Some(election), Some(reconcile_task)).await
+}
+
+/// Kubernetes Events per `[kubernetes] events`, as this pod.
+fn kube_events(config: &Config, client: &kube::Client, namespace: &str) -> Events {
+    if !config.kubernetes.events {
+        return Events::disabled();
+    }
+    Events::spawn(
+        client.clone(),
+        detect_identity(std::env::var_os("POD_NAME"), hostname),
+        namespace.to_string(),
+        std::env::var("POD_UID").ok(),
+    )
 }
 
 /// A reload channel with no sender: startup waits are not superseded by reloads
@@ -900,6 +919,9 @@ fn restart_required(boot: &Config, new: &Config) -> Vec<&'static str> {
     {
         fields.push("[kubernetes] kubeconfig/context");
     }
+    if boot.kubernetes.events != new.kubernetes.events {
+        fields.push("[kubernetes] events");
+    }
     if boot.server != new.server {
         fields.push("[server]");
     }
@@ -1003,25 +1025,53 @@ mod tests {
         assert!(parse(&["--config"]).is_err());
     }
 
-    fn temp_file(name: &str, content: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("pingap-k8s-main-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("namespace");
+    /// A fresh directory in the system temp dir, removed on drop (also when
+    /// the test panics), so test runs leave nothing behind.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("pingap-k8s-main-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A `namespace` file with `content`; keep the guard alive while using the path.
+    fn temp_file(name: &str, content: &str) -> (TempDir, PathBuf) {
+        let dir = TempDir::new(name);
+        let path = dir.0.join("namespace");
         std::fs::write(&path, content).unwrap();
-        path
+        (dir, path)
+    }
+
+    #[test]
+    fn temp_dir_is_removed_on_drop() {
+        let (dir, file) = temp_file("drop", "x");
+        assert!(file.exists());
+        let path = dir.0.clone();
+        drop(dir);
+        assert!(!path.exists());
     }
 
     #[test]
     fn namespace_from_env_wins() {
-        let file = temp_file("env", "from-file\n");
+        let (_dir, file) = temp_file("env", "from-file\n");
         let got = detect_namespace(Some("from-env".into()), &file);
         assert_eq!(got, ("from-env".to_string(), NamespaceSource::Env));
     }
 
     #[test]
     fn namespace_from_service_account_file() {
-        let file = temp_file("sa", "edge\n");
+        let (_dir, file) = temp_file("sa", "edge\n");
         assert_eq!(
             detect_namespace(None, &file),
             ("edge".to_string(), NamespaceSource::ServiceAccount)
@@ -1040,7 +1090,7 @@ mod tests {
             detect_namespace(None, missing),
             ("default".to_string(), NamespaceSource::Default)
         );
-        let empty = temp_file("empty", "\n");
+        let (_dir, empty) = temp_file("empty", "\n");
         assert_eq!(detect_namespace(None, &empty).1, NamespaceSource::Default);
     }
 
@@ -1121,13 +1171,16 @@ services = ["api.prod:http"]
             restart_required(&base, &cfg("[defaults]\nresync = \"1m\"\n")),
             vec!["defaults.resync"]
         );
+        assert_eq!(
+            restart_required(&base, &cfg("[kubernetes]\nevents = true\n")),
+            vec!["[kubernetes] events"]
+        );
     }
 
     #[test]
     fn load_rejects_bad_etcd_url() {
-        let dir = std::env::temp_dir().join(format!("pingap-k8s-main-{}-url", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("c.toml");
+        let dir = TempDir::new("url");
+        let path = dir.0.join("c.toml");
         std::fs::write(&path, BASE.replace("127.0.0.1:2379/pingap", "/pingap")).unwrap();
         assert!(matches!(load(&path, "default"), Err(LoadError::EtcdUrl(_))));
         std::fs::write(&path, BASE).unwrap();

@@ -65,6 +65,13 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            {{- if .Values.events.enabled }}
+            # Pod-scoped Events carry the UID, so kubectl describe pod shows them.
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            {{- end }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
             {{- with .Values.otel.endpoint }}

@@ -33,6 +33,7 @@ use tokio::sync::{RwLock, mpsc};
 use toml_edit::{Array, DocumentMut, Item, Table, TableLike, Value};
 use tracing::{debug, info, warn};
 
+use crate::metrics::EtcdHealth;
 use crate::types::{AddrsWriter, ForeignWrite, WriteOutcome};
 
 /// The scheme of Pingap's etcd config URL.
@@ -77,6 +78,47 @@ pub enum EtcdError {
     Tls(String),
     #[error("compare-and-swap on {key} failed {attempts} times in a row")]
     Conflict { key: String, attempts: u32 },
+}
+
+/// Whether an etcd-client error means etcd could not be reached (no answer):
+/// transport and I/O errors, closed streams, and the gRPC codes a client
+/// sees without an answer from the server (Cancelled, Unknown,
+/// DeadlineExceeded, Unavailable). Any other gRPC status is an answer
+/// (permission denied, invalid argument, ...), as are local errors.
+pub fn client_error_unreachable(err: &etcd_client::Error) -> bool {
+    use etcd_client::Error as E;
+    match err {
+        E::GRpcStatus(status) => grpc_code_unreachable(status.code().into()),
+        E::InvalidArgs(_)
+        | E::InvalidUri(_)
+        | E::Utf8Error(_)
+        | E::InvalidMetadataValue(_)
+        | E::EndpointsNotManaged => false,
+        _ => true,
+    }
+}
+
+/// gRPC codes (numbers, tonic is not a direct dependency) a client gets
+/// without an answer from etcd: Cancelled 1, Unknown 2, DeadlineExceeded 4,
+/// Unavailable 14.
+fn grpc_code_unreachable(code: i32) -> bool {
+    matches!(code, 1 | 2 | 4 | 14)
+}
+
+/// [`client_error_unreachable`] for an error chain: an [`EtcdError`] (the
+/// stored entry or a CAS conflict: etcd answered) is reachable, the first
+/// etcd-client error decides otherwise, and anything else (timeouts,
+/// unclassified errors) counts as unreachable.
+pub fn is_unreachable(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if cause.downcast_ref::<EtcdError>().is_some() {
+            return false;
+        }
+        if let Some(e) = cause.downcast_ref::<etcd_client::Error>() {
+            return client_error_unreachable(e);
+        }
+    }
+    true
 }
 
 /// A parsed Pingap etcd URL:
@@ -539,6 +581,8 @@ pub struct EtcdWriter {
     prefix: String,
     own: Arc<OwnWrites>,
     pre_commit_hook: Option<PreCommitHook>,
+    /// Where the owned-key watch reports etcd reachability.
+    health: Option<EtcdHealth>,
 }
 
 impl fmt::Debug for EtcdWriter {
@@ -560,6 +604,7 @@ impl EtcdWriter {
             prefix: target.prefix.clone(),
             own: Arc::default(),
             pre_commit_hook: None,
+            health: None,
         })
     }
 
@@ -574,6 +619,14 @@ impl EtcdWriter {
         Client::connect(&target.endpoints, Some(options))
             .await
             .with_context(|| format!("connecting to etcd {:?} (election)", target.endpoints))
+    }
+
+    /// The owned-key watches started after this report etcd reachability
+    /// here (the design notes `etcd_up`): a message from etcd is reachable, a stream
+    /// error or a failed reconnect is decided by [`client_error_unreachable`].
+    pub fn with_etcd_health(mut self, health: EtcdHealth) -> Self {
+        self.health = Some(health);
+        self
     }
 
     /// `"/" + <url path>` as Pingap keeps it.
@@ -735,6 +788,7 @@ impl EtcdWriter {
             names,
             next: start,
             tx,
+            health: self.health.clone(),
         };
         tokio::spawn(task.run(stream));
         Ok(rx)
@@ -780,6 +834,7 @@ struct OwnedWatch {
     /// The first revision not seen yet.
     next: i64,
     tx: mpsc::Sender<ForeignWrite>,
+    health: Option<EtcdHealth>,
 }
 
 enum StreamEnd {
@@ -790,6 +845,12 @@ enum StreamEnd {
 }
 
 impl OwnedWatch {
+    fn report(&self, reachable: bool) {
+        if let Some(health) = &self.health {
+            health.report(reachable);
+        }
+    }
+
     async fn run(mut self, stream: WatchStream) {
         let mut backoff = WATCH_BACKOFF_MIN;
         let mut stream = Some(stream);
@@ -798,6 +859,7 @@ impl OwnedWatch {
                 Some(stream) => stream,
                 None => match open_watch(&self.client, &self.range, self.next).await {
                     Ok(stream) => {
+                        self.report(true);
                         info!(
                             range = self.range,
                             revision = self.next,
@@ -806,6 +868,7 @@ impl OwnedWatch {
                         stream
                     }
                     Err(e) => {
+                        self.report(!is_unreachable(&e));
                         warn!(error = %e, range = self.range, "owned-key watch: reconnect failed");
                         if !self.sleep(&mut backoff).await {
                             return;
@@ -846,15 +909,18 @@ impl OwnedWatch {
             let resp = match message {
                 Ok(Some(resp)) => resp,
                 Ok(None) => {
+                    self.report(false);
                     warn!(range = self.range, "owned-key watch stream ended");
                     return StreamEnd::Reopen(true);
                 }
                 Err(e) => {
+                    self.report(!client_error_unreachable(&e));
                     warn!(error = %e, range = self.range, "owned-key watch failed");
                     return StreamEnd::Reopen(true);
                 }
             };
             *backoff = WATCH_BACKOFF_MIN;
+            self.report(true);
             if resp.canceled() {
                 if resp.compact_revision() > 0 {
                     warn!(
@@ -1224,6 +1290,36 @@ connection_timeout = "10s"
             seen.set
                 .contains(&("/k".to_string(), OWN_REVISIONS_CAP as i64 + 9))
         );
+    }
+
+    #[test]
+    fn unreachable_classification() {
+        use etcd_client::Error as E;
+        for code in [1, 2, 4, 14] {
+            assert!(grpc_code_unreachable(code), "code {code}");
+        }
+        // InvalidArgument, NotFound, PermissionDenied, FailedPrecondition, Unauthenticated.
+        for code in [3, 5, 7, 9, 16] {
+            assert!(!grpc_code_unreachable(code), "code {code}");
+        }
+        assert!(client_error_unreachable(&E::WatchError("closed".into())));
+        assert!(client_error_unreachable(&E::LeaseKeepAliveError(
+            "keep-alive stream closed".into()
+        )));
+        assert!(!client_error_unreachable(&E::InvalidArgs("x".into())));
+
+        // Chains: an etcd-client error under context decides; an EtcdError
+        // means etcd answered; anything else is unreachable.
+        let wrapped = anyhow::Error::new(E::WatchError("closed".into())).context("etcd watch");
+        assert!(is_unreachable(&wrapped));
+        let wrapped = anyhow::Error::new(E::InvalidArgs("x".into())).context("etcd txn /k");
+        assert!(!is_unreachable(&wrapped));
+        let conflict = anyhow::Error::new(EtcdError::Conflict {
+            key: "/k".into(),
+            attempts: 6,
+        });
+        assert!(!is_unreachable(&conflict));
+        assert!(is_unreachable(&anyhow::anyhow!("timed out")));
     }
 
     #[test]

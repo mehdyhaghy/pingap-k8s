@@ -56,6 +56,18 @@
 //! entries and CAS conflicts affect metrics and logs only: one broken
 //! upstream must not block rollouts of the controller.
 //!
+//! etcd reachability goes to [`EtcdHealth`]: a write that got any answer
+//! from etcd (including a malformed entry, a conflict or permission denied)
+//! is reachable, a transport error or timeout is not.
+//!
+//! Kubernetes Events ([`Reconciler::with_events`], the design notes): only the
+//! leader posts, with the same once-per-episode dedupe as the logs: a
+//! resolve warning when it first appears (on the Service), the drain
+//! fallback on enter and exit (on each Service of the upstream), a malformed
+//! entry once per episode (on the controller Pod). On promotion the new
+//! leader posts the warnings and fallbacks already open, so an episode that
+//! started while it was a follower is reported once.
+//!
 //! Startup : the caller must wait for the watchers' first list before
 //! calling [`Reconciler::run`]; `run` reconciles every upstream right away.
 
@@ -70,8 +82,9 @@ use tokio::task::{Id, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior, sleep_until};
 
 use crate::config::UpstreamConfig;
-use crate::etcd::EtcdError;
-use crate::metrics::{Metrics, WriteResult};
+use crate::etcd::{self, EtcdError};
+use crate::events::{Events, Notice};
+use crate::metrics::{EtcdHealth, Metrics, WriteResult};
 use crate::resolve::{self, ResolveWarning, ServiceInput};
 use crate::server::Readiness;
 use crate::status::StatusBoard;
@@ -116,6 +129,7 @@ pub struct Reconciler<W: AddrsWriter, S: SnapshotSource> {
     source: Arc<S>,
     metrics: Arc<Metrics>,
     readiness: Readiness,
+    events: Events,
     shared: Arc<Shared>,
     status: StatusBoard,
 }
@@ -127,6 +141,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Clone for Reconciler<W, S> {
             source: Arc::clone(&self.source),
             metrics: Arc::clone(&self.metrics),
             readiness: self.readiness.clone(),
+            events: self.events.clone(),
             shared: Arc::clone(&self.shared),
             status: self.status.clone(),
         }
@@ -145,6 +160,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Reconciler<W, S> {
             source,
             metrics,
             readiness,
+            events: Events::disabled(),
             shared: Arc::new(Shared {
                 upstreams: Mutex::new(Pending::default()),
                 foreign: Mutex::new(None),
@@ -165,6 +181,13 @@ impl<W: AddrsWriter, S: SnapshotSource> Reconciler<W, S> {
     /// The board this reconciler publishes into.
     pub fn status_board(&self) -> StatusBoard {
         self.status.clone()
+    }
+
+    /// Posts Kubernetes Events (and `EtcdUnreachable`/`EtcdRecovered` from
+    /// its writes) to `events`. Off by default. Call before [`Reconciler::run`].
+    pub fn with_events(mut self, events: Events) -> Self {
+        self.events = events;
+        self
     }
 
     /// Replaces the set of owned upstreams. Works before and while `run` is
@@ -218,8 +241,10 @@ impl<W: AddrsWriter, S: SnapshotSource> Reconciler<W, S> {
         let mut engine = Engine {
             writer: self.writer,
             source: self.source,
+            etcd_health: EtcdHealth::new(Arc::clone(&self.metrics), self.events.clone()),
             metrics: self.metrics,
             readiness: self.readiness,
+            events: self.events,
             upstreams: BTreeMap::new(),
             by_service: HashMap::new(),
             leader: is_leader,
@@ -384,6 +409,8 @@ struct UpstreamState {
     /// The stored entry is malformed; logged once per episode.
     malformed: bool,
     fallback: bool,
+    /// Draining endpoints of the last pass (for the fallback Event on promotion).
+    fallback_endpoints: usize,
     warnings: BTreeSet<ResolveWarning>,
 }
 
@@ -402,6 +429,7 @@ impl UpstreamState {
             empty: false,
             malformed: false,
             fallback: false,
+            fallback_endpoints: 0,
             warnings: BTreeSet::new(),
         }
     }
@@ -447,6 +475,8 @@ struct Engine<W: AddrsWriter, S: SnapshotSource> {
     source: Arc<S>,
     metrics: Arc<Metrics>,
     readiness: Readiness,
+    events: Events,
+    etcd_health: EtcdHealth,
     upstreams: BTreeMap<String, UpstreamState>,
     by_service: HashMap<ServiceKey, Vec<String>>,
     leader: bool,
@@ -621,6 +651,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
         self.status.set_leader(leader);
         if leader {
             tracing::info!("became leader; reconciling all upstreams");
+            self.post_open_episodes();
             // Another replica may have written meanwhile: forget what we
             // believe is stored and let the writer compare.
             self.mark_all(now, false, true);
@@ -634,6 +665,45 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
             self.update_readiness();
         }
         self.publish_all();
+    }
+
+    /// Events for the warnings and fallbacks already open (on promotion).
+    fn post_open_episodes(&self) {
+        if !self.events.is_enabled() {
+            return;
+        }
+        for (name, st) in &self.upstreams {
+            for w in &st.warnings {
+                self.events.post(Notice::resolve_warning(
+                    name,
+                    w,
+                    service_uid(&*self.source, warning_service(w)),
+                ));
+            }
+            if st.fallback {
+                self.post_drain_fallback(name, &st.config, true, st.fallback_endpoints);
+            }
+        }
+    }
+
+    /// One drain fallback Event on each Service of the upstream.
+    fn post_drain_fallback(
+        &self,
+        name: &str,
+        config: &UpstreamConfig,
+        started: bool,
+        endpoints: usize,
+    ) {
+        let keys: BTreeSet<&ServiceKey> = config.services.iter().map(|s| &s.key).collect();
+        for key in keys {
+            self.events.post(Notice::drain_fallback(
+                name,
+                key,
+                service_uid(&*self.source, key),
+                started,
+                endpoints,
+            ));
+        }
     }
 
     fn next_deadline(&self) -> Option<Instant> {
@@ -694,6 +764,17 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
         let current: BTreeSet<ResolveWarning> = resolved.warnings.iter().cloned().collect();
         for w in current.difference(&st.warnings) {
             tracing::warn!(upstream = %name, "{w}");
+            if self.leader && self.events.is_enabled() {
+                let service = warning_service(w);
+                let uid = st
+                    .config
+                    .services
+                    .iter()
+                    .zip(&snapshots)
+                    .find(|(sref, _)| &sref.key == service)
+                    .and_then(|(_, snap)| snapshot_uid(snap));
+                self.events.post(Notice::resolve_warning(name, w, uid));
+            }
         }
         for w in st.warnings.difference(&current) {
             tracing::info!(upstream = %name, "resolved: {w}");
@@ -701,7 +782,8 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
         st.warnings = current;
 
         // D2 fallback, logged on enter and exit.
-        if resolved.fallback != st.fallback {
+        let fallback_changed = resolved.fallback != st.fallback;
+        if fallback_changed {
             if resolved.fallback {
                 tracing::warn!(
                     upstream = %name,
@@ -713,7 +795,20 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
             }
             st.fallback = resolved.fallback;
         }
+        st.fallback_endpoints = resolved.draining;
         self.metrics.set_drain_fallback(name, resolved.fallback);
+        if fallback_changed && self.leader && self.events.is_enabled() {
+            let endpoints = if resolved.fallback {
+                resolved.draining
+            } else {
+                resolved.ready
+            };
+            let config = st.config.clone();
+            self.post_drain_fallback(name, &config, resolved.fallback, endpoints);
+        }
+        let Some(st) = self.upstreams.get_mut(name) else {
+            return;
+        };
 
         // empty keeps the last addrs.
         if resolved.addrs.is_empty() {
@@ -814,7 +909,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
                 // the writer, which compares with etcd.
                 st.last_written = if stored_changed { None } else { Some(addrs) };
                 st.backoff = RETRY_MIN;
-                self.metrics.set_etcd_up(true);
+                self.etcd_health.report(true);
                 self.unreachable.remove(&name);
                 self.update_readiness();
                 self.publish(&name);
@@ -842,8 +937,10 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
             },
             &[],
         );
-        // A malformed entry or a CAS conflict means etcd answered.
-        self.metrics.set_etcd_up(kind != FailureKind::Other);
+        // A malformed entry or a CAS conflict means etcd answered; so does
+        // any gRPC status other than a transport one (permission denied...).
+        self.etcd_health
+            .report(kind != FailureKind::Other || !etcd::is_unreachable(err));
         // A write that finishes after demotion is not retried and does not
         // affect readiness (followers never write).
         if !self.leader {
@@ -867,6 +964,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
             if !st.malformed {
                 st.malformed = true;
                 tracing::error!(upstream = %name, error = %err, "stored upstream entry is malformed; not written until it is fixed");
+                self.events.post(Notice::malformed_upstream(name, &err));
             }
         } else {
             let delay = jitter(st.backoff);
@@ -882,6 +980,24 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
         self.readiness
             .set_last_write_ok(self.unreachable.is_empty());
     }
+}
+
+/// The Service a resolve warning is about.
+fn warning_service(w: &ResolveWarning) -> &ServiceKey {
+    match w {
+        ResolveWarning::ServiceMissing(key) => key,
+        ResolveWarning::PortNotInService { service, .. }
+        | ResolveWarning::PortNotInSlices { service, .. } => service,
+    }
+}
+
+fn snapshot_uid(snapshot: &crate::types::ServiceSnapshot) -> Option<String> {
+    snapshot.service.as_ref()?.metadata.uid.clone()
+}
+
+/// The UID of the Service as currently watched (`None` when it does not exist).
+fn service_uid<S: SnapshotSource>(source: &S, key: &ServiceKey) -> Option<String> {
+    snapshot_uid(&source.snapshot(key))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1091,6 +1207,7 @@ mod tests {
         changes: broadcast::Sender<ServiceKey>,
         foreign: mpsc::Sender<ForeignWrite>,
         leader: watch::Sender<bool>,
+        events: Mutex<mpsc::Receiver<Notice>>,
         stop: Option<tokio::sync::oneshot::Sender<()>>,
         task: tokio::task::JoinHandle<()>,
     }
@@ -1107,12 +1224,14 @@ mod tests {
             let writer = Arc::new(FakeWriter::default());
             let metrics = Arc::new(Metrics::new());
             let readiness = Readiness::new();
+            let (events, events_rx) = Events::channel(64);
             let rec = Reconciler::new(
                 Arc::clone(&writer),
                 Arc::clone(&source),
                 Arc::clone(&metrics),
                 readiness.clone(),
-            );
+            )
+            .with_events(events);
             rec.set_upstreams(
                 upstreams
                     .iter()
@@ -1136,9 +1255,24 @@ mod tests {
                 changes,
                 foreign,
                 leader,
+                events: Mutex::new(events_rx),
                 stop: Some(stop),
                 task,
             }
+        }
+
+        /// The Events posted since the last call: (reason, regarding name).
+        fn notices(&self) -> Vec<(&'static str, String)> {
+            let mut rx = lock(&self.events);
+            let mut out = Vec::new();
+            while let Ok(n) = rx.try_recv() {
+                let name = match n.regarding {
+                    crate::events::Regarding::Service { key, .. } => key.name,
+                    crate::events::Regarding::Pod => "<pod>".to_string(),
+                };
+                out.push((n.reason, name));
+            }
+            out
         }
 
         fn change(&self, svc: &str) {
@@ -1666,6 +1800,134 @@ mod tests {
         assert_eq!(h.writer.calls().len(), 2);
         assert_eq!(write_count(&h.metrics, "web", "error"), 2);
         assert!(h.readiness_last_write_ok());
+        h.stop().await;
+    }
+
+    impl FakeSource {
+        /// Renames the Service port of `name` (its slices keep "http").
+        fn rename_port(&self, name: &str, port_name: &str) {
+            let mut snaps = lock(&self.snaps);
+            let snap = snaps.get_mut(&key(name)).unwrap();
+            let mut svc = (**snap.service.as_ref().unwrap()).clone();
+            svc.metadata.uid = Some(format!("uid-{name}"));
+            svc.spec.as_mut().unwrap().ports.as_mut().unwrap()[0].name = Some(port_name.into());
+            snap.service = Some(Arc::new(svc));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leader_posts_resolve_warning_events_once_per_episode() {
+        let h = Harness::start(&[("web", &["web"])], true, 64, |s| {
+            s.set("web", &["10.0.0.1"], &[])
+        });
+        sleep(10).await;
+        assert!(h.notices().is_empty());
+
+        // Port renamed: one Warning on the Service, however often it is reconciled.
+        h.source.rename_port("web", "other");
+        for _ in 0..3 {
+            h.change("web");
+            sleep(1000).await;
+        }
+        assert_eq!(h.notices(), vec![("PortNotInService", "web".to_string())]);
+        let posted = {
+            h.source.rename_port("web", "other");
+            h.change("web");
+            sleep(1000).await;
+            h.notices()
+        };
+        assert!(posted.is_empty(), "{posted:?}");
+
+        // Fixed: nothing new; broken again: a new episode, a new Event.
+        h.source.set("web", &["10.0.0.1"], &[]);
+        h.change("web");
+        sleep(1000).await;
+        assert!(h.notices().is_empty());
+        lock(&h.source.snaps).remove(&key("web"));
+        h.change("web");
+        sleep(1000).await;
+        assert_eq!(h.notices(), vec![("ServiceMissing", "web".to_string())]);
+        h.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn followers_post_nothing_until_promoted() {
+        let h = Harness::start(&[("web", &["web"])], false, 64, |s| {
+            s.set("web", &["10.0.0.1"], &[])
+        });
+        h.source.rename_port("web", "other");
+        h.change("web");
+        sleep(1000).await;
+        assert!(h.notices().is_empty());
+
+        // The new leader reports the episode already open, once.
+        h.leader.send(true).unwrap();
+        sleep(3000).await;
+        let n = lock(&h.events).try_recv().unwrap();
+        assert_eq!(n.reason, "PortNotInService");
+        assert_eq!(
+            n.regarding,
+            crate::events::Regarding::Service {
+                key: key("web"),
+                uid: Some("uid-web".into())
+            }
+        );
+        assert!(h.notices().is_empty());
+        h.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_fallback_and_malformed_events() {
+        let h = Harness::start(&[("web", &["web"])], true, 64, |s| {
+            s.set("web", &["10.0.0.1"], &[])
+        });
+        sleep(10).await;
+        h.source.set("web", &[], &["10.0.0.1"]);
+        h.change("web");
+        sleep(1000).await;
+        assert_eq!(
+            h.notices(),
+            vec![("DrainFallbackStarted", "web".to_string())]
+        );
+        h.source.set("web", &["10.0.0.2"], &[]);
+        h.change("web");
+        sleep(1000).await;
+        assert_eq!(h.notices(), vec![("DrainFallbackEnded", "web".to_string())]);
+
+        // A malformed entry: one Event on the Pod per episode.
+        h.writer
+            .fail(100, || EtcdError::Toml("expected `=`".into()).into());
+        for i in 3..6 {
+            h.source.set("web", &[&format!("10.0.0.{i}")], &[]);
+            h.change("web");
+            sleep(1000).await;
+        }
+        assert_eq!(
+            h.notices(),
+            vec![("MalformedUpstream", "<pod>".to_string())]
+        );
+        h.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn etcd_events_on_reachability_changes_only() {
+        let h = Harness::start(&[("web", &["web"])], true, 64, |s| {
+            s.set("web", &["10.0.0.1"], &[])
+        });
+        sleep(10).await;
+        // The first report (up) is not a change.
+        assert!(h.notices().is_empty());
+        h.writer.fail(3, || anyhow::anyhow!("connection refused"));
+        h.source.set("web", &["10.0.0.2"], &[]);
+        h.change("web");
+        sleep(10_000).await;
+        assert_eq!(
+            h.notices(),
+            vec![
+                ("EtcdUnreachable", "<pod>".to_string()),
+                ("EtcdRecovered", "<pod>".to_string())
+            ]
+        );
         h.stop().await;
     }
 

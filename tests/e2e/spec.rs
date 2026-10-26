@@ -1,4 +1,4 @@
-//! e2e "Integration", tests 1–13, one test function each.
+//! e2e "Integration", tests 1–14, one test function each.
 //!
 //! Every test starts from the same baseline ([`baseline`]: etcd up, both controller
 //! replicas rolled out, echo at 3 replicas with no pod terminating, both upstreams equal to
@@ -2397,6 +2397,144 @@ async fn e2e_13_sse_stream() {
             );
         },
         async {
+            scale_app(
+                &env,
+                HTTPBIN_DEPLOYMENT,
+                HTTPBIN_SELECTOR,
+                HTTPBIN_REPLICAS,
+                HTTPBIN_UPSTREAM,
+                HTTPBIN_PORT,
+            )
+            .await
+            .map(|_| ())
+        },
+    )
+    .await;
+}
+
+// ---------------------------------------------------------------------------------------
+// 14. Kubernetes Events (opt-in, events.enabled in tests/e2e/values.yaml).
+// ---------------------------------------------------------------------------------------
+
+/// The Service port name `httpbin`'s upstream follows (tests/e2e/values.yaml).
+const HTTPBIN_PORT_NAME: &str = "http";
+
+/// Warning Events posted by pingap-k8s about the Service `name`: event name and how often
+/// it was observed (`series.count`, 1 without a series). Read through events.k8s.io/v1.
+async fn controller_warnings(env: &Env, name: &str) -> anyhow::Result<BTreeMap<String, i32>> {
+    use k8s_openapi::api::events::v1::Event;
+    let api: Api<Event> = Api::namespaced(env.client.clone(), &env.app_namespace);
+    let list = api
+        .list(&kube::api::ListParams::default().fields("reportingController=pingap-k8s"))
+        .await?;
+    Ok(list
+        .items
+        .into_iter()
+        .filter(|e| e.type_.as_deref() == Some("Warning"))
+        .filter(|e| {
+            e.regarding.as_ref().is_some_and(|r| {
+                r.kind.as_deref() == Some("Service") && r.name.as_deref() == Some(name)
+            })
+        })
+        .map(|e| {
+            let count = e.series.as_ref().map_or(1, |s| s.count);
+            (
+                format!(
+                    "{}/{}",
+                    e.reason.unwrap_or_default(),
+                    e.metadata.name.unwrap_or_default()
+                ),
+                count,
+            )
+        })
+        .collect())
+}
+
+/// Renames the httpbin Service port (port 80) to `port_name`.
+async fn rename_httpbin_port(env: &Env, port_name: &str) -> anyhow::Result<()> {
+    use k8s_openapi::api::core::v1::Service;
+    let api: Api<Service> = Api::namespaced(env.client.clone(), &env.app_namespace);
+    // Service ports merge by port number (strategic merge patch).
+    let patch = json!({ "spec": { "ports": [{ "port": 80, "name": port_name }] } });
+    api.patch(
+        HTTPBIN_DEPLOYMENT,
+        &PatchParams::default(),
+        &Patch::Strategic(&patch),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Opt-in Events: breaking the port name of a referenced Service posts one Warning
+/// (`PortNotInService`) on that Service; fixing it posts no further warnings, and the
+/// upstream follows the pods again. The `addrs` stay as they were meanwhile .
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_14_events() {
+    const T: &str = "e2e_14";
+    let Some(env) = Env::setup("e2e_14_events").await else {
+        return;
+    };
+    baseline(&env).await;
+    let ips = scale_app(
+        &env,
+        HTTPBIN_DEPLOYMENT,
+        HTTPBIN_SELECTOR,
+        HTTPBIN_REPLICAS,
+        HTTPBIN_UPSTREAM,
+        HTTPBIN_PORT,
+    )
+    .await
+    .expect("httpbin baseline");
+
+    guarded(
+        async {
+            let before = controller_warnings(&env, HTTPBIN_DEPLOYMENT).await.unwrap();
+            rename_httpbin_port(&env, "http-broken").await.unwrap();
+            let posted = wait_for(
+                "a PortNotInService Warning Event on the httpbin Service",
+                Duration::from_secs(60),
+                Duration::from_millis(500),
+                || async {
+                    let now = controller_warnings(&env, HTTPBIN_DEPLOYMENT).await?;
+                    let new: BTreeMap<String, i32> = now
+                        .into_iter()
+                        .filter(|(k, v)| before.get(k) != Some(v))
+                        .collect();
+                    Ok((!new.is_empty()).then_some(new))
+                },
+            )
+            .await
+            .unwrap();
+            println!("[{T}] new warning events: {posted:?}");
+            assert!(
+                posted.keys().all(|k| k.starts_with("PortNotInService/")),
+                "{posted:?}"
+            );
+            // Kept while broken .
+            assert_eq!(
+                env.etcd.upstream_addrs(HTTPBIN_UPSTREAM).await.unwrap(),
+                Some(with_port(&ips, HTTPBIN_PORT))
+            );
+
+            let fixed = controller_warnings(&env, HTTPBIN_DEPLOYMENT).await.unwrap();
+            rename_httpbin_port(&env, HTTPBIN_PORT_NAME).await.unwrap();
+            wait_app_converged(
+                &env,
+                HTTPBIN_SELECTOR,
+                HTTPBIN_UPSTREAM,
+                HTTPBIN_PORT,
+                CONVERGE,
+            )
+            .await
+            .unwrap();
+            // A resync or debounce later, still nothing new.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let after = controller_warnings(&env, HTTPBIN_DEPLOYMENT).await.unwrap();
+            assert_eq!(after, fixed, "no new warnings after the fix");
+            println!("[{T}] after the fix: no new warning events");
+        },
+        async {
+            rename_httpbin_port(&env, HTTPBIN_PORT_NAME).await?;
             scale_app(
                 &env,
                 HTTPBIN_DEPLOYMENT,

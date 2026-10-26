@@ -97,6 +97,9 @@ pub struct KubernetesSection {
     pub default_namespace: String,
     /// Used for `target = "service"` addresses.
     pub cluster_domain: String,
+    /// Post Kubernetes Events. Needs `create` and `patch` on
+    /// `events.k8s.io` `events` in the Service namespaces and the pod's own.
+    pub events: bool,
 }
 
 impl Default for KubernetesSection {
@@ -106,6 +109,7 @@ impl Default for KubernetesSection {
             context: String::new(),
             default_namespace: String::new(),
             cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
+            events: false,
         }
     }
 }
@@ -1127,8 +1131,33 @@ target = "service"
     }
 
     #[test]
+    fn events_off_by_default() {
+        assert!(
+            !cfg("[upstreams.a]\nservices = [\"a:80\"]\n")
+                .unwrap()
+                .kubernetes
+                .events
+        );
+        let c = cfg("[kubernetes]\nevents = true\n[upstreams.a]\nservices = [\"a:80\"]\n").unwrap();
+        assert!(c.kubernetes.events);
+        assert!(cfg("[kubernetes]\nevents = \"yes\"\n").is_err());
+    }
+
+    /// A directory in the system temp dir, removed on drop (also when the
+    /// test panics).
+    struct TempDir(PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
     fn load_reads_file_and_reports_missing() {
-        let dir = std::env::temp_dir().join(format!("pingap-k8s-config-{}", std::process::id()));
+        let tmp =
+            TempDir(std::env::temp_dir().join(format!("pingap-k8s-config-{}", std::process::id())));
+        let dir = tmp.0.clone();
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         std::fs::write(

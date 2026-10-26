@@ -40,6 +40,16 @@ rbac:
   # config.kubernetes.default_namespace, or the release namespace when that is empty).
   fromConfig: true
 
+events:
+  # Post Kubernetes Events (events.k8s.io/v1, reportingController "pingap-k8s")
+  # for resolve warnings (ServiceMissing, PortNotInService, PortNotInSlices) and
+  # drain fallbacks on the Service, and for MalformedUpstream and
+  # EtcdUnreachable/EtcdRecovered on the controller Pod. This is the controller's
+  # only write permission in Kubernetes: with rbac.create, the Roles above also
+  # grant create and patch on events.k8s.io events, plus one Role in the release
+  # namespace for the Pod events. Never a ClusterRole.
+  enabled: false
+
 etcd:
   # Pingap's etcd URL, the same string Pingap gets with --conf:
   #   etcd://host:port[,host:port]/<prefix>?ca=..&cert=..&key=..

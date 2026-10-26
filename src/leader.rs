@@ -24,8 +24,11 @@
 //!
 //! # Metrics
 //!
-//! This module does not touch [`crate::metrics::Metrics`]. The caller watches the channel and
-//! calls `Metrics::set_leader`, which keeps the contract signature unchanged.
+//! This module does not touch [`crate::metrics::Metrics`] for leadership. The caller watches the
+//! channel and calls `Metrics::set_leader`, which keeps the contract signature unchanged.
+//! [`run_election_with_health`] reports etcd reachability (`etcd_up`) through an
+//! [`EtcdHealth`]: lease grants, keep-alives (every `ttl / 5`, also while campaigning, so a
+//! follower notices etcd going away within seconds) and campaign results.
 //!
 //! # etcd permissions
 //!
@@ -49,6 +52,9 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, sleep_until, timeout, timeout_at};
 use tracing::{debug, info, warn};
+
+use crate::etcd::client_error_unreachable;
+use crate::metrics::EtcdHealth;
 
 /// Default lease TTL.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(10);
@@ -80,6 +86,20 @@ pub async fn run_election(
     tx: watch::Sender<bool>,
     shutdown: impl Future<Output = ()>,
 ) {
+    run_election_with_health(client, election_name, ttl, identity, tx, shutdown, None).await;
+}
+
+/// [`run_election`] that also reports etcd reachability to `health`.
+pub async fn run_election_with_health(
+    client: Client,
+    election_name: String,
+    ttl: Duration,
+    identity: String,
+    tx: watch::Sender<bool>,
+    shutdown: impl Future<Output = ()>,
+    health: Option<EtcdHealth>,
+) {
+    let health = Health(health);
     let shutdown = shutdown;
     tokio::pin!(shutdown);
     let ttl = round_ttl(ttl);
@@ -93,6 +113,7 @@ pub async fn run_election(
             &tx,
             shutdown.as_mut(),
             &mut backoff,
+            &health,
         )
         .await;
         publish(&tx, false);
@@ -137,7 +158,24 @@ enum LeaseState {
     Lost,
 }
 
+/// Optional reachability reporting.
+#[derive(Clone)]
+struct Health(Option<EtcdHealth>);
+
+impl Health {
+    fn report(&self, reachable: bool) {
+        if let Some(health) = &self.0 {
+            health.report(reachable);
+        }
+    }
+
+    fn error(&self, err: &EtcdClientError) {
+        self.report(!client_error_unreachable(err));
+    }
+}
+
 /// One lease: grant, keep alive, campaign, hold; always revokes the lease at the end.
+#[allow(clippy::too_many_arguments)]
 async fn session<F: Future<Output = ()>>(
     client: &Client,
     name: &str,
@@ -146,6 +184,7 @@ async fn session<F: Future<Output = ()>>(
     tx: &watch::Sender<bool>,
     mut shutdown: Pin<&mut F>,
     backoff: &mut Backoff,
+    health: &Health,
 ) -> End {
     let mut lease = client.lease_client();
     let granted_at = Instant::now();
@@ -155,12 +194,19 @@ async fn session<F: Future<Output = ()>>(
     };
     let (id, ttl) = match grant {
         Ok(Ok(resp)) => {
+            health.report(true);
             // Never assume more than we asked for, nor more than the server granted.
             let granted = Duration::from_secs(resp.ttl().max(0) as u64);
             (resp.id(), ttl.min(granted))
         }
-        Ok(Err(e)) => return End::Lost(format!("lease grant failed: {e}")),
-        Err(_) => return End::Lost("lease grant timed out".into()),
+        Ok(Err(e)) => {
+            health.error(&e);
+            return End::Lost(format!("lease grant failed: {e}"));
+        }
+        Err(_) => {
+            health.report(false);
+            return End::Lost("lease grant timed out".into());
+        }
     };
     if ttl.is_zero() {
         return End::Lost("server granted a lease with TTL 0".into());
@@ -174,10 +220,11 @@ async fn session<F: Future<Output = ()>>(
         id,
         every,
         state_tx,
+        health.clone(),
     )));
 
     let end = campaign_and_hold(
-        client, name, ttl, every, identity, id, tx, shutdown, state_rx, backoff,
+        client, name, ttl, every, identity, id, tx, shutdown, state_rx, backoff, health,
     )
     .await;
 
@@ -204,6 +251,7 @@ async fn campaign_and_hold<F: Future<Output = ()>>(
     mut shutdown: Pin<&mut F>,
     mut state_rx: watch::Receiver<LeaseState>,
     backoff: &mut Backoff,
+    health: &Health,
 ) -> End {
     // Campaign: blocks server-side until our key is the oldest under the election prefix.
     let leader_key: LeaderKey = {
@@ -218,11 +266,17 @@ async fn campaign_and_hold<F: Future<Output = ()>>(
             tokio::select! {
                 _ = shutdown.as_mut() => return End::Shutdown,
                 r = &mut campaign => match r {
-                    Ok(mut resp) => match resp.take_leader() {
-                        Some(key) => break key,
-                        None => return End::Lost("campaign returned no leader key".into()),
-                    },
-                    Err(e) => return End::Lost(format!("campaign failed: {e}")),
+                    Ok(mut resp) => {
+                        health.report(true);
+                        match resp.take_leader() {
+                            Some(key) => break key,
+                            None => return End::Lost("campaign returned no leader key".into()),
+                        }
+                    }
+                    Err(e) => {
+                        health.error(&e);
+                        return End::Lost(format!("campaign failed: {e}"));
+                    }
                 },
                 r = state_rx.changed() => if r.is_err() {
                     return End::Lost("lease keep-alive task stopped".into());
@@ -303,6 +357,7 @@ async fn keep_alive_loop(
     id: i64,
     every: Duration,
     state: watch::Sender<LeaseState>,
+    health: Health,
 ) {
     let mut stream: Option<(LeaseKeeper, LeaseKeepAliveStream)> = None;
     loop {
@@ -313,18 +368,22 @@ async fn keep_alive_loop(
         let sent_at = Instant::now();
         match timeout(every, keep_alive_once(&mut lease, id, &mut stream)).await {
             Ok(Ok(KeepAlive::Renewed)) => {
+                health.report(true);
                 state.send_replace(LeaseState::Alive(sent_at));
             }
             Ok(Ok(KeepAlive::NotFound)) => {
+                health.report(true);
                 warn!(lease = id, "etcd reports the lease as expired or revoked");
                 state.send_replace(LeaseState::Lost);
                 return;
             }
             Ok(Err(e)) => {
+                health.error(&e);
                 debug!(lease = id, error = %e, "lease keep-alive failed");
                 stream = None;
             }
             Err(_) => {
+                health.report(false);
                 debug!(lease = id, "lease keep-alive timed out");
                 stream = None;
             }
