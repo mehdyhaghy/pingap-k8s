@@ -18,6 +18,8 @@
 # Env:
 #   E2E_CLUSTER          kind cluster name (default pk8s-e2e)
 #   KIND_NODE_IMAGE      kindest/node image (default: kind's default)
+#   KIND_CONFIG          kind cluster config file (default: none), e.g. one with
+#                        networking.ipFamily: dual for a dual-stack cluster
 #   E2E_IMAGE            controller image tag to build and load (default pingap-k8s:e2e)
 #   E2E_SKIP_BUILD=1     do not build the image (it must already exist locally)
 #   E2E_WAIT_CONTROLLER  1: also wait for the controller Deployment to be Ready
@@ -60,7 +62,10 @@ create_args=(--name "$CLUSTER" --kubeconfig "$KUBECONFIG_FILE" --wait 180s)
 if [[ -n "${KIND_NODE_IMAGE:-}" ]]; then
   create_args+=(--image "$KIND_NODE_IMAGE")
 fi
-log "creating kind cluster $CLUSTER ${KIND_NODE_IMAGE:+($KIND_NODE_IMAGE)}"
+if [[ -n "${KIND_CONFIG:-}" ]]; then
+  create_args+=(--config "$KIND_CONFIG")
+fi
+log "creating kind cluster $CLUSTER ${KIND_NODE_IMAGE:+($KIND_NODE_IMAGE)} ${KIND_CONFIG:+(config $KIND_CONFIG)}"
 kind create cluster "${create_args[@]}"
 
 # --- controller image ----------------------------------------------------------

@@ -94,7 +94,7 @@ jobs:
           cache-to: type=gha,mode=max
 
   e2e:
-    name: e2e (kind ${{ matrix.node }})
+    name: e2e (kind ${{ matrix.node }}${{ matrix.ipFamily == 'dual' && ', dual-stack' || '' }})
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -104,6 +104,13 @@ jobs:
         node:
           - kindest/node:v1.35.8
           - kindest/node:v1.37.0
+        ipFamily: [ipv4]
+        include:
+          # Dual-stack nodes and pods: the controller ([::]:9090) and the seeded
+          # Pingap listener ([::]:8080) must serve IPv4 there too. The test app's
+          # Services stay single-stack IPv4, so the expected addrs do not change.
+          - node: kindest/node:v1.37.0
+            ipFamily: dual
     env:
       KIND_VERSION: v0.33.0
       KIND_NODE_IMAGE: ${{ matrix.node }}
@@ -151,6 +158,17 @@ jobs:
           push: false
           tags: ${{ env.E2E_IMAGE }}
           cache-from: type=gha
+
+      - name: kind config (dual-stack)
+        if: matrix.ipFamily == 'dual'
+        run: |
+          cat >"$RUNNER_TEMP/kind-dual-stack.yaml" <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          networking:
+            ipFamily: dual
+          EOF
+          echo "KIND_CONFIG=$RUNNER_TEMP/kind-dual-stack.yaml" >>"$GITHUB_ENV"
 
       - name: e2e
         run: scripts/e2e-run.sh
