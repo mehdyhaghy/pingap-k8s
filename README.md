@@ -165,7 +165,9 @@ Main chart values:
 | `networkPolicy.enabled` | `false` | NetworkPolicy on the controller pods: only the sources below may reach the metrics port (none when both are empty); probes are not affected |
 | `networkPolicy.allowSameNamespace` / `networkPolicy.metricsFrom` | `false` / `[]` | allow pods of the release namespace / extra NetworkPolicy `from` peers (e.g. a monitoring namespace) |
 | `etcd.deploy` | `false` | deploy a bundled etcd (below) |
+| `etcd.tls.peerAllowedCN` | `""` | CN required of etcd peer certificates; empty: the generated server CN with `etcd.tls.autoGenerate` |
 | `pingap.deploy` | `false` | deploy a quickstart Pingap (below) |
+| `pingap.networkPolicy.enabled` / `.extraPorts` / `.adminFrom` | `true` / `[]` / `[]` | quickstart Pingap: open the proxy port (and extra listener ports) to all pods, the admin port only to `adminFrom` |
 
 See [`charts/pingap-k8s/values.yaml`](charts/pingap-k8s/values.yaml) for every value.
 
@@ -241,6 +243,11 @@ helm install pingap-k8s ./charts/pingap-k8s --namespace edge -f quickstart.yaml
   kubectl -n edge port-forward svc/pingap-k8s-pingap-admin 3018:3018
   # http://localhost:3018, user "admin"
   ```
+
+- A NetworkPolicy (`pingap.networkPolicy.enabled`, on by default) opens only the proxy port
+  (`pingap.httpPort`) to other pods and keeps the admin port closed to them. If your seed config
+  adds listeners, list their ports in `pingap.networkPolicy.extraPorts`. To call the admin API
+  from other pods, list them in `pingap.networkPolicy.adminFrom`. Port-forward always works.
 
 ### Try it
 
@@ -650,7 +657,10 @@ web       service  web.prod:80 9,gone.prod:80 1  0      0         no       -    
 ```
 
 It runs `kubectl` underneath, so `--context`, `--kubeconfig` and your credentials apply as usual.
-`admin` prints the password only with `--show-password`. Security model:
+`admin` prints the password only with `--show-password`, and only forwards to a Service with all
+three labels of the chart's Pingap (`app.kubernetes.io/part-of=pingap-k8s`,
+`app.kubernetes.io/name=pingap`, `app.kubernetes.io/component=proxy`); when more than one matches,
+it stops and asks for `-n`. Security model:
 
 - `/status` listens on `127.0.0.1` inside the controller pod only, on its own port; no Service or
   container port exposes it, and a non-loopback address is rejected.
@@ -711,7 +721,9 @@ otel:
 ```
 
 The endpoint must be a collector on the private or cluster network (for example a ClusterIP
-Service), never a public address. Use `https://` for TLS (system roots).
+Service), never a public address; a public IP address logs a warning at startup. Use `https://`
+for TLS (system roots). Put `OTEL_EXPORTER_OTLP_HEADERS` (for example an auth token) in a Secret
+and pass it with `extraEnv` and `valueFrom.secretKeyRef`, not as a plain value.
 
 ## Security
 
@@ -737,13 +749,31 @@ Service), never a public address. Use `https://` for TLS (system roots).
     ```
 
   - Certificates and keys come from a mounted Secret, never from the ConfigMap or the command line.
+  - A plaintext etcd connection logs a warning at startup, and `helm install` prints one in its
+    notes. A password in the etcd URL is redacted in errors and in the notes.
+  - The bundled etcd accepts a peer certificate only with the server certificate's CN
+    (`--peer-cert-allowed-cn`), so a client certificate can not join the cluster as a member.
+    With your own certificates, set `etcd.tls.peerAllowedCN` to the server certificate's CN.
 - **Only addresses from configured Services are written**: pod IPs from the EndpointSlices of
-  explicitly listed Services. A workload cannot inject an arbitrary address.
+  explicitly listed Services. Loopback, link-local (for example `169.254.169.254`), unspecified,
+  broadcast and multicast addresses are skipped, so a hand-written EndpointSlice can not point an
+  upstream at the node or at cloud metadata.
 - **Cluster-internal endpoints**: the metrics/health port, etcd and the quickstart Pingap admin UI
   are `ClusterIP` only. `networkPolicy.enabled: true` also limits who may reach the controller's
   metrics port (`networkPolicy.allowSameNamespace`, `networkPolicy.metricsFrom`); kubelet probes
-  keep working. CI fails if the chart renders a `LoadBalancer` or `NodePort` Service other
-  than the quickstart proxy listener, or any cluster-wide RBAC.
+  keep working. We recommend turning it on in production. CI fails if the chart renders a
+  `LoadBalancer` or `NodePort` Service other than the quickstart proxy listener, or any
+  cluster-wide RBAC.
+- **The quickstart Pingap admin port is closed to other pods** by a NetworkPolicy
+  (`pingap.networkPolicy.enabled`, on by default). Only the proxy port (`pingap.httpPort`, plus
+  `pingap.networkPolicy.extraPorts` for more listeners) is open. To reach the admin from other
+  pods, list them in `pingap.networkPolicy.adminFrom`. `kubectl pingap admin` and
+  `kubectl port-forward` keep working: port-forward does not go through NetworkPolicy.
+- **Bounded HTTP servers**: the metrics/health and `/status` servers serve at most 64 connections
+  at once, and close a connection after 10 s without traffic or 60 s in total. A client that
+  trickles request headers can not hold them open.
+- **Telemetry stays private**: an `OTEL_EXPORTER_OTLP_ENDPOINT` given as a public IP address logs
+  a warning at startup.
 - **Hardened pods**: non-root (UID 65532), read-only root filesystem, no privilege escalation, all
   capabilities dropped, `RuntimeDefault` seccomp, for the controller, the bundled etcd and the
   quickstart Pingap. The controller image is distroless (no shell).
@@ -779,6 +809,20 @@ make docker-multiarch PLATFORMS=linux/amd64,linux/arm64
 STATUS=1 scripts/smoke-local.sh   # local binary + local etcd + kind, including /status
 make docker && scripts/plugin-kind.sh   # kubectl plugin against the chart on kind
 ```
+
+Tests:
+
+| Command | What it covers | In CI |
+| --- | --- | --- |
+| `cargo test` | unit tests; OTLP export to an in-process receiver (`tests/otlp_export.rs`); the plugin against a fake `kubectl` (`tests/kubectl_plugin.rs`) | `rust` |
+| `scripts/test-etcd.sh` | `tests/etcd_*.rs` against a throwaway etcd on 127.0.0.1: CAS writes, owned-key watch, compaction, leader election | `integration` |
+| `scripts/test-kind.sh` | `tests/watch_kind.rs`: the Service and EndpointSlice watchers on a throwaway kind cluster | `integration` |
+| `scripts/e2e-run.sh` | e2e tests 1 to 14 with the chart, Pingap and etcd on kind | `e2e` |
+| `scripts/otel-local.sh` | the binary exporting to a real OpenTelemetry Collector (docker) | no |
+| `cargo audit` | RustSec advisories for `Cargo.lock` | `dependencies` (also weekly) |
+
+Line coverage: `cargo llvm-cov --lib --bins` (add `--test 'etcd_*'` with `PINGAP_K8S_TEST_ETCD`
+set to include the etcd tests).
 
 Building needs `protoc` and the protobuf well-known types (Debian/Ubuntu:
 `protobuf-compiler libprotobuf-dev`), used by `etcd-client`. The Docker build cross-compiles in the

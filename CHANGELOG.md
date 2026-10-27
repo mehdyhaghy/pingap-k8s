@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+Security:
+- The quickstart Pingap gets a NetworkPolicy (on by default): only the proxy port is open to other
+  pods, and the admin port is closed except to `pingap.networkPolicy.adminFrom`. Port-forward
+  keeps working. Extra listener ports go in `pingap.networkPolicy.extraPorts`.
+- The metrics/health and `/status` servers serve at most 64 connections at once, and close a
+  connection after 10 s without traffic or 60 s in total.
+- EndpointSlice addresses that are loopback, link-local, unspecified, broadcast or multicast are
+  skipped.
+- A password in the etcd URL no longer appears in URL errors or in the chart's install notes.
+- A plaintext etcd connection logs a warning, and the install notes warn about it too.
+- The bundled etcd accepts peer certificates only with the server CN (`--peer-cert-allowed-cn`;
+  `etcd.tls.peerAllowedCN` for your own certificates).
+- An OTLP endpoint given as a public IP address logs a warning.
+- `kubectl pingap admin` matches the chart's Pingap Service by all three of its labels, and stops
+  when more than one Service matches.
+
+Tests and CI:
+- OTLP export test against an in-process receiver, and kubectl plugin tests against a fake
+  `kubectl`, both in `cargo test`.
+- New CI job `integration` runs the etcd integration tests and the kind watcher tests. Before
+  this, CI skipped them.
+- New CI job `dependencies` runs `cargo audit`, also on the weekly schedule.
+- CI checks the `kind` download against its sha256.
+
 ## 0.1.0
 
 First release: keeps the `addrs` of Pingap upstreams in etcd in sync with Kubernetes
