@@ -48,7 +48,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [dev-dependencies]
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic", "metrics", "logs"] }
 tokio = { version = "~1.53", features = ["test-util"] }
+tokio-stream = { version = "0.1", default-features = false, features = ["net"] }
+tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "server"] }
 
 [profile.release]
 lto = "thin"

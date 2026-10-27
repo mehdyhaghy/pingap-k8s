@@ -1629,6 +1629,7 @@ dependencies = [
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",
  "opentelemetry-prometheus",
+ "opentelemetry-proto",
  "opentelemetry_sdk",
  "prometheus",
  "rand",
@@ -1636,8 +1637,10 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "toml",
  "toml_edit",
+ "tonic",
  "tracing",
  "tracing-subscriber",
 ]

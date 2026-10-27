@@ -73,6 +73,67 @@ jobs:
       - name: no public exposure of etcd, metrics or admin; no ClusterRole
         run: make exposure-check
 
+  integration:
+    name: integration (etcd, kind watchers)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      ETCD_VERSION: v3.7.3
+      # etcd-<version>-linux-amd64.tar.gz in that release's SHA256SUMS.
+      ETCD_SHA256: 5dfa9cc3b3ce3b4b491fbcc2057d3daa166bcc6676f743fcd20f8e5760cb9775
+      KIND_VERSION: v0.33.0
+      KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Install etcd and kind
+        run: |
+          curl -fsSLo etcd.tar.gz "https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-linux-amd64.tar.gz"
+          echo "${ETCD_SHA256}  etcd.tar.gz" | sha256sum -c -
+          tar -xzf etcd.tar.gz --strip-components=1 "etcd-${ETCD_VERSION}-linux-amd64/etcd"
+          sudo mv etcd /usr/local/bin/etcd
+          curl -fsSLo kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          echo "${KIND_SHA256}  kind" | sha256sum -c -
+          chmod +x kind
+          sudo mv kind /usr/local/bin/kind
+          etcd --version
+          kind version
+
+      # tests/etcd_*.rs against a throwaway etcd on 127.0.0.1 (skipped by plain cargo test).
+      - name: etcd integration tests
+        run: scripts/test-etcd.sh --locked
+
+      # tests/watch_kind.rs against a throwaway kind cluster.
+      - name: kind watcher tests
+        run: scripts/test-kind.sh --locked
+
+  dependencies:
+    name: dependency advisories
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      # RustSec advisories for every crate in Cargo.lock.
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+
   docker:
     name: docker build (no push)
     runs-on: ubuntu-24.04
@@ -113,6 +174,8 @@ jobs:
             ipFamily: dual
     env:
       KIND_VERSION: v0.33.0
+      # kind-linux-amd64.sha256sum of that release.
+      KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
       KIND_NODE_IMAGE: ${{ matrix.node }}
       E2E_IMAGE: pingap-k8s:e2e
       # Scheduled runs test the newest Pingap image instead of the pinned tag.
@@ -142,6 +205,7 @@ jobs:
       - name: Install kind
         run: |
           curl -fsSLo kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          echo "${KIND_SHA256}  kind" | sha256sum -c -
           chmod +x kind
           sudo mv kind /usr/local/bin/kind
           kind version
