@@ -18,6 +18,11 @@ flamegraph.svg
 perf.data
 perf.data.old
 criterion/
+# cargo-llvm-cov / cargo-mutants / nextest outputs
+/coverage-html/
+mutants.out/
+mutants.out.old/
+junit.xml
 
 # Fuzzing
 /fuzz/target/
@@ -59,6 +64,19 @@ id_rsa*
 id_ed25519*
 .netrc
 .htpasswd
+.npmrc
+.pypirc
+.cargo/credentials
+.cargo/credentials.toml
+.docker/config.json
+credentials.json
+*.age
+*.gpg
+*.asc
+!KEYS.asc
+# Pingap admin passwords and etcd client TLS material fetched for local testing
+admin-password*
+*.p8
 
 # ---------------------------------------------------------------------------
 # Kubernetes / Helm / kind
@@ -86,6 +104,11 @@ etcd-data/
 *.tar.gz
 *.tar.gz.sha256
 kubectl-pingap_*_checksums.txt
+# SBOMs, provenance and scan reports generated locally
+*.spdx.json
+*.cdx.json
+*.intoto.jsonl
+*.sarif
 
 # ---------------------------------------------------------------------------
 # Container builds
@@ -144,5 +167,6 @@ ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
 
-# Local work checkpoint (agents and harnesses), never committed
+# Local work checkpoint, editor agents and harness worktrees, never committed
 .checkpoint/
+.claude/
