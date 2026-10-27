@@ -1,0 +1,43 @@
+{{- /*
+The quickstart Pingap: proxy listeners are open, the admin port is reachable
+only from pingap.networkPolicy.adminFrom (and port-forward / kubelet probes,
+which NetworkPolicy does not cover). Without it every pod in the cluster could
+reach the admin UI.
+*/ -}}
+{{- if and .Values.pingap.deploy .Values.pingap.networkPolicy.enabled }}
+{{- $p := .Values.pingap }}
+{{- $np := $p.networkPolicy }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pingap-k8s.pingap.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pingap-k8s.pingap.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "pingap-k8s.pingap.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Proxy traffic, from anywhere.
+    - ports:
+        - port: {{ $p.httpPort }}
+          protocol: TCP
+        {{- range $np.extraPorts }}
+        {{- if eq (int .) (int $p.admin.port) }}
+        {{- fail "pingap.networkPolicy.extraPorts must not contain the admin port" }}
+        {{- end }}
+        - port: {{ . }}
+          protocol: TCP
+        {{- end }}
+    {{- with $np.adminFrom }}
+    # Admin UI.
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - port: {{ $p.admin.port }}
+          protocol: TCP
+    {{- end }}
+{{- end }}

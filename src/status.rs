@@ -312,10 +312,13 @@ pub async fn serve_listener(
     if let Ok(local) = listener.local_addr() {
         tracing::info!(addr = %local, "status endpoint listening (loopback only)");
     }
-    axum::serve(listener, router(sources))
-        .with_graceful_shutdown(shutdown)
-        .await
-        .context("status server failed")
+    axum::serve(
+        crate::server::GuardedListener::new(listener),
+        router(sources),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+    .context("status server failed")
 }
 
 async fn status_handler(State(sources): State<StatusSources>) -> Response {

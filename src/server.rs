@@ -7,9 +7,13 @@
 //! exposes it through a ClusterIP Service and a NetworkPolicy, never publicly.
 
 use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::task::{Context as TaskContext, Poll};
+use std::time::Duration;
 
 use anyhow::Context;
 use axum::Router;
@@ -17,9 +21,20 @@ use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use tokio::net::TcpListener;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::{Instant, Sleep};
 
 use crate::metrics::Metrics;
+
+/// Open connections served at once; further ones are closed right away.
+const MAX_CONNECTIONS: usize = 64;
+/// A connection with no bytes read or written for this long is closed
+/// (slow or idle clients, including half-sent request headers).
+const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// No connection lives longer than this, keep-alive or not.
+const MAX_CONNECTION_AGE: Duration = Duration::from_secs(60);
 
 const WRITE_NONE: u8 = 0;
 const WRITE_OK: u8 = 1;
@@ -125,10 +140,138 @@ pub async fn serve_listener(
     if let Ok(local) = listener.local_addr() {
         tracing::info!(addr = %local, "metrics server listening");
     }
-    axum::serve(listener, router(metrics, readiness))
+    axum::serve(GuardedListener::new(listener), router(metrics, readiness))
         .with_graceful_shutdown(shutdown)
         .await
         .context("metrics server failed")
+}
+
+/// A TCP listener that bounds what one client can hold: at most
+/// [`MAX_CONNECTIONS`] open connections, each closed after [`IDLE_TIMEOUT`]
+/// without traffic or [`MAX_CONNECTION_AGE`] in total. axum sets no hyper
+/// timeouts, so without this a client trickling request headers keeps its
+/// connection (and a file descriptor) forever.
+pub(crate) struct GuardedListener {
+    inner: TcpListener,
+    permits: Arc<Semaphore>,
+    idle: Duration,
+    max_age: Duration,
+}
+
+impl GuardedListener {
+    pub(crate) fn new(inner: TcpListener) -> Self {
+        Self::with_limits(inner, MAX_CONNECTIONS, IDLE_TIMEOUT, MAX_CONNECTION_AGE)
+    }
+
+    fn with_limits(inner: TcpListener, max: usize, idle: Duration, max_age: Duration) -> Self {
+        GuardedListener {
+            inner,
+            permits: Arc::new(Semaphore::new(max)),
+            idle,
+            max_age,
+        }
+    }
+}
+
+impl axum::serve::Listener for GuardedListener {
+    type Io = GuardedIo;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (stream, addr) = match self.inner.accept().await {
+                Ok(accepted) => accepted,
+                Err(err) => {
+                    // Mostly EMFILE/ENFILE: back off instead of spinning.
+                    tracing::debug!("metrics server accept failed: {err}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
+            let Ok(permit) = self.permits.clone().try_acquire_owned() else {
+                tracing::debug!(%addr, "connection limit reached; closing connection");
+                continue;
+            };
+            let now = Instant::now();
+            let io = GuardedIo {
+                stream,
+                _permit: permit,
+                idle: self.idle,
+                idle_timer: Box::pin(tokio::time::sleep_until(now + self.idle)),
+                age_timer: Box::pin(tokio::time::sleep_until(now + self.max_age)),
+            };
+            return (io, addr);
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
+}
+
+/// A connection from [`GuardedListener`]; frees its slot when dropped.
+pub(crate) struct GuardedIo {
+    stream: TcpStream,
+    _permit: OwnedSemaphorePermit,
+    idle: Duration,
+    idle_timer: Pin<Box<Sleep>>,
+    age_timer: Pin<Box<Sleep>>,
+}
+
+impl GuardedIo {
+    /// After an I/O call: progress restarts the idle timer, and a pending call
+    /// fails once either timer has fired.
+    fn check<T>(
+        &mut self,
+        cx: &mut TaskContext<'_>,
+        poll: Poll<io::Result<T>>,
+    ) -> Poll<io::Result<T>> {
+        match poll {
+            Poll::Ready(result) => {
+                self.idle_timer.as_mut().reset(Instant::now() + self.idle);
+                Poll::Ready(result)
+            }
+            Poll::Pending => {
+                if self.age_timer.as_mut().poll(cx).is_ready()
+                    || self.idle_timer.as_mut().poll(cx).is_ready()
+                {
+                    Poll::Ready(Err(io::ErrorKind::TimedOut.into()))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+}
+
+impl AsyncRead for GuardedIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let poll = Pin::new(&mut self.stream).poll_read(cx, buf);
+        self.check(cx, poll)
+    }
+}
+
+impl AsyncWrite for GuardedIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let poll = Pin::new(&mut self.stream).poll_write(cx, buf);
+        self.check(cx, poll)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
 }
 
 async fn metrics_handler(State(state): State<AppState>) -> Response {
@@ -278,6 +421,58 @@ mod tests {
         assert_eq!(body, "ok");
         stop_tx.send(()).unwrap();
         server.await.unwrap().unwrap();
+    }
+
+    /// Serves the router on a [`GuardedListener`] with short limits.
+    async fn guarded(max: usize, idle: Duration) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let guarded = GuardedListener::with_limits(listener, max, idle, Duration::from_secs(60));
+        let app = router(Arc::new(Metrics::new()), Readiness::new());
+        let server = tokio::spawn(async move {
+            axum::serve(guarded, app).await.unwrap();
+        });
+        (addr, server)
+    }
+
+    #[tokio::test]
+    async fn half_sent_request_is_closed_after_idle_timeout() {
+        let (addr, server) = guarded(4, Duration::from_millis(200)).await;
+        let mut slow = TcpStream::connect(addr).await.unwrap();
+        slow.write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        let n = tokio::time::timeout(Duration::from_secs(5), slow.read_to_end(&mut buf))
+            .await
+            .expect("the server closes an idle half-sent request");
+        assert!(n.is_err() || buf.is_empty() || !buf.starts_with(b"HTTP/1.1 200"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn connections_over_the_limit_are_closed_and_slots_come_back() {
+        let (addr, server) = guarded(2, Duration::from_secs(30)).await;
+        let held: Vec<TcpStream> =
+            futures::future::join_all((0..2).map(|_| TcpStream::connect(addr)))
+                .await
+                .into_iter()
+                .map(Result::unwrap)
+                .collect();
+        // Let the server accept both before the third one arrives.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut extra = TcpStream::connect(addr).await.unwrap();
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), extra.read_to_end(&mut buf))
+            .await
+            .expect("the connection over the limit is closed");
+        assert!(buf.is_empty());
+
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (status, body) = get(addr, "/healthz").await;
+        assert_eq!((status, body.as_str()), (200, "ok"));
+        server.abort();
     }
 
     #[tokio::test]

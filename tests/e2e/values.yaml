@@ -29,9 +29,17 @@ pingap:
     # Only reached from inside the cluster (client pod in the app namespace).
     type: ClusterIP
   admin:
-    # Created by e2e-up.sh (keys user, password) before the install: the chart's
-    # own admin Secret template is not in the repository yet (see tasks/T10.md).
+    # Created by e2e-up.sh (keys user, password) before the install, so the
+    # tests know the credentials without reading the chart's generated Secret.
     existingSecret: pingap-k8s-pingap-admin-e2e
+  networkPolicy:
+    # The gRPC listener of e2e test 12.
+    extraPorts: [8081]
+    # e2e tests 9 and 10 call the admin API from the client pod.
+    adminFrom:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: e2e-app
   seed:
     enabled: true
     # Listener 8080: "/ws" goes to the WebSocket port of the echo pods, "/sse" to

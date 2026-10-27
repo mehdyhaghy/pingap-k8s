@@ -66,6 +66,9 @@ spec:
             - --peer-trusted-ca-file=/etc/etcd/tls/{{ $k.ca }}
             - --peer-cert-file=/etc/etcd/tls/{{ $k.cert }}
             - --peer-key-file=/etc/etcd/tls/{{ $k.key }}
+            {{- with (default (ternary $etcd "" .Values.etcd.tls.autoGenerate) .Values.etcd.tls.peerAllowedCN) }}
+            - --peer-cert-allowed-cn={{ . }}
+            {{- end }}
             - --auto-compaction-mode=periodic
             - --auto-compaction-retention=1h
             {{- range .Values.etcd.extraArgs }}

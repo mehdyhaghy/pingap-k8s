@@ -23,7 +23,9 @@ use pingap_k8s::status::{STATUS_VERSION, StatusDoc, UpstreamStatus};
 const STATUS_PORT_ANNOTATION: &str = "pingap-k8s/status-port";
 const DEFAULT_SELECTOR: &str =
     "app.kubernetes.io/name=pingap-k8s,app.kubernetes.io/component=controller";
-const PROXY_SELECTOR: &str = "app.kubernetes.io/component=proxy";
+/// Labels of the chart's quickstart Pingap Services. All three are matched so a
+/// Service of another chart that only shares `component=proxy` is never used.
+const PROXY_SELECTOR: &str = "app.kubernetes.io/part-of=pingap-k8s,app.kubernetes.io/name=pingap,app.kubernetes.io/component=proxy";
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(20);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const DISABLED_HINT: &str = "the status endpoint is disabled: enable status.enabled in the chart \
@@ -570,30 +572,53 @@ struct AdminService {
     port: u16,
 }
 
-/// The quickstart Pingap admin Service: a proxy Service with a port named `admin`.
-fn find_admin_service(list: &Value) -> Option<AdminService> {
-    list["items"].as_array()?.iter().find_map(|svc| {
-        let port = svc["spec"]["ports"]
-            .as_array()?
-            .iter()
-            .find(|p| p["name"] == "admin")?["port"]
-            .as_u64()?;
-        Some(AdminService {
-            name: svc["metadata"]["name"].as_str()?.into(),
-            namespace: svc["metadata"]["namespace"].as_str()?.into(),
-            port: u16::try_from(port).ok()?,
+/// The quickstart Pingap admin Services: proxy Services with a port named `admin`.
+fn find_admin_services(list: &Value) -> Vec<AdminService> {
+    let Some(items) = list["items"].as_array() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|svc| {
+            let port = svc["spec"]["ports"]
+                .as_array()?
+                .iter()
+                .find(|p| p["name"] == "admin")?["port"]
+                .as_u64()?;
+            Some(AdminService {
+                name: svc["metadata"]["name"].as_str()?.into(),
+                namespace: svc["metadata"]["namespace"].as_str()?.into(),
+                port: u16::try_from(port).ok()?,
+            })
         })
-    })
+        .collect()
+}
+
+/// Exactly one admin Service, or an error naming the choices: the password typed
+/// into the forwarded page must only ever reach the chart's own Pingap.
+fn single_admin_service(mut found: Vec<AdminService>) -> anyhow::Result<AdminService> {
+    match found.len() {
+        0 => bail!(
+            "no quickstart Pingap admin Service (labels {PROXY_SELECTOR}, port named admin) \
+             found; pass -n <namespace> (it exists only with pingap.deploy=true)"
+        ),
+        1 => Ok(found.remove(0)),
+        _ => {
+            let names: Vec<String> = found
+                .iter()
+                .map(|s| format!("{}/{}", s.namespace, s.name))
+                .collect();
+            bail!(
+                "more than one Pingap admin Service matches ({}); pass -n <namespace>",
+                names.join(", ")
+            )
+        }
+    }
 }
 
 fn admin(kubectl: &Kubectl, local_port: Option<u16>, show_password: bool) -> anyhow::Result<()> {
     let list = kubectl.json(&["get", "services", "-l", PROXY_SELECTOR])?;
-    let svc = find_admin_service(&list).ok_or_else(|| {
-        anyhow!(
-            "no quickstart Pingap admin Service (label {PROXY_SELECTOR}, port named admin) found; \
-             pass -n <namespace> (it exists only with pingap.deploy=true)"
-        )
-    })?;
+    let svc = single_admin_service(find_admin_services(&list))?;
     // The chart names the admin Secret like the admin Service by default.
     let secret = &svc.name;
     let password = if show_password {
@@ -854,7 +879,7 @@ web       service  web.prod:80 9,gone.prod:80 1  0      0         no       -    
             ]}"#,
         )
         .unwrap();
-        let svc = find_admin_service(&list).unwrap();
+        let svc = single_admin_service(find_admin_services(&list)).unwrap();
         assert_eq!(
             svc,
             AdminService {
@@ -873,7 +898,25 @@ web       service  web.prod:80 9,gone.prod:80 1  0      0         no       -    
         );
         assert!(!msg.contains("password: s3cret"));
         assert!(admin_message(&svc, 3018, Some("s3cret")).contains("password: s3cret"));
-        assert!(find_admin_service(&serde_json::json!({"items": []})).is_none());
+        assert!(find_admin_services(&serde_json::json!({"items": []})).is_empty());
+        let err = single_admin_service(Vec::new()).unwrap_err().to_string();
+        assert!(
+            err.contains("app.kubernetes.io/part-of=pingap-k8s"),
+            "{err}"
+        );
+        let two = vec![
+            svc,
+            AdminService {
+                name: "other-admin".into(),
+                namespace: "evil".into(),
+                port: 3018,
+            },
+        ];
+        let err = single_admin_service(two).unwrap_err().to_string();
+        assert!(
+            err.contains("more than one") && err.contains("evil/other-admin"),
+            "{err}"
+        );
     }
 
     #[test]

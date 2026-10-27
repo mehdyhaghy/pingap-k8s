@@ -93,6 +93,11 @@ etcd:
     serverSecret: ""
     # Client certificate for the quickstart Pingap (pingap.etcdTlsSecret wins).
     pingapClientSecret: ""
+    # Common name a peer certificate must have (--peer-cert-allowed-cn), so the
+    # client certificates, signed by the same CA, can not join as a member.
+    # Empty: the etcd fullname with autoGenerate (the generated server CN), no
+    # check otherwise. Set it to your server certificate's CN.
+    peerAllowedCN: ""
   persistence:
     enabled: true
     size: 2Gi
@@ -306,6 +311,19 @@ pingap:
     password: ""
     # Use an existing Secret with keys "user" and "password" instead.
     existingSecret: ""
+  # NetworkPolicy for the quickstart Pingap pods. Proxy traffic on httpPort (and
+  # extraPorts) is allowed from anywhere; the admin port only from adminFrom.
+  # kubectl port-forward and kubelet probes do not go through NetworkPolicy, so
+  # `kubectl pingap admin` keeps working with adminFrom empty.
+  networkPolicy:
+    enabled: true
+    # Further listener ports of your seed config, e.g. [8443].
+    extraPorts: []
+    # NetworkPolicy "from" peers allowed to reach the admin port, e.g.
+    #   - namespaceSelector:
+    #       matchLabels:
+    #         kubernetes.io/metadata.name: ops
+    adminFrom: []
   # Seed Pingap's etcd prefix once, before Pingap starts, when it has no server
   # yet. Servers (listeners) are only read at Pingap start, so the listener has
   # to exist first. It is skipped when any server already exists.

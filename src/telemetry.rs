@@ -40,6 +40,30 @@ pub fn otlp_endpoint() -> Option<String> {
     (!disabled && !endpoint.trim().is_empty()).then_some(endpoint)
 }
 
+/// The endpoint's host when it is an IP literal outside the private, loopback,
+/// link-local and shared (CGNAT) ranges. Host names are not resolved.
+fn public_ip(endpoint: &str) -> Option<std::net::IpAddr> {
+    use std::net::IpAddr;
+    let rest = endpoint.split_once("://").map_or(endpoint, |(_, r)| r);
+    let authority = rest.split(['/', '?']).next().unwrap_or_default();
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => host.rsplit_once(':').map_or(host, |(h, _)| h),
+    };
+    let ip: IpAddr = host.parse().ok()?;
+    let private = match ip.to_canonical() {
+        IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || (v4.octets()[0] == 100 && v4.octets()[1] & 0xc0 == 64)
+        }
+        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local(),
+    };
+    (!private).then_some(ip)
+}
+
 impl Telemetry {
     /// Must run inside the Tokio runtime (the gRPC channel is created here).
     /// `otlp: false` keeps everything local (used by `--check`).
@@ -48,6 +72,13 @@ impl Telemetry {
         let mut meters = SdkMeterProvider::builder().with_resource(resource.clone());
         let mut logs = None;
         if let Some(endpoint) = otlp.then(otlp_endpoint).flatten() {
+            if let Some(ip) = public_ip(&endpoint) {
+                // Logged before the subscriber exists: stderr only, never exported.
+                eprintln!(
+                    "warning: OTEL_EXPORTER_OTLP_ENDPOINT points at the public address {ip}; \
+                     metrics and logs should go to a collector on the private network"
+                );
+            }
             // Plain `http://` unless the endpoint asks for TLS.
             let tls = endpoint
                 .starts_with("https://")
@@ -148,6 +179,31 @@ mod tests {
             attr(&r, "service.instance.id").as_deref(),
             Some("pingap-k8s-abc")
         );
+    }
+
+    #[test]
+    fn public_otlp_endpoints_are_recognised() {
+        for private in [
+            "http://otel-collector.observability.svc:4317",
+            "http://10.0.0.5:4317",
+            "https://172.20.1.1:4317/",
+            "http://192.168.1.10:4317",
+            "http://100.64.0.1:4317",
+            "http://127.0.0.1:4317",
+            "http://[::1]:4317",
+            "http://[fd00::5]:4317",
+            "10.1.2.3:4317",
+        ] {
+            assert_eq!(public_ip(private), None, "{private}");
+        }
+        for public in [
+            "http://8.8.8.8:4317",
+            "https://user@1.2.3.4:4317/v1",
+            "http://[2001:4860::1]:4317",
+            "http://100.128.0.1:4317",
+        ] {
+            assert!(public_ip(public).is_some(), "{public}");
+        }
     }
 
     #[tokio::test]

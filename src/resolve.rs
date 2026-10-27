@@ -226,6 +226,7 @@ pub fn resolve(inputs: &[ServiceInput<'_>], opts: &UpstreamOptions) -> Resolved 
                     .addresses
                     .first()
                     .and_then(|a| a.parse::<IpAddr>().ok())
+                    .filter(is_pod_address)
                 else {
                     continue;
                 };
@@ -343,6 +344,18 @@ fn resolve_service_target(inputs: &[ServiceInput<'_>], cluster_domain: &str) -> 
         fallback: false,
         warnings,
     }
+}
+
+/// Kubernetes rejects these for pod and Endpoints addresses; an EndpointSlice
+/// written by hand could still carry one and point a public upstream at the
+/// node itself (loopback), cloud metadata (link-local) or nowhere.
+fn is_pod_address(ip: &IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    let special = match ip {
+        IpAddr::V4(v4) => v4.is_link_local() || v4.is_broadcast(),
+        IpAddr::V6(v6) => v6.is_unicast_link_local(),
+    };
+    !(special || ip.is_loopback() || ip.is_unspecified() || ip.is_multicast())
 }
 
 #[cfg(test)]
@@ -686,6 +699,38 @@ mod tests {
     // ---- slices: merge, families, FQDN, dedupe ----
 
     #[test]
+    fn non_pod_addresses_skipped() {
+        let r = sref("api", named("http"), None);
+        let s = snap(
+            http_svc(),
+            vec![v4(vec![
+                ep("127.0.0.1", READY),
+                ep("169.254.169.254", READY),
+                ep("0.0.0.0", READY),
+                ep("224.0.0.1", READY),
+                ep("255.255.255.255", READY),
+                ep("10.0.0.2", READY),
+            ])],
+        );
+        assert_eq!(run1(&r, &s, &opts()).addrs, vec!["10.0.0.2:8080"]);
+
+        let v6 = slice(
+            "IPv6",
+            &[("http", 8080, "TCP")],
+            vec![
+                ep("::1", READY),
+                ep("::", READY),
+                ep("fe80::1", READY),
+                ep("ff02::1", READY),
+                ep("::ffff:127.0.0.1", READY),
+                ep("fd00::2", READY),
+            ],
+        );
+        let s = snap(http_svc(), vec![v6]);
+        assert_eq!(run1(&r, &s, &opts()).addrs, vec!["[fd00::2]:8080"]);
+    }
+
+    #[test]
     fn slices_table() {
         type Tweak = fn(&mut UpstreamOptions);
         let none: Tweak = |_| {};
@@ -1007,7 +1052,7 @@ mod tests {
             http_svc(),
             vec![
                 v4(vec![ep("10.0.0.9", READY), ep("10.0.0.10", READY)]),
-                slice("IPv6", &[("http", 8080, "TCP")], vec![ep("::1", READY)]),
+                slice("IPv6", &[("http", 8080, "TCP")], vec![ep("fd00::1", READY)]),
             ],
         );
         let sg = snap(http_svc(), vec![v4(vec![ep("10.0.1.1", READY)])]);
@@ -1025,7 +1070,7 @@ mod tests {
             "10.0.0.10:8080 9",
             "10.0.0.9:8080 9",
             "10.0.1.1:8080 1",
-            "[::1]:8080 9",
+            "[fd00::1]:8080 9",
         ];
         let got = resolve(&inputs, &opts());
         assert_eq!(got.addrs, want);
@@ -1035,7 +1080,7 @@ mod tests {
         let sb_rev = snap(
             http_svc(),
             vec![
-                slice("IPv6", &[("http", 8080, "TCP")], vec![ep("::1", READY)]),
+                slice("IPv6", &[("http", 8080, "TCP")], vec![ep("fd00::1", READY)]),
                 v4(vec![ep("10.0.0.10", READY), ep("10.0.0.9", READY)]),
             ],
         );

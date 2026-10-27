@@ -1,6 +1,14 @@
 pingap-k8s is installed in namespace {{ .Release.Namespace }}.
 
-etcd URL: {{ include "pingap-k8s.etcd.url" . }}
+{{- $etcdUrl := include "pingap-k8s.etcd.url" . }}
+etcd URL: {{ regexReplaceAll "password=[^&]*" $etcdUrl "password=<redacted>" }}
+{{- if not (regexMatch "[?&](ca|cert|tls|server_name)=[^&]" $etcdUrl) }}
+
+WARNING: the etcd connection is not encrypted (no ca, cert or tls in etcd.url).
+Anyone who can reach etcd can rewrite Pingap's config. Keep etcd on the private
+network only and use TLS client certificates, or set etcd.deploy=true for the
+bundled etcd with mTLS.
+{{ end }}
 Upstreams managed: {{ if .Values.config.upstreams }}{{ keys .Values.config.upstreams | sortAlpha | join ", " }}{{ else }}none yet (set config.upstreams){{ end }}
 Read access granted in: {{ include "pingap-k8s.rbacNamespaces" . | fromJsonArray | join ", " }}
 

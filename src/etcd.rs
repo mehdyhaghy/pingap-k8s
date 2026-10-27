@@ -20,6 +20,7 @@ use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -53,6 +54,8 @@ pub const MAX_CAS_RETRIES: u32 = 5;
 const OWN_REVISIONS_CAP: usize = 4096;
 /// Capacity of the foreign-write channel returned by `watch_owned`.
 const FOREIGN_CHANNEL_CAP: usize = 256;
+/// The plaintext-connection warning is logged once per process, not per connection.
+static PLAINTEXT_WARNED: AtomicBool = AtomicBool::new(false);
 const WATCH_BACKOFF_MIN: Duration = Duration::from_millis(500);
 const WATCH_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
@@ -198,9 +201,18 @@ impl EtcdTarget {
         let mut options = ConnectOptions::new();
         if let Some(tls) = self.tls_options()? {
             options = options.with_tls(tls);
+        } else if !PLAINTEXT_WARNED.swap(true, Ordering::Relaxed) {
+            warn!(
+                "the etcd connection is not encrypted: anyone who can reach etcd can change \
+                 Pingap's config; set ca/cert/key in the etcd url (the chart's bundled etcd \
+                 does this)"
+            );
         }
         match (&self.user, &self.password) {
             (Some(user), Some(password)) => {
+                if !self.tls_wanted() {
+                    warn!("the etcd password is sent without TLS");
+                }
                 options = options.with_user(user.clone(), password.clone());
             }
             (None, None) => {}
@@ -301,8 +313,26 @@ fn form_decode(input: &str) -> Result<String, EtcdError> {
         }
         i += 1;
     }
+    // The value is left out: it may be the password.
     String::from_utf8(out)
-        .map_err(|_| EtcdError::InvalidUrl(format!("query value {input:?} is not UTF-8")))
+        .map_err(|_| EtcdError::InvalidUrl("a query parameter is not UTF-8".into()))
+}
+
+/// The URL with the value of every `password` parameter replaced, for error messages.
+pub fn redact_url(url: &str) -> String {
+    let Some((base, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let query: Vec<String> = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((name, value)) if name == "password" && !value.is_empty() => {
+                format!("{name}=<redacted>")
+            }
+            _ => pair.to_string(),
+        })
+        .collect();
+    format!("{base}?{}", query.join("&"))
 }
 
 fn parse_bool(name: &str, value: &str) -> Result<bool, EtcdError> {
@@ -334,17 +364,22 @@ pub fn parse_etcd_url(url: &str) -> Result<EtcdTarget, EtcdError> {
     let (hosts, path_query) = rest.split_once('/').unwrap_or((rest, ""));
     let (path, query) = path_query.split_once('?').unwrap_or((path_query, ""));
     if hosts.is_empty() {
-        return Err(EtcdError::InvalidUrl(format!("{url} names no host")));
+        return Err(EtcdError::InvalidUrl(format!(
+            "{} names no host",
+            redact_url(url)
+        )));
     }
     if hosts.contains('?') {
         return Err(EtcdError::InvalidUrl(format!(
-            "{url}: put a path before the query, e.g. etcd://host:2379/pingap?..."
+            "{}: put a path before the query, e.g. etcd://host:2379/pingap?...",
+            redact_url(url)
         )));
     }
     let endpoints: Vec<String> = hosts.split(',').map(str::to_string).collect();
     if endpoints.iter().any(String::is_empty) {
         return Err(EtcdError::InvalidUrl(format!(
-            "{url} has an empty host entry"
+            "{} has an empty host entry",
+            redact_url(url)
         )));
     }
 
@@ -1013,6 +1048,25 @@ mod tests {
         let t = parse_etcd_url("etcd://127.0.0.1:2379").unwrap();
         assert_eq!(t.prefix, "/");
         assert!(parse_etcd_url("etcd:///pingap").is_err());
+    }
+
+    #[test]
+    fn url_errors_never_show_the_password() {
+        for url in [
+            "etcd://?user=u&password=s3cret",
+            "etcd://h:2379?user=u&password=s3cret",
+            "etcd://a:2379,,b:2379/p?password=s3cret&tls=true",
+            "etcd://h:2379/p?password=%FF%FEs3cret",
+        ] {
+            let err = parse_etcd_url(url).unwrap_err().to_string();
+            assert!(!err.contains("s3cret"), "{url} -> {err}");
+        }
+        assert_eq!(
+            redact_url("etcd://h:2379/p?user=u&password=s3cret&tls=true"),
+            "etcd://h:2379/p?user=u&password=<redacted>&tls=true"
+        );
+        assert_eq!(redact_url("etcd://h:2379/p"), "etcd://h:2379/p");
+        assert_eq!(redact_url("etcd://h/p?password="), "etcd://h/p?password=");
     }
 
     #[test]
