@@ -43,6 +43,11 @@ resources is planned for later phases.
 - [Pingap side](#pingap-side)
 - [Upstream target](#upstream-target)
 - [Graceful shutdown of application pods (preStop)](#graceful-shutdown-of-application-pods-prestop)
+- [Headers, sticky sessions and auth](#headers-sticky-sessions-and-auth)
+  - [Request headers](#request-headers)
+  - [Sticky sessions](#sticky-sessions)
+  - [Authentication](#authentication)
+- [Upgrades and hot reload](#upgrades-and-hot-reload)
 - [Production checklist](#production-checklist)
 - [Operating it with kubectl](#operating-it-with-kubectl)
   - [kubectl plugin](#kubectl-plugin)
@@ -509,6 +514,91 @@ your upstream's connect timeout.
 Each write rebuilds the upstream and resets its runtime state (circuit breaker, backend stats,
 round-robin position). The debounce keeps the number of writes during a rollout low.
 
+## Headers, sticky sessions and auth
+
+The controller only writes `addrs`; requests go from the client to Pingap and from Pingap to the
+pod (or to the Service in `service` mode). Everything below is Pingap configuration on the
+location or upstream, set in the admin UI or in etcd. Phase 1 does not generate it.
+
+### Request headers
+
+- The client's request headers reach the pod as sent, `Host`, cookies and `Authorization`
+  included; Pingap drops only hop-by-hop headers such as `Connection`. WebSocket upgrades, gRPC
+  (h2c) and server-sent events pass through.
+- The pod sees the Pingap pod as the TCP peer. Location `enable_reverse_proxy_headers = true` adds
+  `X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host` and `X-Forwarded-Port`.
+  The client address Pingap itself sees depends on how traffic reaches it (see "Client source
+  IP" in the [Production checklist](#production-checklist)).
+- Add or replace headers with `proxy_set_headers` / `proxy_add_headers` on the location, or the
+  `request_headers` plugin. In `service` mode kube-proxy does not touch headers either.
+
+### Sticky sessions
+
+They work in `pods` mode, where Pingap sees every pod:
+
+| Upstream `algo` | Affinity by | Notes |
+|---|---|---|
+| `sticky:<cookie>` | a cookie Pingap sets itself | The usual choice. The cookie value is derived from the pod address, so every Pingap replica picks the same pod. A client whose pod is gone, unhealthy or just failed is moved and gets a new cookie; a request never fails because of it. |
+| `hash:cookie:<name>`, `hash:header:<name>`, `hash:ip`, `hash:url`, `hash:query:<key>` | consistent hash of a request value | The app sets the cookie or header. When pods change, only the clients of those pods move. |
+
+- A terminating pod leaves `addrs` at once, so its clients move to another pod while it drains.
+  Affinity is a preference, not a guarantee: keep session state in a shared store if losing it
+  matters.
+- `hash:ip` needs the real client address (behind a load balancer that hides it, every client
+  hashes the same).
+- Behind a CDN or another shared cache, `sticky:<cookie>`'s `Set-Cookie` can be cached and given
+  to everyone. Use a `hash:` key there, or make the cache leave `Set-Cookie` responses alone.
+- In `service` mode Pingap sees one address and cannot pin a client to a pod; the Service's
+  `sessionAffinity: ClientIP` would only see the Pingap pods.
+
+### Authentication
+
+Pingap's plugins authenticate on the location, before the request reaches the pod:
+
+| Plugin | What it does |
+|---|---|
+| `basic_auth` | HTTP basic auth against htpasswd entries (bcrypt and others), with a delay and block after failures |
+| `key_auth` | API key in a header or query parameter, optionally hidden from the app |
+| `jwt` | JWT bearer tokens: HS256/HS512, RS and ES keys or a JWKS URL, checked claims, claims passed to the app as headers |
+| `oidc` | browser login with an OpenID Connect provider (authorization code flow with PKCE), user claims passed to the app as headers |
+| `forward_auth` | asks an external auth service for every request; a `2xx` lets it through and selected response headers are copied onto it |
+| `hmac_auth` | requests signed with a shared secret (HTTP Signatures) |
+| `combined_auth` | per-app secrets combined with an IP allowlist |
+| server `tls_client_ca` | client certificates (mutual TLS), required or optional |
+
+Related: IP, geo, referer and user-agent restrictions, URI blocking, CSRF, CORS, and rate and
+bandwidth limits.
+
+LDAP or Active Directory, plain OAuth2 providers (for example GitHub) and opaque token
+introspection have no plugin. Use `forward_auth` with an auth service running in the cluster:
+Authelia, Authentik or Keycloak (LDAP federation), Dex behind oauth2-proxy, or oauth2-proxy alone
+for OAuth2 providers.
+
+## Upgrades and hot reload
+
+Traffic is not interrupted by any of these:
+
+- **Upgrading the controller** (`helm upgrade`): the controller is not on the request path, and
+  Pingap keeps serving from etcd. The Deployment rolls with `maxSurge: 1`, `maxUnavailable: 0`
+  and a PodDisruptionBudget. A stopping leader resigns and revokes its lease, so a standby takes
+  over at once and resyncs every upstream; changes during the handover (about a second) are
+  written then. With `replicaCount: 1` that gap is the new pod's startup time.
+- **Changing the controller config**: reloaded live, see [Helm](#helm).
+  The settings read only at startup need a rolling restart, which is the case above.
+- **Endpoint changes**: Pingap's `--autoreload` rebuilds only the changed upstream and swaps it
+  in; no Pingap restart, in-flight requests and upgraded connections are kept.
+- **Upgrading the quickstart Pingap**: rolling update with surge and no unavailable pod, a 15 s
+  `preStop`, then pingora's graceful shutdown (in-flight requests finish). Run 2 or more replicas
+  for the PodDisruptionBudget. Changing Pingap listeners (`servers`) or `[basic]` needs a Pingap
+  restart, by Pingap's design.
+- **Application rollouts**: terminating pods leave `addrs` at once and a single draining pod is
+  kept until its replacement is Ready; the app pods need a [preStop delay](#graceful-shutdown-of-application-pods-prestop).
+  The e2e suite checks no failed requests under load during rollouts and single-replica restarts.
+
+Not covered: `service` mode with a recreated Service picks up the new ClusterIP only at Pingap's
+next lookup (`update_frequency`, see [Upstream target](#upstream-target)), and while every
+controller pod is down new pods get no traffic.
+
 ## Production checklist
 
 - [ ] **App pods have a `preStop` delay** sized from the upstream health-check connect timeout
@@ -554,9 +644,8 @@ round-robin position). The debounce keeps the number of writes during a rollout 
       the connection or stream age in the app if load must even out after scaling.
 - [ ] **`service` mode upstreams refresh DNS often**: `update_frequency = "5s"`, so a recreated
       Service (new ClusterIP) is picked up within seconds ([Upstream target](#upstream-target)).
-- [ ] **Sticky sessions use consistent hashing**: `algo = "hash:cookie:<name>"` (or `hash:ip`,
-      `hash:header:<name>`). Pingora's consistent hash moves only the keys of the pods that
-      changed during a rollout; round robin has no affinity.
+- [ ] **Sticky sessions, if needed, use `sticky:<cookie>` or a hash**
+      ([Sticky sessions](#sticky-sessions)); round robin has no affinity.
 - [ ] **Quickstart Pingap runs 2 or more replicas** (`pingap.replicas`), so its
       PodDisruptionBudget applies.
 - [ ] **Streaming workloads** (server-sent events, long polling, gRPC streams):
