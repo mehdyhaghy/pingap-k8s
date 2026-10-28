@@ -464,6 +464,11 @@ target = "service"
 - In `service` mode keep the Pingap upstream's `discovery` empty. Pingap then treats the hostname
   in `addrs` as DNS discovery and re-resolves it every `update_frequency` (60 s by default). With
   `discovery = "static"` the name is resolved only once, when the upstream is built.
+- Set `update_frequency = "5s"` on `service` mode upstreams. A Service that is deleted and
+  recreated gets a new ClusterIP under the same name, so the controller has nothing to write and
+  Pingap keeps the old address until its next lookup: on kind that was 26 s of 503s with the 60 s
+  default, and none with 5 s. Upstreams the controller creates get `update_frequency = "5s"`;
+  for an upstream you created, set it yourself (the controller only changes `addrs`).
 - The port written is the Service `port`. Several Services in one upstream give one address each,
   with their weights. The Service and port must exist, as in `pods` mode.
 - Pingap forwards the client's `Host` header. If a layer behind the Service routes by Service
@@ -512,7 +517,9 @@ round-robin position). The debounce keeps the number of writes during a rollout 
       `health_check = "http://api/healthz?connection_timeout=1s&check_frequency=5s"`. Minimal
       upstreams created by the controller have none, and fail-static depends on it: while the
       controller is down, or when a Service has no endpoints, health checks are what take dead pod
-      IPs out of rotation.
+      IPs out of rotation. Prefer an HTTP check with a path only this app serves over `tcp://`:
+      a pod IP freed during a long controller outage can be given to another app's pod on the
+      same port, and a TCP check would still pass.
 - [ ] **The health-check connect timeout is short** (about 1 s). Each write is swapped in only
       after a health-check round, so a slow or dead backend delays it by up to that timeout
       (measured 3–5.5 s with a default health check).
@@ -545,6 +552,8 @@ round-robin position). The debounce keeps the number of writes during a rollout 
       its own, even when a client sends them all over one connection, but a WebSocket or a
       long-running stream stays on the pod it was opened to, and new pods only get new ones. Cap
       the connection or stream age in the app if load must even out after scaling.
+- [ ] **`service` mode upstreams refresh DNS often**: `update_frequency = "5s"`, so a recreated
+      Service (new ClusterIP) is picked up within seconds ([Upstream target](#upstream-target)).
 - [ ] **Sticky sessions use consistent hashing**: `algo = "hash:cookie:<name>"` (or `hash:ip`,
       `hash:header:<name>`). Pingora's consistent hash moves only the keys of the pods that
       changed during a rollout; round robin has no affinity.

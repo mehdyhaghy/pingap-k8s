@@ -6,6 +6,12 @@ Version 0.16.10. Versions now follow Pingap: the Pingap version the release is t
 one digit for our own releases (Pingap 0.16.1: 0.16.10 to 0.16.19). `make version-check` and the
 release workflow enforce it.
 
+Changes:
+- Upstreams the controller creates for `target = "service"` get `update_frequency = "5s"`, so
+  Pingap re-resolves the Service name every 5 s instead of 60 s. A deleted and recreated Service
+  (new ClusterIP) gave 26 s of 503s on kind before; none with 5 s. The README recommends the same
+  for upstreams you create.
+
 Security:
 - Releases are signed with cosign (keyless, Sigstore): the image, the OCI chart, and each release
   file with a `.sigstore.json` bundle. The README shows how to verify.
@@ -39,8 +45,11 @@ Tests and CI:
   (`.helmignore`).
 - Kubernetes Events publishing tested against a mock API server: the request paths and bodies,
   series updates, the spam filter and a forbidden namespace.
-- e2e test 04 records why a failed request failed (curl exit code, time, address) and prints the
-  Pingap log when it fails.
+- e2e test 04 records why a failed request failed (curl exit code, DNS and connect time, address)
+  and prints the Pingap log when it fails. That showed its dual-stack flake was a cluster DNS
+  lookup lost in kind (a 5 s resolver timeout), never reaching Pingap. The harness now reaches
+  Pingap by its ClusterIP (curl `--resolve`, fortio `-resolve`): 15 of 15 local dual-stack runs
+  passed, against 5 failures in 30 before.
 - OTLP export test against an in-process receiver, and kubectl plugin tests against a fake
   `kubectl`, both in `cargo test`.
 - New CI job `integration` runs the etcd integration tests and the kind watcher tests. Before
