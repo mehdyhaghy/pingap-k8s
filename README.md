@@ -53,6 +53,7 @@ resources is planned for later phases.
 - [Limitations](#limitations)
 - [Development](#development)
 - [License](#license)
+- [Releasing](#releasing)
 
 ## How it works
 
@@ -525,6 +526,8 @@ round-robin position). The debounce keeps the number of writes during a rollout 
       IPs directly, so policies that only admit traffic "from the Service" do not apply. If
       traffic must pass the Service (Service-level routing, policy or mTLS), use
       [`target = "service"`](#upstream-target) for those upstreams.
+- [ ] **Prometheus may scrape the controller**: the chart's NetworkPolicy closes the metrics port
+      by default; list your Prometheus in `networkPolicy.metricsFrom`.
 - [ ] **Client source IP** is decided:
   - `externalTrafficPolicy: Local` keeps the client address (only nodes running a Pingap pod get
     traffic, so spread the replicas); `Cluster`, the default, shows Pingap a node address;
@@ -831,7 +834,7 @@ At 50 upstreams × 20 endpoints: event-to-write p50 0.52 s (the 500 ms debounce)
 
 ```sh
 make fmt           # cargo fmt
-make check         # fmt check, clippy -D warnings, tests, helm lint/template, exposure check, manifests check
+make check         # fmt check, clippy -D warnings, tests, helm lint/template, exposure check, version check, manifests check
 make manifests     # regenerate deploy/pingap-k8s.yaml from the chart
 make docker        # build the image for the local platform
 make docker-multiarch PLATFORMS=linux/amd64,linux/arm64
@@ -843,7 +846,7 @@ Tests:
 
 | Command | What it covers | In CI |
 | --- | --- | --- |
-| `cargo test` | unit tests; OTLP export to an in-process receiver (`tests/otlp_export.rs`); the plugin against a fake `kubectl` (`tests/kubectl_plugin.rs`) | `rust` |
+| `cargo test` | unit tests (including Kubernetes Events against a mock API server); OTLP export to an in-process receiver (`tests/otlp_export.rs`); the plugin against a fake `kubectl` (`tests/kubectl_plugin.rs`) | `rust` |
 | `scripts/test-etcd.sh` | `tests/etcd_*.rs` against a throwaway etcd on 127.0.0.1: CAS writes, owned-key watch, compaction, leader election | `integration` |
 | `scripts/test-kind.sh` | `tests/watch_kind.rs`: the Service and EndpointSlice watchers on a throwaway kind cluster | `integration` |
 | `scripts/e2e-run.sh` | e2e tests 1 to 14 with the chart, Pingap and etcd on kind | `e2e` |
