@@ -7,3 +7,14 @@
 *~
 .idea/
 .vscode/
+# Never package credentials or local overrides
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+kubeconfig*
+*.local.yaml
+values-*.local.yaml
+secrets/

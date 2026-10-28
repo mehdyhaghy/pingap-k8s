@@ -31,6 +31,12 @@ Security:
   when more than one Service matches.
 
 Tests and CI:
+- New CI job `secrets` runs gitleaks over the whole git history and the working tree.
+- Workflow checkouts no longer keep the GitHub token in `.git/config`
+  (`persist-credentials: false`).
+- `SECURITY.md` (private vulnerability reporting) and `CODEOWNERS`; more credential, dump and
+  snapshot patterns in `.gitignore`, and credentials kept out of the chart package
+  (`.helmignore`).
 - Kubernetes Events publishing tested against a mock API server: the request paths and bodies,
   series updates, the spam filter and a forbidden namespace.
 - e2e test 04 records why a failed request failed (curl exit code, time, address) and prints the

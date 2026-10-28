@@ -742,6 +742,8 @@ and pass it with `extraEnv` and `valueFrom.secretKeyRef`, not as a plain value.
 
 ## Security
 
+Report vulnerabilities privately, as described in [SECURITY.md](SECURITY.md).
+
 - **Kubernetes access is read-only and namespaced**: `get/list/watch` on `services` and
   `endpointslices`, through one Role per namespace. Never a ClusterRole. The only write
   permission is opt-in: `events.enabled` adds `create/patch` on `events.k8s.io` `events` in those
@@ -849,9 +851,10 @@ Tests:
 | `cargo test` | unit tests (including Kubernetes Events against a mock API server); OTLP export to an in-process receiver (`tests/otlp_export.rs`); the plugin against a fake `kubectl` (`tests/kubectl_plugin.rs`) | `rust` |
 | `scripts/test-etcd.sh` | `tests/etcd_*.rs` against a throwaway etcd on 127.0.0.1: CAS writes, owned-key watch, compaction, leader election | `integration` |
 | `scripts/test-kind.sh` | `tests/watch_kind.rs`: the Service and EndpointSlice watchers on a throwaway kind cluster | `integration` |
-| `scripts/e2e-run.sh` | e2e tests 1 to 14 with the chart, Pingap and etcd on kind | `e2e` |
+| `scripts/e2e-run.sh` | end-to-end tests 1 to 14 with the chart, Pingap and etcd on kind | `e2e` |
 | `scripts/otel-local.sh` | the binary exporting to a real OpenTelemetry Collector (docker) | no |
 | `cargo audit` | RustSec advisories for `Cargo.lock` | `dependencies` (also weekly) |
+| `gitleaks git . && gitleaks dir .` | secrets in the git history and the working tree (`.gitleaks.toml`) | `secrets` |
 
 Line coverage: `cargo llvm-cov --lib --bins` (add `--test 'etcd_*'` with `PINGAP_K8S_TEST_ETCD`
 set to include the etcd tests).

@@ -1,0 +1,5 @@
+# Changes to these paths need the owner's review when branch protection requires it.
+*                   @mehdyhaghy
+/.github/           @mehdyhaghy
+/Dockerfile         @mehdyhaghy
+/charts/            @mehdyhaghy

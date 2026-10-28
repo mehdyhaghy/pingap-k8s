@@ -77,6 +77,35 @@ credentials.json
 # Pingap admin passwords and etcd client TLS material fetched for local testing
 admin-password*
 *.p8
+# Cloud, registry and signing credentials
+.aws/
+.azure/
+.gcloud/
+gha-creds-*.json
+*service-account*.json
+.vault-token
+.git-credentials
+.ssh/
+known_hosts
+*.ovpn
+*.kdbx
+cosign.key
+*.sigstore.json
+# Local GitHub Actions runs (act)
+.secrets
+.actrc
+# HTTP captures and dumps can hold tokens and cookies
+*.har
+core
+core.[0-9]*
+*.dmp
+dhat-heap.json
+heaptrack.*
+# etcd snapshots and local databases hold the full Pingap config
+*.snapshot
+snapshot.db
+*.sqlite
+*.sqlite3
 
 # ---------------------------------------------------------------------------
 # Kubernetes / Helm / kind
@@ -133,8 +162,11 @@ temp/
 *.rej
 *.bak
 
-# Local notes not meant for the repository
+# Local notes and the design spec, kept private (not in the repository)
 ISSUE-*-RESPONSE.md
+/SPEC.md
+/notes/
+*.private.md
 
 # ---------------------------------------------------------------------------
 # Editors and IDEs
@@ -167,6 +199,9 @@ ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
 
-# Local work checkpoint, editor agents and harness worktrees, never committed
+# Local work checkpoint and AI coding tool state, never committed
 .checkpoint/
-.claude/
+.cursor/
+.aider*
+.codex/
+.windsurf/

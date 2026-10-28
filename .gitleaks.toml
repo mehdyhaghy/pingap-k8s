@@ -1,0 +1,16 @@
+# Secret scan (CI job "secrets", or locally: gitleaks git . && gitleaks dir .).
+# The default rules, minus known false positives.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Kubernetes Secret names (not values) and the RFC 6455 sample WebSocket key"
+regexTarget = "match"
+regexes = [
+  '''tlsSecret[=:]\s*pingap-k8s-etcd''',
+  '''Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==''',
+]
+
+[[allowlists]]
+description = "Build output"
+paths = ['''^target/''']
