@@ -230,6 +230,19 @@ pub struct Traffic {
 
 impl Traffic {
     pub fn start(env: &Env, path: &str, max: Duration) -> anyhow::Result<Traffic> {
+        Self::start_paced(env, path, max, Duration::ZERO)
+    }
+
+    /// [`Traffic::start`] with a pause after each request. Back to back, the loop opens
+    /// about 400 connections a second from one pod to one ClusterIP; runs one after the
+    /// other then reuse source ports still in TIME_WAIT and some connects are refused,
+    /// which says nothing about Pingap.
+    pub fn start_paced(
+        env: &Env,
+        path: &str,
+        max: Duration,
+        pause: Duration,
+    ) -> anyhow::Result<Traffic> {
         let script = format!(
             "end=$(( $(date +%s) + {secs} )); f=/tmp/e2e-traffic.$$; \
              while [ $(date +%s) -lt $end ]; do \
@@ -238,8 +251,13 @@ impl Traffic {
                if [ \"$code\" = 200 ]; then h=$(head -c 200 $f | tr -d '\\n '); \
                else f2() {{ echo \"$w\" | cut -d' ' -f$1; }}; \
                  h=\"-curl=$rc,t=$(f2 2),ip=$(f2 3),dns=$(f2 4),connect=$(f2 5)\"; fi; \
-               echo \"$code $h\"; \
+               echo \"$code $h\"; {sleep} \
              done; rm -f $f",
+            sleep = if pause.is_zero() {
+                String::new()
+            } else {
+                format!("sleep {};", pause.as_secs_f64())
+            },
             secs = max.as_secs().max(1),
             url = env.pingap.url,
             resolve = env.pingap.resolve,

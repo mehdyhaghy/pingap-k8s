@@ -145,7 +145,7 @@ pingap:
       addrs = ["127.0.0.1:9"]
       algo = "sticky:e2e-sticky"
 
-      # E2E test 18 deletes this entry so the controller creates it ("service" target).
+      # E2E test 18 deletes this entry so the controller creates it (its ClusterIP).
       [upstreams.echo-svc]
       addrs = ["127.0.0.1:9"]
 

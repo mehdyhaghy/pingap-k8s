@@ -99,6 +99,12 @@ pub const RETRY_MAX: Duration = Duration::from_secs(30);
 /// Retry delay for a malformed stored entry. An event or resync
 /// retries earlier.
 pub const MALFORMED_RETRY: Duration = Duration::from_secs(300);
+/// Least debounce of a `target = "service"` upstream. Its address (a ClusterIP) changes
+/// when a Service is recreated, and kube-proxy routes the new ClusterIP a moment after
+/// the Service's EndpointSlice appears. Written sooner, Pingap's first health check
+/// connected before that, conntrack kept the unrouted connection for every retry, and
+/// the backend stayed unhealthy for a whole check interval (about 10 s of 503s on kind).
+pub const SERVICE_SETTLE: Duration = Duration::from_secs(3);
 
 /// Inputs that can be handed to a running [`Reconciler`] from another task.
 struct Shared {
@@ -460,9 +466,17 @@ impl UpstreamState {
     }
 
     fn deadline(&self) -> Option<Instant> {
-        let debounce = self.debounce.map(|d| {
-            (d.last + self.config.options.debounce).min(d.first + self.config.options.debounce_max)
-        });
+        let options = &self.config.options;
+        let (debounce, debounce_max) = match options.target {
+            UpstreamTarget::Pods => (options.debounce, options.debounce_max),
+            UpstreamTarget::Service { .. } => (
+                options.debounce.max(SERVICE_SETTLE),
+                options.debounce_max.max(SERVICE_SETTLE),
+            ),
+        };
+        let debounce = self
+            .debounce
+            .map(|d| (d.last + debounce).min(d.first + debounce_max));
         match (debounce, self.retry_at) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -2042,6 +2056,9 @@ mod tests {
         };
         h.handle
             .set_upstreams([("web".to_string(), service_mode)].into());
+        // Service targets wait SERVICE_SETTLE (3 s) for kube-proxy, not the 500 ms debounce.
+        sleep(2500).await;
+        assert!(h.writer.calls_for("web").is_empty());
         sleep(1000).await;
         let service_addrs = vec![
             "api.prod.svc.cluster.local:80".to_string(),

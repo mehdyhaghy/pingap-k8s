@@ -555,10 +555,8 @@ fn rewrite_array(array: &mut Array, addrs: &[String]) {
 }
 
 /// How often Pingap re-resolves a hostname in `addrs` (its DNS discovery), set in the
-/// entries the controller creates for `target = "service"`. Pingap's default is 60 s:
-/// a Service deleted and recreated gets a new ClusterIP, the name stays the same (no
-/// write), and Pingap kept the old address for up to a minute (measured on kind: 26 s
-/// of 503s; none with 5 s).
+/// entries the controller creates with one: a headless Service in `target = "service"`
+/// mode. Pingap's default is 60 s.
 pub const SERVICE_UPDATE_FREQUENCY: &str = "5s";
 
 /// The entry written when an owned upstream key does not exist:

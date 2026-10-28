@@ -186,7 +186,9 @@ fn target_lines(config: &Config) -> Vec<String> {
         .map(|(name, up)| match &up.options.target {
             UpstreamTarget::Pods => format!("  upstream {name:?}: target pods"),
             UpstreamTarget::Service { cluster_domain } => {
-                format!("  upstream {name:?}: target service (*.svc.{cluster_domain})")
+                format!(
+                    "  upstream {name:?}: target service (ClusterIP; headless: *.svc.{cluster_domain})"
+                )
             }
         })
         .collect()
@@ -978,7 +980,8 @@ mod tests {
             target_lines(&config),
             vec![
                 "  upstream \"a\": target pods".to_string(),
-                "  upstream \"b\": target service (*.svc.k.internal)".to_string(),
+                "  upstream \"b\": target service (ClusterIP; headless: *.svc.k.internal)"
+                    .to_string(),
             ]
         );
     }

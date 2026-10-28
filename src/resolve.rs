@@ -175,7 +175,7 @@ struct Entry {
 /// config order.
 pub fn resolve(inputs: &[ServiceInput<'_>], opts: &UpstreamOptions) -> Resolved {
     if let UpstreamTarget::Service { cluster_domain } = &opts.target {
-        return resolve_service_target(inputs, cluster_domain);
+        return resolve_service_target(inputs, cluster_domain, opts.ipv4_only);
     }
     let mut warnings = Vec::new();
     let mut seen: HashMap<SocketAddr, Entry> = HashMap::new();
@@ -288,17 +288,20 @@ pub fn resolve(inputs: &[ServiceInput<'_>], opts: &UpstreamOptions) -> Resolved 
     }
 }
 
-/// `target = "service"`: one Service DNS name per entry, port is the
-/// Service `port`.
+/// `target = "service"`: one Service address per entry, port is the Service `port`.
 ///
-/// Pingap resolves the name itself: an upstream whose `discovery` is unset
-/// and whose `addrs` hold a hostname is treated as `discovery = "dns"`
-/// (pingap-config `UpstreamConf::guess_discovery`), and DNS discovery looks
-/// the names up again every `update_frequency` (default 60 s). So a Service
-/// whose ClusterIP changes (deleted and recreated) is picked up without a
-/// controller write. An explicit `discovery = "static"` on the upstream
-/// would resolve the name only once, when the upstream is built.
-fn resolve_service_target(inputs: &[ServiceInput<'_>], cluster_domain: &str) -> Resolved {
+/// The address is the Service's ClusterIP (with `ipv4_only`, its first IPv4 one), so a
+/// Service deleted and recreated with a new ClusterIP is followed by a write within the
+/// debounce, like a pod change. Writing the DNS name instead left it to Pingap's DNS
+/// discovery, which keeps an answer for its TTL (30 s with the default CoreDNS config)
+/// whatever `update_frequency` says: on kind about 10 s of 503s after a recreate. A
+/// Service without a ClusterIP (headless) gets its DNS name, which Pingap resolves itself
+/// (an upstream with a hostname in `addrs` and no `discovery` uses DNS discovery).
+fn resolve_service_target(
+    inputs: &[ServiceInput<'_>],
+    cluster_domain: &str,
+    ipv4_only: bool,
+) -> Resolved {
     let mut warnings = Vec::new();
     // address -> weight; the first entry in config order keeps its weight.
     let mut seen: HashMap<String, Option<u32>> = HashMap::new();
@@ -309,21 +312,36 @@ fn resolve_service_target(inputs: &[ServiceInput<'_>], cluster_domain: &str) -> 
             warnings.push(ResolveWarning::ServiceMissing(sref.key.clone()));
             continue;
         };
-        let Some(port) = find_service_port(service, &sref.port)
-            .and_then(|p| u16::try_from(p.port).ok())
-            .filter(|p| *p != 0)
-        else {
+        let Some(service_port) = find_service_port(service, &sref.port) else {
             warnings.push(ResolveWarning::PortNotInService {
                 service: sref.key.clone(),
                 port: sref.port.clone(),
             });
             continue;
         };
-        let addr = format!(
-            "{}.{}.svc.{cluster_domain}:{port}",
-            sref.key.name, sref.key.namespace
-        );
-        seen.entry(addr).or_insert(sref.weight);
+        let port_name = service_port.name.as_deref().unwrap_or("");
+        let Some(port) = u16::try_from(service_port.port).ok().filter(|p| *p != 0) else {
+            warnings.push(ResolveWarning::PortNotInService {
+                service: sref.key.clone(),
+                port: sref.port.clone(),
+            });
+            continue;
+        };
+        let host = match cluster_ip(service, ipv4_only) {
+            // The ClusterIP is routed only once the Service has endpoints (kube-proxy
+            // programs it from the EndpointSlices): until then it contributes nothing
+            // and the stored address is kept. Written earlier, Pingap's first health
+            // check of a recreated Service timed out and held it unhealthy for a whole
+            // check interval.
+            Some(_) if !has_endpoint(input.snapshot, port_name) => continue,
+            Some(IpAddr::V4(v4)) => v4.to_string(),
+            Some(IpAddr::V6(v6)) => format!("[{v6}]"),
+            None => format!(
+                "{}.{}.svc.{cluster_domain}",
+                sref.key.name, sref.key.namespace
+            ),
+        };
+        seen.entry(format!("{host}:{port}")).or_insert(sref.weight);
     }
 
     let mut addrs: Vec<String> = seen
@@ -344,6 +362,34 @@ fn resolve_service_target(inputs: &[ServiceInput<'_>], cluster_domain: &str) -> 
         fallback: false,
         warnings,
     }
+}
+
+/// Whether an EndpointSlice of the Service has a ready or still serving endpoint on the
+/// Service port named `port_name`.
+fn has_endpoint(snapshot: &ServiceSnapshot, port_name: &str) -> bool {
+    snapshot.slices.iter().any(|slice| {
+        find_slice_port(slice, port_name).is_some()
+            && slice
+                .endpoints
+                .iter()
+                .any(|e| classify(e.conditions.as_ref(), false) != Class::Excluded)
+    })
+}
+
+/// The ClusterIP to write for a Service: the first of `clusterIPs` (the primary family),
+/// or with `ipv4_only` the first IPv4 one. `None` for a headless Service (`None`), a
+/// Service without one, or no address of the wanted family.
+fn cluster_ip(service: &Service, ipv4_only: bool) -> Option<IpAddr> {
+    let spec = service.spec.as_ref()?;
+    let ips: Vec<IpAddr> = match spec.cluster_ips.as_deref() {
+        Some(ips) if !ips.is_empty() => ips.iter().filter_map(|ip| ip.parse().ok()).collect(),
+        _ => spec
+            .cluster_ip
+            .iter()
+            .filter_map(|ip| ip.parse().ok())
+            .collect(),
+    };
+    ips.into_iter().find(|ip| !ipv4_only || ip.is_ipv4())
 }
 
 /// Kubernetes rejects these for pod and Endpoints addresses; an EndpointSlice
@@ -1308,6 +1354,112 @@ mod tests {
             got.warnings,
             vec![ResolveWarning::ServiceMissing(key("gone"))]
         );
+    }
+
+    /// `service(ports)` with `clusterIP` / `clusterIPs` set.
+    fn with_cluster_ips(svc: Arc<Service>, ips: &[&str]) -> Arc<Service> {
+        let mut svc = (*svc).clone();
+        let spec = svc.spec.as_mut().unwrap();
+        spec.cluster_ip = ips.first().map(|ip| ip.to_string());
+        spec.cluster_ips = Some(ips.iter().map(|ip| ip.to_string()).collect());
+        Arc::new(svc)
+    }
+
+    #[test]
+    fn service_target_writes_the_cluster_ip() {
+        let web = service(&[("http", 80, "TCP")]);
+        let r = sref("web", named("http"), Some(4));
+        let cases: Vec<(&str, Vec<&str>, bool, &str)> = vec![
+            ("IPv4", vec!["10.96.0.10"], false, "10.96.0.10:80 4"),
+            (
+                "IPv6 in brackets",
+                vec!["fd00:10:96::a"],
+                false,
+                "[fd00:10:96::a]:80 4",
+            ),
+            (
+                "dual-stack: the primary family",
+                vec!["fd00:10:96::a", "10.96.0.10"],
+                false,
+                "[fd00:10:96::a]:80 4",
+            ),
+            (
+                "dual-stack with ipv4_only: the IPv4 one",
+                vec!["fd00:10:96::a", "10.96.0.10"],
+                true,
+                "10.96.0.10:80 4",
+            ),
+            (
+                "IPv6 only with ipv4_only: the name",
+                vec!["fd00:10:96::a"],
+                true,
+                "web.prod.svc.cluster.local:80 4",
+            ),
+            (
+                "headless: the name",
+                vec!["None"],
+                false,
+                "web.prod.svc.cluster.local:80 4",
+            ),
+        ];
+        let ready = v4(vec![ep("10.244.0.5", READY)]);
+        for (name, ips, ipv4_only, want) in cases {
+            let s = snap(
+                Some(with_cluster_ips(web.clone(), &ips)),
+                vec![ready.clone()],
+            );
+            let mut o = svc_opts("cluster.local");
+            o.ipv4_only = ipv4_only;
+            let got = run1(&r, &s, &o);
+            assert_eq!(got.addrs, vec![want], "{name}");
+            assert!(got.warnings.is_empty(), "{name}");
+        }
+        // Only `clusterIP` set (older objects): it is used.
+        let mut only = (*web).clone();
+        only.spec.as_mut().unwrap().cluster_ip = Some("10.96.0.11".into());
+        let only = Arc::new(only);
+        let got = run1(
+            &r,
+            &snap(Some(only.clone()), vec![ready.clone()]),
+            &svc_opts("cluster.local"),
+        );
+        assert_eq!(got.addrs, vec!["10.96.0.11:80 4"]);
+
+        // Not routed yet: no slice, only not-ready endpoints, or a slice for another
+        // port. A draining (still serving) endpoint counts.
+        let cases: Vec<(&str, Vec<Arc<EndpointSlice>>, bool)> = vec![
+            ("no slice", vec![], false),
+            (
+                "not ready",
+                vec![v4(vec![ep("10.244.0.5", NOT_READY)])],
+                false,
+            ),
+            (
+                "other port",
+                vec![slice(
+                    "IPv4",
+                    &[("grpc", 9, "TCP")],
+                    vec![ep("10.244.0.5", READY)],
+                )],
+                false,
+            ),
+            ("draining", vec![v4(vec![ep("10.244.0.5", DRAINING)])], true),
+            ("ready", vec![ready], true),
+        ];
+        for (name, slices, routed) in cases {
+            let got = run1(
+                &r,
+                &snap(Some(only.clone()), slices),
+                &svc_opts("cluster.local"),
+            );
+            let want: Vec<&str> = if routed {
+                vec!["10.96.0.11:80 4"]
+            } else {
+                vec![]
+            };
+            assert_eq!(got.addrs, want, "{name}");
+            assert!(got.warnings.is_empty(), "{name}");
+        }
     }
 
     #[test]

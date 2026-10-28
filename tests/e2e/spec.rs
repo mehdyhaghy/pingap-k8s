@@ -2903,10 +2903,10 @@ async fn recreate_service(env: &Env) -> anyhow::Result<(String, String)> {
 }
 
 /// Upstream `echo-svc` has `target = "service"` (location `/svc/`). The test deletes its
-/// stored entry, so the controller creates it: with the Service name and
-/// `update_frequency = "5s"`. Then Service `echo-svc` is deleted and created again (a new
-/// ClusterIP under the same name, so nothing for the controller to write): requests must
-/// keep working, because Pingap looks the name up again within 5 s.
+/// stored entry, so the controller creates it, with the Service's ClusterIP. Then Service
+/// `echo-svc` is deleted and created again with a new ClusterIP: the controller writes
+/// the new one within the debounce, and requests keep working (the old ClusterIP is kept
+/// while the Service is missing, never an empty list).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_18_service_target_recreated() {
     const T: &str = "e2e_18";
@@ -2914,29 +2914,26 @@ async fn e2e_18_service_target_recreated() {
         return;
     };
     baseline(&env).await;
+    let api: Api<Service> = Api::namespaced(env.client.clone(), &env.app_namespace);
+    let first_ip = api
+        .get(SVC_NAME)
+        .await
+        .unwrap()
+        .spec
+        .and_then(|s| s.cluster_ip)
+        .unwrap();
     let key = env.etcd.upstream_key(SVC_UPSTREAM);
     env.etcd.delete(&key).await.unwrap();
     let entry = wait_for(
         "the controller recreated upstream echo-svc",
         CONVERGE,
         Duration::from_millis(250),
-        || async {
-            Ok(env
-                .etcd
-                .get(&key)
-                .await?
-                .filter(|kv| kv.value.contains("echo-svc.e2e-app.svc"))
-                .map(|kv| kv.value))
-        },
+        || async { Ok(env.etcd.get(&key).await?.map(|kv| kv.value)) },
     )
     .await
     .unwrap();
     println!("[{T}] created entry:\n{entry}");
-    assert!(entry.contains(r#"update_frequency = "5s""#), "{entry}");
-    assert!(
-        entry.contains(r#""echo-svc.e2e-app.svc.cluster.local:80""#),
-        "{entry}"
-    );
+    assert!(entry.contains(&format!("\"{first_ip}:80\"")), "{entry}");
     wait_for(
         "requests through /svc/",
         Duration::from_secs(60),
@@ -2946,19 +2943,54 @@ async fn e2e_18_service_target_recreated() {
     .await
     .unwrap();
 
-    let traffic = Traffic::start(&env, "/svc/hostname", Duration::from_secs(90)).unwrap();
+    let traffic = Traffic::start_paced(
+        &env,
+        "/svc/hostname",
+        Duration::from_secs(90),
+        Duration::from_millis(20),
+    )
+    .unwrap();
     tokio::time::sleep(Duration::from_secs(5)).await;
+    let recreated = SystemTime::now();
     let (old, new) = recreate_service(&env).await.unwrap();
     println!("[{T}] Service {SVC_NAME} recreated: ClusterIP {old} -> {new}");
     assert_ne!(old, new);
-    tokio::time::sleep(Duration::from_secs(30)).await;
+    wait_for(
+        "upstream echo-svc on the new ClusterIP",
+        CONVERGE,
+        Duration::from_millis(100),
+        || async {
+            let want = Some(vec![format!("{new}:80")]);
+            Ok((env.etcd.upstream_addrs(SVC_UPSTREAM).await? == want).then_some(()))
+        },
+    )
+    .await
+    .unwrap();
+    println!(
+        "[{T}] new ClusterIP written {} after the recreate",
+        s(track::secs_between(SystemTime::now(), recreated))
+    );
+    tokio::time::sleep(Duration::from_secs(20)).await;
     let hits = traffic.stop();
     let failed = track::failures(&hits);
     println!("[{T}] {} requests, {} failed", hits.len(), failed.len());
-    assert!(hits.len() > 100, "too few requests: {}", hits.len());
+    if let (Some(first), Some(last)) = (failed.first(), failed.last()) {
+        let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
+        for h in &failed {
+            let kind = h.host.split(',').next().unwrap_or_default();
+            *kinds.entry(format!("{} {kind}", h.status)).or_default() += 1;
+        }
+        println!(
+            "[{T}] failures from {} to {} after the recreate: {kinds:?}",
+            s(track::secs_between(first.at, recreated)),
+            s(track::secs_between(last.at, recreated))
+        );
+    }
+    assert!(hits.len() > 300, "too few requests: {}", hits.len());
     assert!(
         failed.is_empty(),
-        "requests failed after the recreate: {failed:?}"
+        "requests failed after the recreate: {:?}",
+        &failed[..failed.len().min(5)]
     );
 }
 

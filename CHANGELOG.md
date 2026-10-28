@@ -7,10 +7,11 @@ one digit for our own releases (Pingap 0.16.1: 0.16.10 to 0.16.19). `make versio
 release workflow enforce it.
 
 Changes:
-- Upstreams the controller creates for `target = "service"` get `update_frequency = "5s"`, so
-  Pingap re-resolves the Service name every 5 s instead of 60 s. A deleted and recreated Service
-  (new ClusterIP) gave 26 s of 503s on kind before; none with 5 s. The README recommends the same
-  for upstreams you create.
+- `target = "service"` writes the Service's ClusterIP instead of its DNS name (a headless Service
+  keeps the name). A Service deleted and recreated with a new ClusterIP is now followed within the
+  debounce. With the name, Pingap kept the old address for its DNS TTL (30 s with the default
+  CoreDNS config), whatever `update_frequency` said: on kind about 10 s of 503s after a recreate.
+- Upstreams the controller creates with a hostname in `addrs` get `update_frequency = "5s"`.
 
 Security:
 - Releases are signed with cosign (keyless, Sigstore): the image, the OCI chart, and each release

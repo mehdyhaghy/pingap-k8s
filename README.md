@@ -390,7 +390,7 @@ drain_terminating = true # any [defaults] key can be overridden per upstream
 | `kubernetes.kubeconfig` | `""` | kubeconfig path; empty means in-cluster, then `$KUBECONFIG`, then `~/.kube/config` |
 | `kubernetes.context` | `""` | kubeconfig context |
 | `kubernetes.default_namespace` | `""` | namespace for `services` entries without one; empty means the controller pod's namespace (`POD_NAMESPACE`) |
-| `kubernetes.cluster_domain` | `cluster.local` | cluster DNS domain used in `target = "service"` addresses; applies live |
+| `kubernetes.cluster_domain` | `cluster.local` | cluster DNS domain of the `target = "service"` address of a headless Service; applies live |
 | `kubernetes.events` | `false` | post Kubernetes Events for resolve warnings, drain fallbacks, malformed entries and etcd reachability (needs `create/patch` on `events.k8s.io` `events`); restart required |
 | `include_not_ready` | `false` | also write endpoints that are not ready (and not terminating) |
 | `drain_terminating` | `true` | remove terminating endpoints; `false` treats serving terminating endpoints as ready |
@@ -452,7 +452,7 @@ Kubernetes addressing only.
 | `target` | Written into `addrs` | Who balances | Use when |
 |---|---|---|---|
 | `pods` (default) | ready pod IPs from EndpointSlices | Pingap, per request | Pingap should reach the pods directly (the usual case) |
-| `service` | one `<service>.<namespace>.svc.<cluster_domain>:<port>` per Service | kube-proxy, or whatever layer sits behind the Service | traffic must go through the Service, e.g. for Service-level routing, policy or mTLS applied there |
+| `service` | one `<ClusterIP>:<port>` per Service (`<service>.<namespace>.svc.<cluster_domain>:<port>` for a headless one) | kube-proxy, or whatever layer sits behind the Service | traffic must go through the Service, e.g. for Service-level routing, policy or mTLS applied there |
 
 ```toml
 [kubernetes]
@@ -466,14 +466,14 @@ target = "service"
 - `pods` gives per-pod health checks, drain within about a second, per-request balancing across
   pods (gRPC included) and consistent-hash stickiness. Prefer it unless traffic must pass the
   Service.
-- In `service` mode keep the Pingap upstream's `discovery` empty. Pingap then treats the hostname
-  in `addrs` as DNS discovery and re-resolves it every `update_frequency` (60 s by default). With
-  `discovery = "static"` the name is resolved only once, when the upstream is built.
-- Set `update_frequency = "5s"` on `service` mode upstreams. A Service that is deleted and
-  recreated gets a new ClusterIP under the same name, so the controller has nothing to write and
-  Pingap keeps the old address until its next lookup: on kind that was 26 s of 503s with the 60 s
-  default, and none with 5 s. Upstreams the controller creates get `update_frequency = "5s"`;
-  for an upstream you created, set it yourself (the controller only changes `addrs`).
+- The address is the Service's ClusterIP (with `ipv4_only`, its IPv4 one), so traffic still
+  goes through the Service. A Service deleted and recreated gets a new ClusterIP, and the
+  controller writes it within the debounce, as for a pod change; no DNS is involved. Writing
+  the Service DNS name instead would leave that to Pingap's DNS discovery, which keeps an answer
+  for its DNS TTL (30 s with the default CoreDNS config) whatever `update_frequency` says.
+- A headless Service (no ClusterIP) gets its DNS name. Keep that upstream's `discovery` empty, so
+  Pingap uses DNS discovery for it; upstreams the controller creates for a name get
+  `update_frequency = "5s"`.
 - The port written is the Service `port`. Several Services in one upstream give one address each,
   with their weights. The Service and port must exist, as in `pods` mode.
 - Pingap forwards the client's `Host` header. If a layer behind the Service routes by Service
@@ -482,7 +482,7 @@ target = "service"
 - Lost compared with `pods`: Pingap's per-pod health checks (it sees one address), fast drain
   (draining is up to the layer behind the Service), and per-request gRPC spread across pods
   (connections are spread only if that layer balances per request).
-- `target` and `cluster_domain` apply live; switching an upstream between modes needs no restart.
+- `target` and `cluster_domain` (used for headless Services) apply live; switching an upstream between modes needs no restart.
 - Chart: `config.defaults.target`, `config.upstreams.<name>.target` and
   `config.kubernetes.cluster_domain`. To add the quickstart Pingap pods to another layer that
   selects pods by label or annotation, use `pingap.podLabels` and `pingap.podAnnotations`
@@ -595,9 +595,7 @@ Traffic is not interrupted by any of these:
   kept until its replacement is Ready; the app pods need a [preStop delay](#graceful-shutdown-of-application-pods-prestop).
   The e2e suite checks no failed requests under load during rollouts and single-replica restarts.
 
-Not covered: `service` mode with a recreated Service picks up the new ClusterIP only at Pingap's
-next lookup (`update_frequency`, see [Upstream target](#upstream-target)), and while every
-controller pod is down new pods get no traffic.
+Not covered: while every controller pod is down, new pods get no traffic.
 
 ## Production checklist
 
@@ -642,8 +640,6 @@ controller pod is down new pods get no traffic.
       its own, even when a client sends them all over one connection, but a WebSocket or a
       long-running stream stays on the pod it was opened to, and new pods only get new ones. Cap
       the connection or stream age in the app if load must even out after scaling.
-- [ ] **`service` mode upstreams refresh DNS often**: `update_frequency = "5s"`, so a recreated
-      Service (new ClusterIP) is picked up within seconds ([Upstream target](#upstream-target)).
 - [ ] **Sticky sessions, if needed, use `sticky:<cookie>` or a hash**
       ([Sticky sessions](#sticky-sessions)); round robin has no affinity.
 - [ ] **Quickstart Pingap runs 2 or more replicas** (`pingap.replicas`), so its
