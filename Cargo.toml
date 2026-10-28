@@ -1,6 +1,6 @@
 [package]
 name = "pingap-k8s"
-version = "0.1.0"
+version = "0.16.10"
 edition = "2024"
 rust-version = "1.89"
 description = "Kubernetes controller for Pingap: syncs Service endpoints into Pingap's etcd config"

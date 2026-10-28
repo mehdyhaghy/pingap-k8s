@@ -73,6 +73,9 @@ jobs:
       - name: no public exposure of etcd, metrics or admin; no ClusterRole
         run: make exposure-check
 
+      - name: version follows the Pingap version
+        run: make version-check
+
   integration:
     name: integration (etcd, kind watchers)
     runs-on: ubuntu-24.04

@@ -4,8 +4,8 @@ description: >-
   Kubernetes controller for Pingap. Watches Services and EndpointSlices and writes the
   ready pod addresses into the upstreams of Pingap's etcd config storage.
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 0.16.10
+appVersion: "0.16.10"
 kubeVersion: ">=1.32.0-0"
 home: https://github.com/mehdyhaghy/pingap-k8s
 sources:

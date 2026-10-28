@@ -694,7 +694,7 @@ mod tests {
             version: 1,
             controller: ControllerInfo {
                 identity: "pingap-k8s-7d9f-abcde".into(),
-                version: "0.1.0".into(),
+                version: "0.16.10".into(),
             },
             generated_at_unix: 1_000,
             phase: "running".into(),
@@ -751,7 +751,7 @@ mod tests {
     fn status_table() {
         let got = render_status(&pod(), &doc());
         let want = "\
-controller pingap-k8s-7d9f-abcde (leader) v0.1.0, phase running, ready yes, etcd prefix /pingap, watchers 2/2 synced
+controller pingap-k8s-7d9f-abcde (leader) v0.16.10, phase running, ready yes, etcd prefix /pingap, watchers 2/2 synced
 UPSTREAM  TARGET   SERVICES                      READY  DRAINING  IN SYNC  LAST WRITE  NOTES
 api       pods     api.prod:http                 2      0         yes      ok 12s ago
 web       service  web.prod:80 9,gone.prod:80 1  0      0         no       -           no endpoints, 1 warning

@@ -425,6 +425,8 @@ pingap-k8s --check --config config.toml
 
 - Tested with Pingap 0.16.1 (the quickstart default) on Kubernetes 1.35 and 1.37, IPv4 and
   dual-stack; a weekly CI run checks Pingap `latest`.
+- The controller version tells you the Pingap version it was tested with: `0.16.1x` means Pingap
+  0.16.1 (see [Releasing](#releasing)).
 - Run Pingap with `--conf etcd://...` and `--autoreload`.
 - Create each owned upstream once, in the admin UI or by hand, with the fields you want (health
   check, timeouts, algorithm). Leave `discovery` empty (static). Or let the controller create a
@@ -605,7 +607,7 @@ Validate a config before rolling it out (the image runs the controller binary):
 ```sh
 helm template pingap-k8s charts/pingap-k8s -f values.yaml --show-only templates/configmap.yaml \
   | yq '.data["config.toml"]' > config.toml
-docker run --rm -v "$PWD/config.toml:/config.toml:ro" ghcr.io/mehdyhaghy/pingap-k8s:0.1.0 \
+docker run --rm -v "$PWD/config.toml:/config.toml:ro" ghcr.io/mehdyhaghy/pingap-k8s:0.16.10 \
   --check --config /config.toml
 ```
 
@@ -640,7 +642,7 @@ Install the plugin from the [release assets](https://github.com/mehdyhaghy/pinga
 the manifest attached to the release:
 
 ```sh
-kubectl krew install --manifest-url=https://github.com/mehdyhaghy/pingap-k8s/releases/download/v0.1.0/pingap.yaml
+kubectl krew install --manifest-url=https://github.com/mehdyhaghy/pingap-k8s/releases/download/v0.16.10/pingap.yaml
 ```
 
 ```sh
@@ -650,7 +652,7 @@ kubectl pingap admin -n pingap-k8s           # port-forward the quickstart admin
 ```
 
 ```text
-controller pingap-k8s-6d4f9c7b8-x2kqp (leader) v0.1.0, phase running, ready yes, etcd prefix /pingap, watchers 2/2 synced
+controller pingap-k8s-6d4f9c7b8-x2kqp (leader) v0.16.10, phase running, ready yes, etcd prefix /pingap, watchers 2/2 synced
 UPSTREAM  TARGET   SERVICES                      READY  DRAINING  IN SYNC  LAST WRITE  NOTES
 api       pods     api.prod:http                 2      0         yes      ok 12s ago
 web       service  web.prod:80 9,gone.prod:80 1  0      0         no       -           no endpoints, 1 warning
@@ -840,17 +842,25 @@ Apache-2.0, the same license as Pingap. See [LICENSE](LICENSE).
 
 ## Releasing
 
-1. Bump the version in three places to the same value (for example `0.2.0`): `version` in
-   `Cargo.toml`, and `version` and `appVersion` in `charts/pingap-k8s/Chart.yaml`. Run
-   `cargo check` to update `Cargo.lock`, then `make manifests` and `make check`.
+Versions follow Pingap: a release is the Pingap version it is tested with plus one more digit,
+our own release number for that Pingap version. Releases tested with Pingap 0.16.1 are `0.16.10`,
+`0.16.11`, ... up to `0.16.19`; the first release for Pingap 0.16.2 is `0.16.20`. The Pingap
+version is `pingap.image.tag` in the chart values (the quickstart default). `make version-check`
+(part of `make check` and CI) checks this.
+
+1. Bump the version in three places to the same value (for example `0.16.11`): `version` in
+   `Cargo.toml`, and `version` and `appVersion` in `charts/pingap-k8s/Chart.yaml`. For a new
+   Pingap version, also set `pingap.image.tag` in `charts/pingap-k8s/values.yaml` and start again
+   at digit 0. Run `cargo check` to update `Cargo.lock`, then `make manifests` and `make check`.
 2. Commit, merge to `main`, then tag and push the tag:
 
    ```sh
-   git tag -a v0.2.0 -m "v0.2.0"
-   git push origin v0.2.0
+   git tag -a v0.16.11 -m "v0.16.11"
+   git push origin v0.16.11
    ```
 
-The `release` workflow fails if the tag does not match both files. Otherwise it runs the CI checks,
+The `release` workflow fails if the tag does not match both files or the version does not follow
+the Pingap version. Otherwise it runs the CI checks,
 pushes the `linux/amd64` + `linux/arm64` image to `ghcr.io/mehdyhaghy/pingap-k8s:<version>` and
 `:latest` (with SBOM and provenance attestations), pushes the chart to
 `oci://ghcr.io/mehdyhaghy/charts/pingap-k8s`, and creates a GitHub Release with generated notes,

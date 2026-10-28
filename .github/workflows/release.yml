@@ -41,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: tag, Cargo.toml and Chart.yaml agree
+      - name: tag, Cargo.toml, Chart.yaml and the Pingap version agree
         id: versions
         env:
           EVENT: ${{ github.event_name }}
@@ -50,20 +50,9 @@ jobs:
           DRY_RUN: ${{ inputs.dry-run }}
         run: |
           set -euo pipefail
-          cargo_version=$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p && /^version *=/{gsub(/"/,"",$3); print $3; exit}' Cargo.toml)
-          chart_version=$(sed -n 's/^version: *//p' "$CHART/Chart.yaml" | tr -d '"'"'"' ')
-          app_version=$(sed -n 's/^appVersion: *//p' "$CHART/Chart.yaml" | tr -d '"'"'"' ')
-          echo "Cargo.toml version:   $cargo_version"
-          echo "Chart.yaml version:   $chart_version"
-          echo "Chart.yaml appVersion: $app_version"
           fail=0
-          if [ -z "$cargo_version" ]; then echo "::error::no version in Cargo.toml [package]"; fail=1; fi
-          if [ "$chart_version" != "$cargo_version" ]; then
-            echo "::error file=$CHART/Chart.yaml::version $chart_version does not match Cargo.toml $cargo_version"; fail=1
-          fi
-          if [ "$app_version" != "$cargo_version" ]; then
-            echo "::error file=$CHART/Chart.yaml::appVersion $app_version does not match Cargo.toml $cargo_version"; fail=1
-          fi
+          cargo_version=$(scripts/check-version.sh) || fail=1
+          echo "version: $cargo_version"
 
           publish=false
           if [ "$REF_TYPE" = "tag" ]; then

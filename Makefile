@@ -5,7 +5,7 @@ NAMESPACE   ?= pingap-k8s
 IMAGE       ?= pingap-k8s:dev
 PLATFORMS   ?= linux/amd64,linux/arm64
 
-.PHONY: all fmt fmt-check clippy test check helm-lint helm-template exposure-check manifests manifests-check docker docker-multiarch
+.PHONY: all fmt fmt-check clippy test check helm-lint helm-template exposure-check version-check manifests manifests-check docker docker-multiarch
 
 all: check
 
@@ -21,7 +21,7 @@ clippy:
 test:
 	cargo test --locked
 
-check: fmt-check clippy test helm-lint helm-template exposure-check manifests-check
+check: fmt-check clippy test helm-lint helm-template exposure-check version-check manifests-check
 
 # Lint the chart with the default values and with each ci/*-values.yaml.
 helm-lint:
@@ -52,6 +52,11 @@ exposure-check:
 			echo "cluster-wide RBAC rendered ($${f:-default values})" >&2; exit 1; \
 		fi; \
 	done; echo "exposure-check: ok"
+
+# The version is the Pingap version in the chart values plus one release digit
+# (Pingap 0.16.1: 0.16.10 to 0.16.19), the same in Cargo.toml and Chart.yaml.
+version-check:
+	@echo "version-check: $$(scripts/check-version.sh)"
 
 # Regenerate the plain manifests from the chart with the default values.
 manifests:

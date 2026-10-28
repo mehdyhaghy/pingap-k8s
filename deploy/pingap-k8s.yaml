@@ -13,8 +13,8 @@ metadata:
   name: pingap-k8s
   namespace: pingap-k8s
   labels:
-    helm.sh/chart: pingap-k8s-0.1.0
-    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: pingap-k8s-0.16.10
+    app.kubernetes.io/version: "0.16.10"
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/part-of: pingap-k8s
     app.kubernetes.io/name: pingap-k8s
@@ -36,8 +36,8 @@ metadata:
   name: pingap-k8s
   namespace: pingap-k8s
   labels:
-    helm.sh/chart: pingap-k8s-0.1.0
-    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: pingap-k8s-0.16.10
+    app.kubernetes.io/version: "0.16.10"
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/part-of: pingap-k8s
     app.kubernetes.io/name: pingap-k8s
@@ -52,8 +52,8 @@ metadata:
   name: pingap-k8s-config
   namespace: pingap-k8s
   labels:
-    helm.sh/chart: pingap-k8s-0.1.0
-    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: pingap-k8s-0.16.10
+    app.kubernetes.io/version: "0.16.10"
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/part-of: pingap-k8s
     app.kubernetes.io/name: pingap-k8s
@@ -89,8 +89,8 @@ metadata:
   name: pingap-k8s
   namespace: pingap-k8s
   labels:
-    helm.sh/chart: pingap-k8s-0.1.0
-    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: pingap-k8s-0.16.10
+    app.kubernetes.io/version: "0.16.10"
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/part-of: pingap-k8s
     app.kubernetes.io/name: pingap-k8s
@@ -112,8 +112,8 @@ metadata:
   name: pingap-k8s
   namespace: pingap-k8s
   labels:
-    helm.sh/chart: pingap-k8s-0.1.0
-    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: pingap-k8s-0.16.10
+    app.kubernetes.io/version: "0.16.10"
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/part-of: pingap-k8s
     app.kubernetes.io/name: pingap-k8s
@@ -136,8 +136,8 @@ metadata:
   name: pingap-k8s-metrics
   namespace: pingap-k8s
   labels:
-    helm.sh/chart: pingap-k8s-0.1.0
-    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: pingap-k8s-0.16.10
+    app.kubernetes.io/version: "0.16.10"
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/part-of: pingap-k8s
     app.kubernetes.io/name: pingap-k8s
@@ -163,8 +163,8 @@ metadata:
   name: pingap-k8s
   namespace: pingap-k8s
   labels:
-    helm.sh/chart: pingap-k8s-0.1.0
-    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: pingap-k8s-0.16.10
+    app.kubernetes.io/version: "0.16.10"
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/part-of: pingap-k8s
     app.kubernetes.io/name: pingap-k8s
@@ -203,7 +203,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: controller
-          image: ghcr.io/mehdyhaghy/pingap-k8s:0.1.0
+          image: ghcr.io/mehdyhaghy/pingap-k8s:0.16.10
           imagePullPolicy: IfNotPresent
           args:
             - --config

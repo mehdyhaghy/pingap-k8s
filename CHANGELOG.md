@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Version 0.16.10. Versions now follow Pingap: the Pingap version the release is tested with plus
+one digit for our own releases (Pingap 0.16.1: 0.16.10 to 0.16.19). `make version-check` and the
+release workflow enforce it.
+
 Security:
 - The quickstart Pingap gets a NetworkPolicy (on by default): only the proxy port is open to other
   pods, and the admin port is closed except to `pingap.networkPolicy.adminFrom`. Port-forward
