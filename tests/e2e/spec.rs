@@ -1554,8 +1554,8 @@ async fn e2e_08_etcd_outage() {
 
 /// E2E test 9: during a rolling restart of echo (several controller writes), the
 /// "echo" upstream's health check is changed through Pingap's admin API the way its UI
-/// saves (load the config, POST the whole entry). After the rollout the stored entry has
-/// both the new health check and the current pods.
+/// saves (load the config, POST the whole entry). After the rollout and one more pod the
+/// stored entry has both the new health check and the current pods.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_09_admin_health_check_edit() {
     const T: &str = "e2e_09";
@@ -1595,7 +1595,10 @@ async fn e2e_09_admin_health_check_edit() {
             )
             .await
             .unwrap();
-            let ips = wait_converged(&env, CONVERGE).await.unwrap();
+            // With cached images and an instant first readiness probe, the whole rollout
+            // can fit in one debounce window, so the edit may come after the last write
+            // of the rollout. One more pod makes sure the controller writes after it.
+            let ips = scale_echo(&env, ECHO_REPLICAS + 1).await.unwrap();
             let changes = watch.changes();
             let before = changes.iter().filter(|c| c.at < t_edit).count() - 1;
             let after = changes.iter().filter(|c| c.at >= t_edit).count();
@@ -1620,8 +1623,8 @@ async fn e2e_09_admin_health_check_edit() {
                 admin.get("health_check").and_then(Value::as_str),
                 Some(HEALTH_CHECK)
             );
-            // wait_converged above: the stored addrs were the current pods.
-            assert_eq!(ips.len(), ECHO_REPLICAS as usize);
+            // scale_echo above: the stored addrs were the current pods.
+            assert_eq!(ips.len(), ECHO_REPLICAS as usize + 1);
         },
         async {
             admin_set_health_check(&env, &env.upstream, None).await?;
