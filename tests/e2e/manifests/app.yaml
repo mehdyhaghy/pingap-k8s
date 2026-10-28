@@ -109,6 +109,22 @@ spec:
       port: 8090
       targetPort: ws
 ---
+# The echo pods again, for the "service" target upstream of e2e test 18, which deletes
+# and recreates this Service (a new ClusterIP under the same name).
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-svc
+  namespace: e2e-app
+spec:
+  type: ClusterIP
+  selector:
+    app: echo
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:

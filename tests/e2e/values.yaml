@@ -50,7 +50,10 @@ pingap:
   seed:
     enabled: true
     # Listener 8080: "/ws" goes to the WebSocket port of the echo pods, "/sse" to
-    # the httpbin pods, everything else to the echo HTTP port.
+    # the httpbin pods, everything else to the echo HTTP port. E2E tests 15 to 18 have
+    # a prefix each, stripped by a rewrite: "/headers-test/" (httpbin, forwarded
+    # headers), "/sticky/" (echo pods with a sticky cookie), "/jwt/" and "/fwd/"
+    # (httpbin behind the jwt and forward_auth plugins), "/svc/" (target = "service").
     # Listener 8081: HTTP/2 without TLS (h2c, enabled_h2) for gRPC,
     # every path to the podinfo gRPC port over h2c (alpn "H2"), with a gRPC health
     # check. A separate listener, so the HTTP/1 tests on 8080 are unaffected; the
@@ -64,7 +67,7 @@ pingap:
 
       [servers.e2e]
       addr = "[::]:8080"
-      locations = ["echo-ws", "httpbin-sse", "echo"]
+      locations = ["echo-ws", "httpbin-sse", "headers", "sticky", "jwt", "fwd", "svc", "echo"]
 
       [servers.grpc]
       addr = "[::]:8081"
@@ -85,6 +88,50 @@ pingap:
       [locations.grpc]
       upstream = "grpc"
 
+      [locations.headers]
+      upstream = "httpbin"
+      path = "/headers-test/"
+      rewrite = "^/headers-test/(.*)$ /$1"
+      enable_reverse_proxy_headers = true
+      proxy_set_headers = ["X-E2E-Set:on"]
+
+      [locations.sticky]
+      upstream = "echo-sticky"
+      path = "/sticky/"
+      rewrite = "^/sticky/(.*)$ /$1"
+
+      [locations.jwt]
+      upstream = "httpbin"
+      path = "/jwt/"
+      rewrite = "^/jwt/(.*)$ /$1"
+      plugins = ["e2eJwt"]
+
+      [locations.fwd]
+      upstream = "httpbin"
+      path = "/fwd/"
+      rewrite = "^/fwd/(.*)$ /$1"
+      plugins = ["e2eForwardAuth"]
+
+      [locations.svc]
+      upstream = "echo-svc"
+      path = "/svc/"
+      rewrite = "^/svc/(.*)$ /$1"
+
+      # HS256 with a test-only secret; the tokens are in tests/e2e/spec.rs.
+      [plugins.e2eJwt]
+      category = "jwt"
+      header = "Authorization"
+      secret = "e2e-jwt-secret"
+      algorithm = "HS256"
+      claims_to_headers = ["sub:X-User"]
+
+      # go-httpbin's /bearer answers 200 to any bearer token and 401 without one.
+      [plugins.e2eForwardAuth]
+      category = "forward_auth"
+      auth_url = "http://httpbin.e2e-app.svc:80/bearer"
+      request_headers = ["Authorization"]
+      timeout = "3s"
+
       [upstreams.echo]
       addrs = ["127.0.0.1:9"]
 
@@ -92,6 +139,14 @@ pingap:
       addrs = ["127.0.0.1:9"]
 
       [upstreams.httpbin]
+      addrs = ["127.0.0.1:9"]
+
+      [upstreams.echo-sticky]
+      addrs = ["127.0.0.1:9"]
+      algo = "sticky:e2e-sticky"
+
+      # E2E test 18 deletes this entry so the controller creates it ("service" target).
+      [upstreams.echo-svc]
       addrs = ["127.0.0.1:9"]
 
       [upstreams.grpc]
@@ -110,3 +165,8 @@ config:
       services: ["httpbin.e2e-app:http"]
     grpc:
       services: ["podinfo.e2e-app:grpc"]
+    echo-sticky:
+      services: ["echo.e2e-app:http"]
+    echo-svc:
+      services: ["echo-svc.e2e-app:http"]
+      target: service

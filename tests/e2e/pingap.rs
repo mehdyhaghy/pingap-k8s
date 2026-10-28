@@ -129,6 +129,53 @@ impl Pingap {
         self.curl(&args, None).await
     }
 
+    /// Sends `n` sequential GETs of `path` with the cookie jar `jar` (a file in the client
+    /// pod, kept between calls, created when missing). One `(status, body)` per request;
+    /// the body is cut to 200 bytes without newlines and spaces, `-` when not a 200.
+    pub async fn get_with_jar(
+        &self,
+        path: &str,
+        jar: &str,
+        n: usize,
+        pause_ms: u32,
+    ) -> anyhow::Result<Vec<(u16, String)>> {
+        let script = format!(
+            "i=0; while [ $i -lt {n} ]; do \
+               code=$(curl -s -m 5 --resolve '{resolve}' -c {jar} -b {jar} -o /tmp/e2e-jar-body -w '%{{http_code}}' '{url}{path}'); \
+               if [ \"$code\" = 200 ]; then h=$(head -c 200 /tmp/e2e-jar-body | tr -d '\\n '); else h=-; fi; \
+               echo \"$code $h\"; i=$((i+1)); sleep {pause}; \
+             done",
+            resolve = self.resolve,
+            url = self.url,
+            pause = f64::from(pause_ms) / 1000.0,
+        );
+        let out = self.run(&script).await?;
+        Ok(out
+            .lines()
+            .filter_map(|l| {
+                let (code, body) = l.trim().split_once(' ')?;
+                Some((code.parse().ok()?, body.to_string()))
+            })
+            .collect())
+    }
+
+    /// Runs `script` with `sh -c` in the client pod and returns its stdout.
+    pub async fn run(&self, script: &str) -> anyhow::Result<String> {
+        let out = self
+            .kubectl
+            .exec(
+                &self.client_namespace,
+                &self.client_pod,
+                None,
+                &["sh", "-c", script],
+            )
+            .await?;
+        if !out.success {
+            anyhow::bail!("script in the client pod failed: {}", out.stderr.trim());
+        }
+        Ok(out.stdout)
+    }
+
     /// The echo pod that served a GET /hostname, or an error with the status.
     pub async fn hostname(&self) -> anyhow::Result<String> {
         let r = self.get("/hostname", &[]).await?;

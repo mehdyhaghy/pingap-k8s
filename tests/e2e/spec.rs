@@ -1,4 +1,4 @@
-//! The end-to-end tests 1–14, one test function each.
+//! The end-to-end tests 1–18, one test function each.
 //!
 //! Every test starts from the same baseline ([`baseline`]: etcd up, both controller
 //! replicas rolled out, echo at 3 replicas with no pod terminating, both upstreams equal to
@@ -20,11 +20,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use futures::FutureExt;
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{Pod, Service};
 use k8s_openapi::api::rbac::v1::Role;
 use k8s_openapi::serde_json::{Value, json};
 use kube::Api;
-use kube::api::{Patch, PatchParams};
+use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
 
 use crate::controller;
 use crate::harness::{Env, wait_for};
@@ -2583,6 +2583,383 @@ async fn e2e_14_events() {
         },
     )
     .await;
+}
+
+// ---------------------------------------------------------------------------------------
+// 15. Request headers reach the pod: the client's, Pingap's forwarded ones, a set one.
+// ---------------------------------------------------------------------------------------
+
+/// The value of request header `name` in a go-httpbin `/anything` answer (header names
+/// compared without case, the first value of a repeated header).
+fn httpbin_header(answer: &Value, name: &str) -> Option<String> {
+    answer["headers"].as_object()?.iter().find_map(|(k, v)| {
+        k.eq_ignore_ascii_case(name).then(|| match v {
+            Value::Array(values) => values.first()?.as_str().map(str::to_string),
+            other => other.as_str().map(str::to_string),
+        })?
+    })
+}
+
+async fn client_pod_ip(env: &Env) -> anyhow::Result<String> {
+    let api: Api<Pod> = Api::namespaced(env.client.clone(), &env.pingap.client_namespace);
+    api.get(&env.pingap.client_pod)
+        .await?
+        .status
+        .and_then(|s| s.pod_ip)
+        .ok_or_else(|| anyhow::anyhow!("client pod has no IP"))
+}
+
+/// The location `/headers-test/` sends to go-httpbin's `/anything` (a rewrite strips the
+/// prefix), with `enable_reverse_proxy_headers` and `proxy_set_headers = ["X-E2E-Set:on"]`.
+/// The app must get the client's own headers as sent, the Host of the request, the
+/// forwarded headers naming the client pod, and the set header.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_15_request_headers() {
+    const T: &str = "e2e_15";
+    let Some(env) = Env::setup("e2e_15_request_headers").await else {
+        return;
+    };
+    let headers = [
+        "X-Custom: abc 123",
+        "Authorization: Bearer token-1",
+        "Cookie: session=s1",
+    ];
+    let r = wait_for(
+        "httpbin behind /headers-test/",
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        || async {
+            let r = env
+                .pingap
+                .get("/headers-test/anything?q=1", &headers)
+                .await?;
+            Ok((r.status == 200).then_some(r))
+        },
+    )
+    .await
+    .unwrap();
+    let answer: Value = k8s_openapi::serde_json::from_str(&r.body).unwrap();
+    println!("[{T}] httpbin saw: {}", answer["headers"]);
+    let h = |name: &str| httpbin_header(&answer, name);
+
+    // The rewrite reached the app, with the query and the client's Host.
+    let host = env
+        .pingap
+        .url
+        .split_once("://")
+        .map_or(env.pingap.url.as_str(), |(_, rest)| rest)
+        .split([':', '/'])
+        .next()
+        .unwrap()
+        .to_string();
+    let url = answer["url"].as_str().unwrap_or_default();
+    assert!(url.contains("/anything?q=1"), "url {url}");
+    assert!(url.contains(&host), "url {url} has no host {host}");
+
+    assert_eq!(h("X-Custom").as_deref(), Some("abc 123"));
+    assert_eq!(h("Authorization").as_deref(), Some("Bearer token-1"));
+    assert_eq!(h("Cookie").as_deref(), Some("session=s1"));
+    assert_eq!(h("X-E2E-Set").as_deref(), Some("on"));
+
+    let client_ip = client_pod_ip(&env).await.unwrap();
+    assert_eq!(h("X-Real-Ip").as_deref(), Some(client_ip.as_str()));
+    assert!(
+        h("X-Forwarded-For").is_some_and(|v| v.contains(&client_ip)),
+        "X-Forwarded-For {:?} without {client_ip}",
+        h("X-Forwarded-For")
+    );
+    assert_eq!(h("X-Forwarded-Proto").as_deref(), Some("http"));
+    assert!(
+        h("X-Forwarded-Host").is_some_and(|v| v.starts_with(&host)),
+        "X-Forwarded-Host {:?}",
+        h("X-Forwarded-Host")
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// 16. Sticky sessions: a client stays on its pod, moves when the pod goes, never fails.
+// ---------------------------------------------------------------------------------------
+
+/// The pods that answered, in order, and whether every request got a 200.
+fn hosts(answers: &[(u16, String)]) -> (Vec<String>, bool) {
+    (
+        answers.iter().map(|(_, h)| h.clone()).collect(),
+        answers.iter().all(|(code, _)| *code == 200),
+    )
+}
+
+/// Upstream `echo-sticky` is the echo pods with `algo = "sticky:e2e-sticky"` (location
+/// `/sticky/`, the rewrite strips the prefix). A client with the cookie keeps its pod;
+/// new clients are spread over the pods; when a client's pod is deleted the client is
+/// moved to another one and sticks there, and no request fails meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_16_sticky_sessions() {
+    const T: &str = "e2e_16";
+    let Some(env) = Env::setup("e2e_16_sticky_sessions").await else {
+        return;
+    };
+    baseline(&env).await;
+    wait_for(
+        "upstream echo-sticky equal to the ready echo pods",
+        CONVERGE,
+        Duration::from_millis(500),
+        || async {
+            let want = with_port(&echo_ready_ips(&env).await?, HTTP_PORT);
+            let have = env.etcd.upstream_addrs("echo-sticky").await?;
+            Ok((have.map(|mut a| {
+                a.sort();
+                a
+            }) == Some(want))
+            .then_some(()))
+        },
+    )
+    .await
+    .unwrap();
+    env.pingap.run("rm -f /tmp/e2e-sticky-*").await.unwrap();
+
+    // Each client sticks; new clients get different pods.
+    let mut firsts = BTreeSet::new();
+    for c in 0..6 {
+        let jar = format!("/tmp/e2e-sticky-{c}");
+        let (seen, ok) = hosts(
+            &env.pingap
+                .get_with_jar("/sticky/hostname", &jar, 10, 0)
+                .await
+                .unwrap(),
+        );
+        println!("[{T}] client {c}: {seen:?}");
+        assert!(ok, "client {c} had a failed request: {seen:?}");
+        assert!(
+            seen.iter().all(|h| h == &seen[0]),
+            "client {c} moved: {seen:?}"
+        );
+        firsts.insert(seen[0].clone());
+    }
+    assert!(
+        firsts.len() >= 2,
+        "every new client got the same pod: {firsts:?}"
+    );
+    let jar_file = env.pingap.run("cat /tmp/e2e-sticky-0").await.unwrap();
+    assert!(
+        jar_file.contains("e2e-sticky"),
+        "no sticky cookie in the jar:\n{jar_file}"
+    );
+
+    // Delete client 0's pod while it keeps sending requests.
+    let (seen, _) = hosts(
+        &env.pingap
+            .get_with_jar("/sticky/hostname", "/tmp/e2e-sticky-0", 1, 0)
+            .await
+            .unwrap(),
+    );
+    let pinned = seen[0].clone();
+    let client = {
+        let env = env.clone();
+        tokio::spawn(async move {
+            env.pingap
+                .get_with_jar("/sticky/hostname", "/tmp/e2e-sticky-0", 150, 150)
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    k8s::delete_pod(&env.client, &env.app_namespace, &pinned, None)
+        .await
+        .unwrap();
+    let (during, ok) = hosts(&client.await.unwrap().unwrap());
+    let moved_to: BTreeSet<&String> = during.iter().filter(|h| **h != pinned).collect();
+    println!(
+        "[{T}] pinned to {pinned}; {} requests while it was deleted, {} on it, then {moved_to:?}",
+        during.len(),
+        during.iter().filter(|h| **h == pinned).count()
+    );
+    assert!(
+        ok,
+        "a request failed while the pinned pod went away: {during:?}"
+    );
+    let tail = &during[during.len() - 20..];
+    assert!(
+        tail.iter().all(|h| h == &tail[0]) && tail[0] != pinned,
+        "the client did not settle on a new pod: {tail:?}"
+    );
+    baseline(&env).await;
+}
+
+// ---------------------------------------------------------------------------------------
+// 17. Authentication plugins: jwt and forward_auth in front of the pods.
+// ---------------------------------------------------------------------------------------
+
+/// HS256 tokens for the `e2eJwt` plugin (secret "e2e-jwt-secret", tests/e2e/values.yaml),
+/// claim `sub` = "e2e-user": valid until 2100, expired in 2000, and one signed with
+/// another key.
+const JWT_VALID: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJlMmUtdXNlciIsImV4cCI6NDEwMjQ0NDgwMH0.Mh4yLqR1bhz5DiB3L-Ag4pqvaOuXitxftlXdBmVeaS0";
+const JWT_EXPIRED: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJlMmUtdXNlciIsImV4cCI6OTQ2Njg0ODAwfQ.GO0slj1yTT27ihiJA0Ndl3jVOzhy3mQlCyWtNIvbmdE";
+const JWT_WRONG_KEY: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJlMmUtdXNlciIsImV4cCI6NDEwMjQ0NDgwMH0.x4lXImPNRw-Xm64eHlf3ldpV9i67kkiQn2mxyIxspMQ";
+
+/// `/jwt/` is go-httpbin behind the `jwt` plugin (the `sub` claim goes to the app as
+/// `X-User`); `/fwd/` is go-httpbin behind `forward_auth`, asking go-httpbin's `/bearer`
+/// (200 with any bearer token, 401 without). Only authenticated requests reach the app.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_17_auth_plugins() {
+    const T: &str = "e2e_17";
+    let Some(env) = Env::setup("e2e_17_auth_plugins").await else {
+        return;
+    };
+    let bearer = |t: &str| format!("Authorization: Bearer {t}");
+    let valid = bearer(JWT_VALID);
+    let r = wait_for(
+        "httpbin behind /jwt/ with a valid token",
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        || async {
+            let r = env.pingap.get("/jwt/anything", &[valid.as_str()]).await?;
+            Ok((r.status == 200).then_some(r))
+        },
+    )
+    .await
+    .unwrap();
+    let answer: Value = k8s_openapi::serde_json::from_str(&r.body).unwrap();
+    assert_eq!(
+        httpbin_header(&answer, "X-User").as_deref(),
+        Some("e2e-user"),
+        "{}",
+        answer["headers"]
+    );
+    for (what, headers) in [
+        ("no token", vec![]),
+        ("expired token", vec![bearer(JWT_EXPIRED)]),
+        ("token signed with another key", vec![bearer(JWT_WRONG_KEY)]),
+        ("not a JWT", vec![bearer("abc")]),
+    ] {
+        let headers: Vec<&str> = headers.iter().map(String::as_str).collect();
+        let r = env.pingap.get("/jwt/anything", &headers).await.unwrap();
+        println!("[{T}] jwt, {what}: {}", r.status);
+        assert_eq!(r.status, 401, "jwt, {what}: {} {}", r.status, r.body);
+    }
+    // A client cannot set the claim header itself.
+    let r = env
+        .pingap
+        .get("/jwt/anything", &[valid.as_str(), "X-User: admin"])
+        .await
+        .unwrap();
+    let answer: Value = k8s_openapi::serde_json::from_str(&r.body).unwrap();
+    assert_eq!(
+        httpbin_header(&answer, "X-User").as_deref(),
+        Some("e2e-user")
+    );
+
+    let r = env.pingap.get("/fwd/anything", &[]).await.unwrap();
+    println!("[{T}] forward_auth, no token: {}", r.status);
+    assert_eq!(r.status, 401, "forward_auth without a token: {}", r.body);
+    let r = env
+        .pingap
+        .get("/fwd/anything", &["Authorization: Bearer abc"])
+        .await
+        .unwrap();
+    println!("[{T}] forward_auth, bearer token: {}", r.status);
+    assert_eq!(r.status, 200, "forward_auth with a token: {}", r.body);
+    let answer: Value = k8s_openapi::serde_json::from_str(&r.body).unwrap();
+    assert_eq!(
+        httpbin_header(&answer, "Authorization").as_deref(),
+        Some("Bearer abc")
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// 18. target = "service": a recreated Service (new ClusterIP) is followed without errors.
+// ---------------------------------------------------------------------------------------
+
+const SVC_UPSTREAM: &str = "echo-svc";
+const SVC_NAME: &str = "echo-svc";
+
+/// Deletes Service `echo-svc` and creates it again without its ClusterIP, so it gets a
+/// new one. Returns (old, new) ClusterIP.
+async fn recreate_service(env: &Env) -> anyhow::Result<(String, String)> {
+    let api: Api<Service> = Api::namespaced(env.client.clone(), &env.app_namespace);
+    let mut svc = api.get(SVC_NAME).await?;
+    let spec = svc
+        .spec
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("no spec"))?;
+    let old = spec.cluster_ip.take().unwrap_or_default();
+    spec.cluster_ips = None;
+    svc.metadata = kube::api::ObjectMeta {
+        name: svc.metadata.name.take(),
+        namespace: svc.metadata.namespace.take(),
+        labels: svc.metadata.labels.take(),
+        ..Default::default()
+    };
+    svc.status = None;
+    api.delete(SVC_NAME, &DeleteParams::default()).await?;
+    wait_for(
+        "the old Service gone",
+        Duration::from_secs(60),
+        Duration::from_millis(200),
+        || async { Ok(api.get_opt(SVC_NAME).await?.is_none().then_some(())) },
+    )
+    .await?;
+    let created = api.create(&PostParams::default(), &svc).await?;
+    let new = created.spec.and_then(|s| s.cluster_ip).unwrap_or_default();
+    Ok((old, new))
+}
+
+/// Upstream `echo-svc` has `target = "service"` (location `/svc/`). The test deletes its
+/// stored entry, so the controller creates it: with the Service name and
+/// `update_frequency = "5s"`. Then Service `echo-svc` is deleted and created again (a new
+/// ClusterIP under the same name, so nothing for the controller to write): requests must
+/// keep working, because Pingap looks the name up again within 5 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_18_service_target_recreated() {
+    const T: &str = "e2e_18";
+    let Some(env) = Env::setup("e2e_18_service_target_recreated").await else {
+        return;
+    };
+    baseline(&env).await;
+    let key = env.etcd.upstream_key(SVC_UPSTREAM);
+    env.etcd.delete(&key).await.unwrap();
+    let entry = wait_for(
+        "the controller recreated upstream echo-svc",
+        CONVERGE,
+        Duration::from_millis(250),
+        || async {
+            Ok(env
+                .etcd
+                .get(&key)
+                .await?
+                .filter(|kv| kv.value.contains("echo-svc.e2e-app.svc"))
+                .map(|kv| kv.value))
+        },
+    )
+    .await
+    .unwrap();
+    println!("[{T}] created entry:\n{entry}");
+    assert!(entry.contains(r#"update_frequency = "5s""#), "{entry}");
+    assert!(
+        entry.contains(r#""echo-svc.e2e-app.svc.cluster.local:80""#),
+        "{entry}"
+    );
+    wait_for(
+        "requests through /svc/",
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+        || async { Ok((env.pingap.get("/svc/hostname", &[]).await?.status == 200).then_some(())) },
+    )
+    .await
+    .unwrap();
+
+    let traffic = Traffic::start(&env, "/svc/hostname", Duration::from_secs(90)).unwrap();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let (old, new) = recreate_service(&env).await.unwrap();
+    println!("[{T}] Service {SVC_NAME} recreated: ClusterIP {old} -> {new}");
+    assert_ne!(old, new);
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    let hits = traffic.stop();
+    let failed = track::failures(&hits);
+    println!("[{T}] {} requests, {} failed", hits.len(), failed.len());
+    assert!(hits.len() > 100, "too few requests: {}", hits.len());
+    assert!(
+        failed.is_empty(),
+        "requests failed after the recreate: {failed:?}"
+    );
 }
 
 #[cfg(test)]
