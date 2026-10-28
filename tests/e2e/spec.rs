@@ -940,10 +940,35 @@ async fn single_replica_fallback(env: &Env) {
     assert!(!ended.is_empty(), "no fallback end logged:\n{new_logs}");
     assert!(!on.is_empty(), "drain_fallback never 1: {gauge:?}");
     assert_eq!(gauge.last().map(|g| g.1), Some(0.0), "{gauge:?}");
+    if !while_serving.is_empty() {
+        print_pingap_logs(env, T).await;
+    }
     assert!(
         while_serving.is_empty(),
         "requests failed while a pod was serving: {while_serving:?}"
     );
+}
+
+/// Prints the last 2 minutes of every Pingap pod's log, to tell why a request failed.
+async fn print_pingap_logs(env: &Env, t: &str) {
+    let release = controller::release(env);
+    let pods = k8s::pods(&env.client, &env.namespace, &k8s::pingap_selector(&release))
+        .await
+        .unwrap_or_default();
+    for p in pods {
+        match env
+            .kubectl
+            .logs(&env.namespace, &p.name, Some("pingap"), Some("2m"))
+            .await
+        {
+            Ok(logs) => {
+                for l in strip_ansi(&logs).lines() {
+                    println!("[{t}] pingap {}: {l}", p.name);
+                }
+            }
+            Err(e) => println!("[{t}] pingap {}: no logs: {e:#}", p.name),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------

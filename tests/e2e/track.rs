@@ -211,7 +211,9 @@ pub struct Hit {
     pub at: SystemTime,
     /// 0: no response (curl error or timeout).
     pub status: u16,
-    /// Response body (the echo pod's name for /hostname) for a 200, else "-".
+    /// Response body (the echo pod's name for /hostname) for a 200, else "-" followed by
+    /// curl's exit code, the request time and Pingap's address, e.g.
+    /// "-curl=52,t=0.004,ip=10.96.0.12".
     pub host: String,
 }
 
@@ -228,8 +230,10 @@ impl Traffic {
         let script = format!(
             "end=$(( $(date +%s) + {secs} )); f=/tmp/e2e-traffic.$$; \
              while [ $(date +%s) -lt $end ]; do \
-               code=$(curl -s -m 5 -o $f -w '%{{http_code}}' '{url}{path}'); \
-               if [ \"$code\" = 200 ]; then h=$(head -c 200 $f | tr -d '\\n '); else h=-; fi; \
+               w=$(curl -s -m 5 -o $f -w '%{{http_code}} %{{time_total}} %{{remote_ip}}' '{url}{path}'); \
+               rc=$?; code=${{w%% *}}; \
+               if [ \"$code\" = 200 ]; then h=$(head -c 200 $f | tr -d '\\n '); \
+               else h=\"-curl=$rc,t=$(echo $w | cut -d' ' -f2),ip=$(echo $w | cut -d' ' -f3)\"; fi; \
                echo \"$code $h\"; \
              done; rm -f $f",
             secs = max.as_secs().max(1),
