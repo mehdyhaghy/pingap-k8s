@@ -1,4 +1,4 @@
-//! e2e "Integration", tests 1–14, one test function each.
+//! The end-to-end tests 1–14, one test function each.
 //!
 //! Every test starts from the same baseline ([`baseline`]: etcd up, both controller
 //! replicas rolled out, echo at 3 replicas with no pod terminating, both upstreams equal to
@@ -42,16 +42,16 @@ const PRESTOP: Duration = Duration::from_secs(10);
 /// A rollout of 3 echo pods takes about 40 s (preStop 10 s per pod).
 const ROLLOUT: Duration = Duration::from_secs(240);
 const CONVERGE: Duration = Duration::from_secs(30);
-/// the design notes default debounce_max (tests/e2e/values.yaml keeps the chart default).
+/// The default debounce_max (tests/e2e/values.yaml keeps the chart default).
 const DEBOUNCE_MAX: f64 = 2.0;
-/// e2e tests 1 and 2.
+/// E2E tests 1 and 2.
 const SYNC_BUDGET: f64 = 3.0;
 /// Leader lease TTL (src/leader.rs DEFAULT_TTL).
 const LEASE_TTL: f64 = 10.0;
 /// Slack on top of the lease TTL for test 7: keep-alive interval (ttl/5 = 2 s) plus the
 /// 200 ms metrics poll.
 const LEASE_SLACK: f64 = 3.0;
-/// The health check the admin tests set (e2e tests 9 and 10).
+/// The health check the admin tests set.
 const HEALTH_CHECK: &str =
     "http://echo/hostname?connection_timeout=2s&read_timeout=2s&check_frequency=5s";
 /// TEST-NET-1 address used as the unreachable backend of test 3; the kind node drops
@@ -356,7 +356,7 @@ fn print_swaps(test: &str, label: &str, swaps: &[Swap]) {
 // 1. A 3-replica echo Deployment: all pod IPs are in Pingap within 3 s of Ready.
 // ---------------------------------------------------------------------------------------
 
-/// e2e test 1. The echo pods already exist when the environment comes up (before the
+/// E2E test 1. The echo pods already exist when the environment comes up (before the
 /// controller), so the test replaces all three with a rollout restart and measures, for
 /// the 3 new pods, the time from Ready to their IPs being in etcd: per pod, and for "all
 /// three" from the last pod's Ready (both as first seen by the pod poll and from its
@@ -441,7 +441,7 @@ async fn e2e_01_initial_sync() {
 // 2. Scale to 5: the new pods get traffic within 3 s.
 // ---------------------------------------------------------------------------------------
 
-/// e2e test 2: time from each new pod's Ready to the first request Pingap sends it
+/// E2E test 2: time from each new pod's Ready to the first request Pingap sends it
 /// (a request loop through Pingap, attributed by the hostname the echo pod returns).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_02_scale_up_traffic() {
@@ -669,7 +669,7 @@ async fn blackhole_off(env: &Env, original: String) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// e2e test 3. fortio at `E2E_LOAD_QPS` (default 200) for 60 s with 8 connections
+/// E2E test 3. fortio at `E2E_LOAD_QPS` (default 200) for 60 s with 8 connections
 /// while echo does a rolling restart: zero 5xx and zero socket errors from fortio, and
 /// zero 5xx from the request loop that runs alongside (which also measures the swap
 /// delay per pod). Then the same with an unreachable backend in the
@@ -715,7 +715,7 @@ async fn e2e_03_rolling_restart_under_load() {
     // second witness: any 5xx from it fails the test. Requests it got no answer for
     // within 5 s (status 0) are reported, not asserted: they were seen only in runs where
     // the host was overloaded (the loop managed 3-12k requests instead of about 20k)
-    // while fortio, the load generator e2e names, had none.
+    // while fortio, the load generator, had none.
     let server_errors: Vec<_> = failed.iter().filter(|h| h.status >= 500).collect();
     assert!(
         server_errors.is_empty(),
@@ -757,9 +757,9 @@ async fn e2e_03_rolling_restart_under_load() {
 // 4. Single-replica restart: fallback logged, requests fail only while no pod serves.
 // ---------------------------------------------------------------------------------------
 
-/// e2e test 4. echo at 1 replica; its pod is deleted (the ReplicaSet starts a new one
+/// E2E test 4. echo at 1 replica; its pod is deleted (the ReplicaSet starts a new one
 /// at once, the old one serves through its 10 s preStop). The draining pod is kept in
-/// `addrs` until the new one is Ready : the leader logs the start and end of the
+/// `addrs` until the new one is Ready: the leader logs the start and end of the
 /// fallback and sets `pingap_k8s_drain_fallback{upstream="echo"}` meanwhile. Requests
 /// may fail only while no pod is serving (old pod gone, new one not Ready yet).
 ///
@@ -987,7 +987,7 @@ async fn ensure_role(env: &Env, role: Role) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// e2e test 5. RBAC is checked per request, so a watch opened before the Role is
+/// E2E test 5. RBAC is checked per request, so a watch opened before the Role is
 /// deleted keeps streaming until it ends by itself (minutes later). The test therefore
 /// deletes the Role and then restarts the controller pods: they come up without read
 /// access, which is the state a broken watch ends in. Then echo is scaled to 4: no
@@ -1153,7 +1153,7 @@ async fn e2e_05_role_deleted() {
 // 6. A WebSocket survives an addrs rewrite and closes only when its own pod terminates.
 // ---------------------------------------------------------------------------------------
 
-/// e2e test 6. A WebSocket through Pingap (port-forward to its Service), echoed every
+/// E2E test 6. A WebSocket through Pingap (port-forward to its Service), echoed every
 /// 500 ms. Its pod is given a high pod-deletion-cost, then echo is scaled 3 -> 4 -> 3
 /// (two rewrites of the "echo-ws" addrs, the scale-down removing another pod). Then its
 /// own pod is deleted: the controller removes it from `addrs` at once, the connection
@@ -1288,7 +1288,7 @@ async fn follower_of(env: &Env, leader: &k8s::PodInfo) -> k8s::PodInfo {
         .expect("a follower")
 }
 
-/// e2e test 7 (a): the leader pod is force-deleted (grace period 0). The kubelet still
+/// E2E test 7 (a): the leader pod is force-deleted (grace period 0). The kubelet still
 /// sends SIGTERM, so the leader resigns and the follower takes over at once. Takeover is
 /// measured from the delete to the follower's `pingap_k8s_is_leader 1`; the budget is the
 /// lease TTL (10 s) plus 3 s for the keep-alive interval and the poll. Then a scale-up
@@ -1334,7 +1334,7 @@ async fn e2e_07_leader_failover() {
     baseline(&env).await;
 }
 
-/// e2e test 7 (b): the leader process is killed with SIGKILL on the node (no
+/// E2E test 7 (b): the leader process is killed with SIGKILL on the node (no
 /// resignation, the lease must expire). The follower must take over within the lease TTL
 /// (10 s) plus 3 s slack.
 ///
@@ -1434,7 +1434,7 @@ async fn e2e_07_leader_failover_sigkill() {
 // 8. Stop etcd for 30 s during a scale-up: the controller converges afterwards.
 // ---------------------------------------------------------------------------------------
 
-/// e2e test 8: the bundled etcd StatefulSet is scaled to 0, echo to 5, and etcd back
+/// E2E test 8: the bundled etcd StatefulSet is scaled to 0, echo to 5, and etcd back
 /// to 1 thirty seconds after it stopped. Meanwhile Pingap keeps serving the old pods.
 /// Measured: time from etcd Ready to both upstreams holding the 5 pods, and to Pingap
 /// sending traffic to all of them.
@@ -1552,7 +1552,7 @@ async fn e2e_08_etcd_outage() {
 // 9. Edit the health check in the Pingap admin while pods churn: the edit survives.
 // ---------------------------------------------------------------------------------------
 
-/// e2e test 9: during a rolling restart of echo (several controller writes), the
+/// E2E test 9: during a rolling restart of echo (several controller writes), the
 /// "echo" upstream's health check is changed through Pingap's admin API the way its UI
 /// saves (load the config, POST the whole entry). After the rollout the stored entry has
 /// both the new health check and the current pods.
@@ -1640,7 +1640,7 @@ async fn e2e_09_admin_health_check_edit() {
 // 10. Save a stale admin form: old addrs corrected within debounce_max + 1 s.
 // ---------------------------------------------------------------------------------------
 
-/// e2e test 10: the "echo" entry is loaded through the admin API (the open form),
+/// E2E test 10: the "echo" entry is loaded through the admin API (the open form),
 /// echo is scaled to 4 (the controller writes 4 addrs), then the stale form is saved with
 /// a health-check edit: Pingap writes the 3 old addrs back. The controller must restore
 /// the 4 addrs within debounce_max + 1 s of that foreign write, keeping the health check.
@@ -1784,7 +1784,7 @@ async fn qs_cleanup(env: &Env) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// e2e test 11: a second release ("qs" in namespace pk8s-qs) installed from scratch
+/// E2E test 11: a second release ("qs" in namespace pk8s-qs) installed from scratch
 /// with charts/pingap-k8s/ci/quickstart-values.yaml as is, plus the locally built
 /// controller image and its one upstream pointed at the echo Service
 /// (`echo.e2e-app:http`). Traffic through the new Pingap must reach the echo pods with
@@ -2068,7 +2068,7 @@ echo "EXIT $?""#;
 /// The SERVING `HealthCheckResponse` in a gRPC frame, as `od -An -tx1` prints it.
 const WATCH_SERVING: &str = "00 00 00 00 02 08 01";
 
-/// e2e test 12. podinfo (3 replicas) serves gRPC behind Pingap's h2c listener
+/// E2E test 12. podinfo (3 replicas) serves gRPC behind Pingap's h2c listener
 /// (upstream `grpc`: alpn H2, gRPC health check). 60 unary `info.InfoService/Info` calls
 /// over one client connection must reach all three pods: HTTP/2 multiplexes the calls on
 /// one connection, so only per-request balancing spreads them. Then, with a
@@ -2292,7 +2292,7 @@ fn sse_events(lines: &[(SystemTime, String)]) -> Vec<(SystemTime, u64)> {
         .collect()
 }
 
-/// e2e test 13. A 30 s server-sent event stream (go-httpbin `/sse`, one event per
+/// E2E test 13. A 30 s server-sent event stream (go-httpbin `/sse`, one event per
 /// second) through Pingap's HTTP listener (location `/sse`, upstream `httpbin`). Five
 /// seconds in, httpbin is scaled 2 -> 3 (the controller rewrites the upstream's `addrs`).
 /// The events must arrive one by one as sent (no gap over [`SSE_MAX_GAP`], first to last
@@ -2502,7 +2502,7 @@ async fn rename_httpbin_port(env: &Env, port_name: &str) -> anyhow::Result<()> {
 
 /// Opt-in Events: breaking the port name of a referenced Service posts one Warning
 /// (`PortNotInService`) on that Service; fixing it posts no further warnings, and the
-/// upstream follows the pods again. The `addrs` stay as they were meanwhile .
+/// upstream follows the pods again. The `addrs` stay as they were meanwhile.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_14_events() {
     const T: &str = "e2e_14";
@@ -2545,7 +2545,7 @@ async fn e2e_14_events() {
                 posted.keys().all(|k| k.starts_with("PortNotInService/")),
                 "{posted:?}"
             );
-            // Kept while broken .
+            // Kept while broken.
             assert_eq!(
                 env.etcd.upstream_addrs(HTTPBIN_UPSTREAM).await.unwrap(),
                 Some(with_port(&ips, HTTPBIN_PORT))

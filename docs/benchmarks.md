@@ -1,6 +1,6 @@
 # Benchmarks
 
-the design notes asks for four numbers at 50 upstreams × 20 endpoints: event-to-write latency,
+The benchmarks measure four numbers at 50 upstreams × 20 endpoints: event-to-write latency,
 etcd write rate during a rollout, controller memory, and Pingap reload CPU per write. This page
 reports what was measured on one laptop, how, and what is estimated rather than measured.
 

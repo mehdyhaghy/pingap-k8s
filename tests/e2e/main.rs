@@ -1,4 +1,4 @@
-//! End-to-end tests on kind (e2e "Integration").
+//! End-to-end tests on kind.
 //!
 //! Gated on `PINGAP_K8S_E2E=1`; otherwise every test prints a skip line and passes, so a
 //! plain `cargo test` stays offline. The environment comes from `scripts/e2e-up.sh`
@@ -31,10 +31,10 @@
 //! (per-pod metrics, leader, logs, config), [`track`] (timestamped etcd watch, request
 //! loop and pod tracker for the timing tests).
 //!
-//! The e2e integration tests 1–14 are in [`spec`] (`spec::e2e_01_initial_sync` ...
+//! The end-to-end tests 1–14 are in [`spec`] (`spec::e2e_01_initial_sync` ...
 //! `spec::e2e_14_events`); filter with e.g. `scripts/e2e-run.sh e2e_04`.
 
-// Helpers are shared with the e2e tests (T12); not every one is used by every test.
+// Helpers are shared with the tests in [`spec`]; not every one is used by every test.
 #![allow(dead_code)]
 
 mod controller;

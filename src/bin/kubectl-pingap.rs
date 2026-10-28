@@ -528,7 +528,7 @@ fn diagnose(doc: &StatusDoc, u: &UpstreamStatus) -> Vec<String> {
         );
     } else if u.no_endpoints {
         out.push(
-            "no ready endpoints now: the last addrs stay in etcd  until a pod is ready; \
+            "no ready endpoints now: the last addrs stay in etcd until a pod is ready; \
              check the pods behind the Services and their readiness probes"
                 .into(),
         );

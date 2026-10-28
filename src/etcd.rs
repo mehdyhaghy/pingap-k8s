@@ -72,7 +72,7 @@ pub enum EtcdError {
     #[error("upstreams.{0}.addrs is not a list of strings")]
     InvalidAddrs(String),
     /// Pingap rejects an upstream without addresses; the controller keeps the last
-    /// `addrs` instead , so an empty list is never written.
+    /// `addrs` instead, so an empty list is never written.
     #[error("refusing to write an empty addrs list for upstream {0}")]
     EmptyAddrs(String),
     #[error("value of etcd key {0} is not UTF-8")]
@@ -554,7 +554,7 @@ fn rewrite_array(array: &mut Array, addrs: &[String]) {
     }
 }
 
-/// The entry written when an owned upstream key does not exist :
+/// The entry written when an owned upstream key does not exist:
 /// `[upstreams.<name>]` with only `addrs`.
 pub fn minimal_upstream(upstream: &str, addrs: &[String]) -> String {
     let mut entry = Table::new();
@@ -657,7 +657,7 @@ impl EtcdWriter {
     }
 
     /// The owned-key watches started after this report etcd reachability
-    /// here (the design notes `etcd_up`): a message from etcd is reachable, a stream
+    /// here: a message from etcd is reachable, a stream
     /// error or a failed reconnect is decided by [`client_error_unreachable`].
     pub fn with_etcd_health(mut self, health: EtcdHealth) -> Self {
         self.health = Some(health);

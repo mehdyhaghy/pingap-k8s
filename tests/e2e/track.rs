@@ -1,4 +1,4 @@
-//! Timestamped observations for the timing tests of e2e: a streamed command's output
+//! Timestamped observations for the timing tests: a streamed command's output
 //! lines, an etcd watch of one upstream's `addrs`, a request loop through Pingap, and a
 //! pod tracker. Every observation carries the wall-clock time it was seen at on the test
 //! host, so delays are differences on one clock. Pod `Ready` transition times from the

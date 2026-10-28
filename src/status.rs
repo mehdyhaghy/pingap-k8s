@@ -101,9 +101,9 @@ pub struct UpstreamStatus {
     pub pending: bool,
     pub ready: usize,
     pub draining: usize,
-    /// Only draining endpoints are written .
+    /// Only draining endpoints are written.
     pub fallback: bool,
-    /// The last resolve gave no endpoints; the last `addrs` are kept .
+    /// The last resolve gave no endpoints; the last `addrs` are kept.
     pub no_endpoints: bool,
     /// The stored entry cannot be edited.
     pub malformed: bool,

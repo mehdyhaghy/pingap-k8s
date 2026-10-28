@@ -60,7 +60,7 @@
 //! from etcd (including a malformed entry, a conflict or permission denied)
 //! is reachable, a transport error or timeout is not.
 //!
-//! Kubernetes Events ([`Reconciler::with_events`], the design notes): only the
+//! Kubernetes Events ([`Reconciler::with_events`]): only the
 //! leader posts, with the same once-per-episode dedupe as the logs: a
 //! resolve warning when it first appears (on the Service), the drain
 //! fallback on enter and exit (on each Service of the upstream), a malformed
@@ -68,7 +68,7 @@
 //! leader posts the warnings and fallbacks already open, so an episode that
 //! started while it was a follower is reported once.
 //!
-//! Startup : the caller must wait for the watchers' first list before
+//! Startup: the caller must wait for the watchers' first list before
 //! calling [`Reconciler::run`]; `run` reconciles every upstream right away.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};

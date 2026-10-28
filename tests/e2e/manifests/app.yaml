@@ -4,12 +4,12 @@
 #     * agnhost netexec on 8080 (Service port "http"): GET /hostname returns the pod name;
 #     * jmalloc/echo-server on 8090 (Service port "ws"): a WebSocket upgrade on any path
 #       first sends "Request served by <pod name>", then echoes every message.
-#   preStop sleep as in the design notes, so a terminating pod keeps serving until Pingap has
+#   preStop sleep as in the README, so a terminating pod keeps serving until Pingap has
 #   swapped it out.
-# - podinfo: Deployment + Service for the gRPC test (e2e test 12). Each pod serves gRPC
+# - podinfo: Deployment + Service for the gRPC test. Each pod serves gRPC
 #   on 9999 (Service port "grpc", appProtocol kubernetes.io/h2c): info.InfoService/Info
 #   returns the pod name, grpc.health.v1 answers for the service "podinfo".
-# - httpbin: Deployment + Service for the SSE test (e2e test 13): go-httpbin on 8080
+# - httpbin: Deployment + Service for the SSE test: go-httpbin on 8080
 #   (Service port "http"), GET /sse?count=N&duration=D streams N events over D.
 # - e2e-client: agnhost (has curl with HTTP/2 and sh) for single requests through Pingap.
 # - e2e-load: fortio for load generation (`fortio load ... -json -`).

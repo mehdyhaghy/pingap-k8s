@@ -319,8 +319,8 @@ impl Metrics {
     }
 }
 
-/// The one place that reports etcd reachability (`pingap_k8s_etcd_up`,
-/// the design notes): the gauge holds the result of the most recent etcd interaction
+/// The one place that reports etcd reachability (`pingap_k8s_etcd_up`):
+/// the gauge holds the result of the most recent etcd interaction
 /// of any kind (writes, the owned-key watch, the election's lease grant,
 /// keep-alives and campaign), so a follower shows 0 while etcd is down too.
 /// `reachable` is true whenever etcd answered, even with an error (a

@@ -92,7 +92,7 @@ pub enum WriteOutcome {
     Unchanged,
     /// The key existed and `addrs` was replaced.
     Updated { revision: i64 },
-    /// The key did not exist; a minimal upstream was created .
+    /// The key did not exist; a minimal upstream was created.
     Created { revision: i64 },
 }
 

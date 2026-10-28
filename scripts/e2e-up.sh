@@ -114,7 +114,7 @@ kubectl -n "$NS" create secret generic "$RELEASE-pingap-admin-e2e" \
 
 log "installing the chart"
 # E2E_PINGAP_TAG overrides the pinned Pingap image tag (CI uses "latest" weekly to
-# catch storage-format changes early, the design notes). It must be a Debian-based tag:
+# catch storage-format changes early). It must be a Debian-based tag:
 # the seed init container needs a shell.
 pingap_tag=()
 if [[ -n "${E2E_PINGAP_TAG:-}" ]]; then

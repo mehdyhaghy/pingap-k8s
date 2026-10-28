@@ -524,7 +524,7 @@ impl WatchRegistry {
     }
 
     /// Per watched Service: whether both watchers have listed once and whether
-    /// both are currently up (for the status endpoint, the design notes).
+    /// both are currently up (for the status endpoint).
     pub fn watch_states(&self) -> Vec<ServiceWatchState> {
         self.inner
             .watches()

@@ -191,7 +191,7 @@ pub async fn wait_no_pods(
     .await
 }
 
-/// Removes a Role and returns it, for [`restore_role`] (e2e test 5).
+/// Removes a Role and returns it, for [`restore_role`].
 pub async fn take_role(client: &Client, ns: &str, name: &str) -> anyhow::Result<Role> {
     let api: Api<Role> = Api::namespaced(client.clone(), ns);
     let role = api.get(name).await?;

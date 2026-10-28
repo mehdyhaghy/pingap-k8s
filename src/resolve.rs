@@ -104,7 +104,7 @@ pub struct Resolved {
     pub warnings: Vec<ResolveWarning>,
 }
 
-/// Endpoint class per the design notes.
+/// Endpoint class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Class {
     Ready,

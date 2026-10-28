@@ -33,7 +33,7 @@ const DEFAULT_CONFIG_PATH: &str = "/etc/pingap-k8s/config/config.toml";
 /// Service-account namespace file mounted into every pod.
 const SA_NAMESPACE_FILE: &str = "/var/run/secrets/kubernetes.io/serviceaccount/namespace";
 /// How long one wait for the first list of all watchers lasts before the
-/// missing ones are logged . The wait itself continues.
+/// missing ones are logged. The wait itself continues.
 const SYNC_WAIT: Duration = Duration::from_secs(30);
 /// Quiet period after a config file event before reloading.
 const FILE_DEBOUNCE: Duration = Duration::from_secs(1);
@@ -311,7 +311,7 @@ async fn kube_client(
     kube::Client::try_from(config).context("creating Kubernetes client")
 }
 
-/// the design notes: API server TLS is always verified, whatever the kubeconfig says.
+/// API server TLS is always verified, whatever the kubeconfig says.
 /// Returns true when verification had been turned off.
 fn enforce_tls_verify(config: &mut kube::Config) -> bool {
     std::mem::replace(&mut config.accept_invalid_certs, false)
@@ -657,7 +657,7 @@ async fn wait_synced_or_reload(
         warn!(
             waited = ?SYNC_WAIT,
             not_synced = %join_keys(&missing),
-            "watchers have not completed their first list; not writing until they have , still waiting"
+            "watchers have not completed their first list; not writing until they have, still waiting"
         );
     }
 }
@@ -808,7 +808,7 @@ impl Controller {
         }
 
         // Start watchers for new Services and wait for their first list before the
-        // reconciler sees upstreams that use them . Old ones keep running until
+        // reconciler sees upstreams that use them. Old ones keep running until
         // the reconciler has switched.
         let new_keys = new.service_keys();
         let union: BTreeSet<ServiceKey> = self

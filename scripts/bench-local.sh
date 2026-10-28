@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Benchmarks of the pingap-k8s release binary (the design notes, Benchmarks) on this machine:
+# Benchmarks of the pingap-k8s release binary on this machine:
 # a local etcd (127.0.0.1 only) + a throwaway kind cluster + optionally the stock
 # Pingap image reading the same etcd with --autoreload.
 #

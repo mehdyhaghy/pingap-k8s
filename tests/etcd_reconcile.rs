@@ -203,7 +203,7 @@ async fn stale_admin_save_is_corrected_and_deleted_key_recreated() {
         1
     );
 
-    // A deleted key is recreated with only addrs .
+    // A deleted key is recreated with only addrs.
     kv.delete(key.as_str(), None).await.unwrap();
     let text = wait_desired(&w, Duration::from_secs(3)).await;
     assert!(!text.contains("health_check"), "{text}");
@@ -234,7 +234,7 @@ async fn wait_addrs(w: &EtcdWriter, want: &[&str], within: Duration) -> String {
     }
 }
 
-/// the design notes: `target = "service"` writes the Service DNS name and port, only
+/// `target = "service"` writes the Service DNS name and port, only
 /// `addrs` is touched (no `discovery`: Pingap treats hostname addrs as DNS
 /// discovery by itself), and switching back to `pods` at runtime works.
 #[tokio::test]

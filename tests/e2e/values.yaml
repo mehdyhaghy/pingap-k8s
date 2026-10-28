@@ -11,7 +11,7 @@ image:
 
 logLevel: "info,pingap_k8s=debug"
 
-# e2e test 14: Kubernetes Events (adds create/patch on events.k8s.io events to the Roles).
+# E2E test 14: Kubernetes Events (adds create/patch on events.k8s.io events to the Roles).
 events:
   enabled: true
 
@@ -42,7 +42,7 @@ pingap:
   networkPolicy:
     # The gRPC listener of e2e test 12.
     extraPorts: [8081]
-    # e2e tests 9 and 10 call the admin API from the client pod.
+    # E2E tests 9 and 10 call the admin API from the client pod.
     adminFrom:
       - namespaceSelector:
           matchLabels:
@@ -50,8 +50,8 @@ pingap:
   seed:
     enabled: true
     # Listener 8080: "/ws" goes to the WebSocket port of the echo pods, "/sse" to
-    # the httpbin pods (e2e test 13), everything else to the echo HTTP port.
-    # Listener 8081 (e2e test 12): HTTP/2 without TLS (h2c, enabled_h2) for gRPC,
+    # the httpbin pods, everything else to the echo HTTP port.
+    # Listener 8081: HTTP/2 without TLS (h2c, enabled_h2) for gRPC,
     # every path to the podinfo gRPC port over h2c (alpn "H2"), with a gRPC health
     # check. A separate listener, so the HTTP/1 tests on 8080 are unaffected; the
     # test reaches it by Pingap pod IP (the chart's Service has one port).

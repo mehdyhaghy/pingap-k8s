@@ -1,4 +1,4 @@
-//! Micro-benchmarks for the CPU-bound parts of a sync (the design notes, Benchmarks):
+//! Micro-benchmarks for the CPU-bound parts of a sync:
 //! `resolve::resolve` and `etcd::replace_addrs` at 50 upstreams x 20 endpoints.
 //!
 //! No benchmark framework: plain `Instant` loops after a warm-up, reporting the
