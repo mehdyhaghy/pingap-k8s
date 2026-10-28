@@ -8,10 +8,10 @@
 # target, so no emulation is needed. The runtime stage only copies the binary.
 
 # Toolchain and Debian release are pinned together with the runtime stage below
-# (trixie), so the binary runs on the glibc it was linked against.
-ARG RUST_VERSION=1.99.1
-
-FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-trixie AS builder
+# (trixie), so the binary runs on the glibc it was linked against. Both base
+# images are pinned by the digest of their multi-arch index as well as by tag;
+# Dependabot (.github/dependabot.yml) proposes updates.
+FROM --platform=$BUILDPLATFORM rust:1.99.1-trixie@sha256:931c2c0531a8b143e044f0f3914dfe802f15bb3d1955f0b657e9359327ac2ffc AS builder
 
 ARG TARGETARCH
 ARG BUILDARCH
@@ -56,7 +56,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 # Runtime: distroless (glibc, CA certificates, no shell, no package manager),
 # running as the unprivileged "nonroot" user (65532).
-FROM gcr.io/distroless/cc-debian13:nonroot
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e
 
 LABEL org.opencontainers.image.title="pingap-k8s" \
       org.opencontainers.image.description="Kubernetes controller for Pingap: syncs Service endpoints into Pingap's etcd config" \

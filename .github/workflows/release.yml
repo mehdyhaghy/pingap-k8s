@@ -4,6 +4,10 @@ name: release
 # chart (OCI) and a GitHub Release with the chart package, plain manifests, the
 # kubectl-pingap plugin (linux/darwin, amd64/arm64, with checksums) and a krew
 # manifest for it. The plugin is not part of the image.
+# The image and the chart are signed with cosign (keyless, Sigstore), and so are
+# the release files (a .sigstore.json bundle next to each). The signer identity is
+# this workflow; Sigstore's public transparency log records it (repository name,
+# workflow path and tag).
 # A manual run defaults to a dry run that builds everything and publishes nothing.
 
 on:
@@ -133,6 +137,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # Keyless signing: the workflow's OIDC token gets the Sigstore certificate.
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -149,6 +155,7 @@ jobs:
       # The builder stage cross-compiles on the runner's platform, so arm64
       # needs no emulation.
       - name: build and push
+        id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -166,6 +173,18 @@ jobs:
           sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        if: needs.verify.outputs.publish == 'true'
+        with:
+          cosign-release: v3.1.4
+
+      # Signs the multi-arch index by digest, so both tags are covered.
+      - name: sign image
+        if: needs.verify.outputs.publish == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "$IMAGE@$DIGEST"
 
   # kubectl plugin, built natively on each platform (protoc is needed by the
   # crate's etcd-client build script even though the plugin does not use it).
@@ -236,6 +255,7 @@ jobs:
     permissions:
       contents: write
       packages: write
+      id-token: write
     env:
       VERSION: ${{ needs.verify.outputs.version }}
       TAG: ${{ needs.verify.outputs.tag }}
@@ -294,7 +314,22 @@ jobs:
           [ "$(grep -c 'sha256: [0-9a-f]\{64\}$' pingap.yaml)" = 4 ] || { echo "::error::expected 4 sha256 lines"; exit 1; }
           ls -l
 
-      - name: push chart to ${{ env.CHART_REPO }}
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        if: env.PUBLISH == 'true'
+        with:
+          cosign-release: v3.1.4
+
+      # One bundle per release file; the checksums file covers the plugin tarballs.
+      - name: sign release files
+        if: env.PUBLISH == 'true'
+        run: |
+          set -euo pipefail
+          cd dist
+          for f in "pingap-k8s-$VERSION.tgz" pingap-k8s.yaml "kubectl-pingap_${VERSION}_checksums.txt" pingap.yaml; do
+            cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
+          done
+
+      - name: push and sign chart in ${{ env.CHART_REPO }}
         if: env.PUBLISH == 'true'
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -302,7 +337,11 @@ jobs:
         run: |
           set -euo pipefail
           echo "$GHCR_TOKEN" | helm registry login ghcr.io --username "$ACTOR" --password-stdin
-          helm push "dist/pingap-k8s-$VERSION.tgz" "$CHART_REPO"
+          helm push "dist/pingap-k8s-$VERSION.tgz" "$CHART_REPO" 2>&1 | tee push.log
+          digest=$(sed -n 's/^Digest: *//p' push.log)
+          [ -n "$digest" ] || { echo "::error::no digest in helm push output"; exit 1; }
+          echo "$GHCR_TOKEN" | cosign login ghcr.io --username "$ACTOR" --password-stdin
+          cosign sign --yes "${CHART_REPO#oci://}/pingap-k8s@$digest"
 
       - name: create GitHub Release
         if: env.PUBLISH == 'true'
@@ -318,7 +357,8 @@ jobs:
             "dist/pingap-k8s.yaml#pingap-k8s.yaml" \
             dist/kubectl-pingap_"$VERSION"_*.tar.gz \
             "dist/kubectl-pingap_${VERSION}_checksums.txt" \
-            "dist/pingap.yaml#pingap.yaml (krew manifest)"
+            "dist/pingap.yaml#pingap.yaml (krew manifest)" \
+            dist/*.sigstore.json
 
       - name: dry run summary
         if: env.PUBLISH != 'true'
@@ -329,6 +369,7 @@ jobs:
             echo "- chart: dist/pingap-k8s-$VERSION.tgz (not pushed to $CHART_REPO)"
             echo "- manifests: dist/pingap-k8s.yaml"
             echo "- kubectl plugin: dist/kubectl-pingap_${VERSION}_*.tar.gz, krew manifest dist/pingap.yaml"
+            echo "- signatures: none (cosign signs only on publish)"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

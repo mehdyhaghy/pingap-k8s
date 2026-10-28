@@ -790,6 +790,22 @@ and pass it with `extraEnv` and `valueFrom.secretKeyRef`, not as a plain value.
 - **Hardened pods**: non-root (UID 65532), read-only root filesystem, no privilege escalation, all
   capabilities dropped, `RuntimeDefault` seccomp, for the controller, the bundled etcd and the
   quickstart Pingap. The controller image is distroless (no shell).
+- **Signed releases**: the image, the chart and every release file are signed with cosign
+  (keyless, Sigstore) by the release workflow, and the base images are pinned by digest. To
+  verify:
+
+  ```sh
+  ID='https://github.com/mehdyhaghy/pingap-k8s/.github/workflows/release.yml@refs/tags/v0.16.10'
+  ISSUER=https://token.actions.githubusercontent.com
+  cosign verify --certificate-identity "$ID" --certificate-oidc-issuer "$ISSUER" \
+    ghcr.io/mehdyhaghy/pingap-k8s:0.16.10
+  cosign verify --certificate-identity "$ID" --certificate-oidc-issuer "$ISSUER" \
+    ghcr.io/mehdyhaghy/charts/pingap-k8s:0.16.10
+  # A release file, with its .sigstore.json bundle from the same release:
+  cosign verify-blob --certificate-identity "$ID" --certificate-oidc-issuer "$ISSUER" \
+    --bundle kubectl-pingap_0.16.10_checksums.txt.sigstore.json kubectl-pingap_0.16.10_checksums.txt
+  sha256sum -c --ignore-missing kubectl-pingap_0.16.10_checksums.txt
+  ```
 
 ## Performance
 
@@ -875,5 +891,8 @@ the Pingap version. Otherwise it runs the CI checks,
 pushes the `linux/amd64` + `linux/arm64` image to `ghcr.io/mehdyhaghy/pingap-k8s:<version>` and
 `:latest` (with SBOM and provenance attestations), pushes the chart to
 `oci://ghcr.io/mehdyhaghy/charts/pingap-k8s`, and creates a GitHub Release with generated notes,
-the chart package and `pingap-k8s.yaml` (plain manifests pinned to the release image). To test the
+the chart package and `pingap-k8s.yaml` (plain manifests pinned to the release image). It signs
+the image, the chart and the release files with cosign keyless signing (see
+[Security](#security)); Sigstore's public transparency log records each signature with the
+repository name, workflow path and tag. To test the
 pipeline without publishing, run the workflow manually with `dry-run` checked (the default).

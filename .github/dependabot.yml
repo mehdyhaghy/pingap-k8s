@@ -1,0 +1,12 @@
+# Weekly update PRs for the pinned base images (Dockerfile, tag and digest) and
+# the GitHub Actions (pinned by commit SHA).
+version: 2
+updates:
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
