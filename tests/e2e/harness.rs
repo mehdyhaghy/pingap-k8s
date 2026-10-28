@@ -13,8 +13,9 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use kube::Client;
+use k8s_openapi::api::core::v1::Service;
 use kube::config::{KubeConfigOptions, Kubeconfig};
+use kube::{Api, Client};
 use tokio::time::Instant;
 
 use crate::etcd::Etcd;
@@ -126,16 +127,26 @@ impl Env {
             state.get("E2E_ETCD_POD")?,
             state.get("E2E_ETCD_PREFIX")?,
         );
+        let pingap_url = state.get("E2E_PINGAP_URL")?.to_string();
+        let pingap_service = state.get("E2E_PINGAP_SERVICE")?.to_string();
+        let pingap_ip = Api::<Service>::namespaced(client.clone(), &namespace)
+            .get(&pingap_service)
+            .await?
+            .spec
+            .and_then(|s| s.cluster_ip)
+            .filter(|ip| !ip.is_empty() && ip != "None")
+            .ok_or_else(|| anyhow::anyhow!("Service {pingap_service} has no ClusterIP"))?;
         let pingap = Pingap {
             kubectl: kubectl.clone(),
             client_namespace: app_namespace.clone(),
             client_pod: state.get("E2E_CLIENT_POD")?.to_string(),
-            url: state.get("E2E_PINGAP_URL")?.to_string(),
+            resolve: crate::pingap::resolve_arg(&pingap_url, &pingap_ip),
+            url: pingap_url,
             admin_url: state.get("E2E_PINGAP_ADMIN_URL")?.to_string(),
             admin_user: state.get("E2E_PINGAP_ADMIN_USER")?.to_string(),
             admin_password: state.get("E2E_PINGAP_ADMIN_PASSWORD")?.to_string(),
             namespace: namespace.clone(),
-            service: state.get("E2E_PINGAP_SERVICE")?.to_string(),
+            service: pingap_service,
             ws_path: state.get("E2E_PINGAP_WS_PATH")?.to_string(),
         };
         let load = Load {
@@ -143,6 +154,7 @@ impl Env {
             namespace: app_namespace.clone(),
             pod: state.get("E2E_LOAD_POD")?.to_string(),
             base_url: pingap.url.clone(),
+            resolve_ip: pingap_ip,
         };
         Ok(Env {
             client,

@@ -21,6 +21,27 @@ pub struct Pingap {
     pub service: String,
     /// Location routed to the WebSocket upstream.
     pub ws_path: String,
+    /// `<host>:<port>:<ClusterIP>` of the proxy URL, for curl's `--resolve`: requests to
+    /// Pingap skip cluster DNS, where a lookup is now and then lost in kind and takes the
+    /// resolver's 5 s timeout (it looked like a failed request through Pingap).
+    pub resolve: String,
+}
+
+/// `<host>:<port>:<ip>` for curl's `--resolve`, from a URL like `http://host:port/...`.
+pub fn resolve_arg(url: &str, ip: &str) -> String {
+    let authority = url
+        .split_once("://")
+        .map_or(url, |(_, rest)| rest)
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    let (host, port) = authority.rsplit_once(':').unwrap_or((authority, "80"));
+    let ip = if ip.contains(':') {
+        format!("[{ip}]")
+    } else {
+        ip.to_string()
+    };
+    format!("{host}:{port}:{ip}")
 }
 
 /// One HTTP response. `status` is 0 when no response arrived (connect error, timeout).
@@ -72,6 +93,8 @@ impl Pingap {
             "5".into(),
             "-w".into(),
             "\n%{http_code}".into(),
+            "--resolve".into(),
+            self.resolve.clone(),
         ];
         cmd.extend_from_slice(args);
         let out = match stdin {
@@ -124,11 +147,12 @@ impl Pingap {
     pub async fn sample(&self, path: &str, n: usize, timeout_secs: u32) -> anyhow::Result<Sample> {
         let script = format!(
             "i=0; while [ $i -lt {n} ]; do \
-               code=$(curl -s -m {timeout_secs} -o /tmp/e2e-body -w '%{{http_code}}' '{url}{path}'); \
+               code=$(curl -s -m {timeout_secs} --resolve '{resolve}' -o /tmp/e2e-body -w '%{{http_code}}' '{url}{path}'); \
                if [ \"$code\" = 200 ]; then h=$(head -c 200 /tmp/e2e-body | tr -d '\\n '); else h=-; fi; \
                echo \"$code $h\"; i=$((i+1)); \
              done",
             url = self.url,
+            resolve = self.resolve,
         );
         let out = self
             .kubectl

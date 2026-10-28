@@ -213,7 +213,8 @@ pub struct Hit {
     pub status: u16,
     /// Response body (the echo pod's name for /hostname) for a 200, else "-" followed by
     /// curl's exit code, the request time and Pingap's address, e.g.
-    /// "-curl=52,t=0.004,ip=10.96.0.12".
+    /// "-curl=52,t=0.004,ip=10.96.0.12,dns=0.001,connect=0.002" (curl's `time_namelookup`
+    /// and `time_connect`; 0 for a step that did not finish).
     pub host: String,
 }
 
@@ -221,6 +222,8 @@ pub struct Hit {
 /// most `max` (the loop ends by itself even if the stream is not stopped). Each request
 /// has a 5 s timeout, the same as the fortio runs ([`crate::load::LoadOptions`]); a
 /// request without a response in that time is recorded with status 0.
+///
+/// curl skips cluster DNS (`--resolve`, see [`crate::pingap::Pingap::resolve`]).
 pub struct Traffic {
     stream: LineStream,
 }
@@ -230,14 +233,16 @@ impl Traffic {
         let script = format!(
             "end=$(( $(date +%s) + {secs} )); f=/tmp/e2e-traffic.$$; \
              while [ $(date +%s) -lt $end ]; do \
-               w=$(curl -s -m 5 -o $f -w '%{{http_code}} %{{time_total}} %{{remote_ip}}' '{url}{path}'); \
+               w=$(curl -s -m 5 --resolve '{resolve}' -o $f -w '%{{http_code}} %{{time_total}} %{{remote_ip}} %{{time_namelookup}} %{{time_connect}}' '{url}{path}'); \
                rc=$?; code=${{w%% *}}; \
                if [ \"$code\" = 200 ]; then h=$(head -c 200 $f | tr -d '\\n '); \
-               else h=\"-curl=$rc,t=$(echo $w | cut -d' ' -f2),ip=$(echo $w | cut -d' ' -f3)\"; fi; \
+               else f2() {{ echo \"$w\" | cut -d' ' -f$1; }}; \
+                 h=\"-curl=$rc,t=$(f2 2),ip=$(f2 3),dns=$(f2 4),connect=$(f2 5)\"; fi; \
                echo \"$code $h\"; \
              done; rm -f $f",
             secs = max.as_secs().max(1),
             url = env.pingap.url,
+            resolve = env.pingap.resolve,
         );
         let stream = LineStream::exec(
             &env.kubectl,

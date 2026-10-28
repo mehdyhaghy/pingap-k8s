@@ -2331,8 +2331,8 @@ async fn e2e_13_sse_stream() {
             .unwrap();
 
             let script = format!(
-                "echo START; curl -sS -N -m 90 '{}/sse?count={SSE_EVENTS}&duration={SSE_SECS}s'; echo \"EXIT $?\"",
-                env.pingap.url
+                "echo START; curl -sS -N -m 90 --resolve '{}' '{}/sse?count={SSE_EVENTS}&duration={SSE_SECS}s'; echo \"EXIT $?\"",
+                env.pingap.resolve, env.pingap.url
             );
             let stream = track::LineStream::exec(
                 &env.kubectl,

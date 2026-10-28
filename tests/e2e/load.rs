@@ -25,6 +25,8 @@ pub struct Load {
     pub pod: String,
     /// Pingap's in-cluster URL; [`LoadOptions::path`] is appended.
     pub base_url: String,
+    /// Pingap's ClusterIP: fortio connects to it without a DNS lookup (`-resolve`).
+    pub resolve_ip: String,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +146,8 @@ impl Load {
             format!("{}ms", o.timeout.as_millis()),
             "-json".into(),
             "-".into(),
+            "-resolve".into(),
+            self.resolve_ip.clone(),
         ];
         a.extend(o.extra_args.iter().cloned());
         a.push(format!("{}{}", self.base_url, o.path));
