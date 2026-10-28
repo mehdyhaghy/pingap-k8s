@@ -554,17 +554,46 @@ fn rewrite_array(array: &mut Array, addrs: &[String]) {
     }
 }
 
+/// How often Pingap re-resolves a hostname in `addrs` (its DNS discovery), set in the
+/// entries the controller creates for `target = "service"`. Pingap's default is 60 s:
+/// a Service deleted and recreated gets a new ClusterIP, the name stays the same (no
+/// write), and Pingap kept the old address for up to a minute (measured on kind: 26 s
+/// of 503s; none with 5 s).
+pub const SERVICE_UPDATE_FREQUENCY: &str = "5s";
+
 /// The entry written when an owned upstream key does not exist:
-/// `[upstreams.<name>]` with only `addrs`.
+/// `[upstreams.<name>]` with `addrs`, plus `update_frequency` when an address is a
+/// hostname ([`SERVICE_UPDATE_FREQUENCY`]).
 pub fn minimal_upstream(upstream: &str, addrs: &[String]) -> String {
     let mut entry = Table::new();
     entry.insert("addrs", toml_edit::value(new_array(addrs)));
+    if addrs.iter().any(|a| is_hostname(a)) {
+        entry.insert(
+            "update_frequency",
+            toml_edit::value(SERVICE_UPDATE_FREQUENCY),
+        );
+    }
     let mut upstreams = Table::new();
     upstreams.set_implicit(true);
     upstreams.insert(upstream, Item::Table(entry));
     let mut doc = DocumentMut::new();
     doc.insert("upstreams", Item::Table(upstreams));
     doc.to_string()
+}
+
+/// Whether the host of an `addrs` entry (`host:port [weight]`, `[v6]:port [weight]`)
+/// is a name rather than an IP address, as Pingap decides between static and DNS
+/// discovery.
+fn is_hostname(addr: &str) -> bool {
+    let host_port = addr.split_whitespace().next().unwrap_or(addr);
+    let host = match host_port.strip_prefix('[') {
+        Some(rest) => rest.split_once(']').map_or(rest, |(host, _)| host),
+        None if host_port.matches(':').count() > 1 => host_port,
+        None => host_port
+            .split_once(':')
+            .map_or(host_port, |(host, _)| host),
+    };
+    host.parse::<std::net::IpAddr>().is_err()
 }
 
 /// Revisions of the controller's own writes, so the owned-key watch can tell them apart.
@@ -1321,6 +1350,45 @@ connection_timeout = "10s"
         // And it parses as plain TOML with the table Pingap expects.
         let value: toml::Table = toml::from_str(&out).unwrap();
         assert!(value["upstreams"]["api-1"]["addrs"].is_array());
+        assert!(
+            value["upstreams"]["api-1"]
+                .get("update_frequency")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn minimal_service_upstream_refreshes_dns_often() {
+        let out = minimal_upstream("legacy", &s(&["legacy.prod.svc.cluster.local:80 2"]));
+        let value: toml::Table = toml::from_str(&out).unwrap();
+        assert_eq!(
+            value["upstreams"]["legacy"]["update_frequency"].as_str(),
+            Some(SERVICE_UPDATE_FREQUENCY)
+        );
+        assert_eq!(
+            read_addrs(&out, "legacy").unwrap(),
+            Some(s(&["legacy.prod.svc.cluster.local:80 2"]))
+        );
+    }
+
+    #[test]
+    fn hostnames_are_told_from_ip_addresses() {
+        for addr in [
+            "10.0.0.1:80",
+            "10.0.0.1:80 3",
+            "[fd00::1]:80",
+            "[fd00::1]:80 2",
+            "fd00::1",
+        ] {
+            assert!(!is_hostname(addr), "{addr}");
+        }
+        for addr in [
+            "web.prod.svc.cluster.local:80",
+            "web.prod.svc:80 2",
+            "localhost",
+        ] {
+            assert!(is_hostname(addr), "{addr}");
+        }
     }
 
     #[test]
