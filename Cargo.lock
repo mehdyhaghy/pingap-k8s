@@ -1620,6 +1620,7 @@ dependencies = [
  "clap",
  "etcd-client",
  "futures",
+ "http",
  "humantime",
  "humantime-serde",
  "k8s-openapi",
@@ -1641,6 +1642,7 @@ dependencies = [
  "toml",
  "toml_edit",
  "tonic",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

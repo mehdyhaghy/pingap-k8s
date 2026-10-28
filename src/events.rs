@@ -476,6 +476,132 @@ mod tests {
         assert!(!f.allow("Service/apps/web", later));
     }
 
+    type Requests = std::sync::Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>;
+
+    /// A kube client whose API server records every request (method, path, JSON
+    /// body) and answers with the body it got; 403 for namespace "denied".
+    fn mock_client() -> (kube::Client, Requests) {
+        let requests = Requests::default();
+        let log = requests.clone();
+        let service = tower::service_fn(move |req: http::Request<kube::client::Body>| {
+            let log = log.clone();
+            async move {
+                let (parts, body) = req.into_parts();
+                let body = body.collect_bytes().await?;
+                let path = parts.uri.path().to_string();
+                let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                log.lock()
+                    .unwrap()
+                    .push((parts.method.to_string(), path.clone(), json));
+                let response = if path.contains("/namespaces/denied/") {
+                    http::Response::builder().status(403).body(kube::client::Body::from(
+                        br#"{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","code":403}"#.to_vec(),
+                    ))
+                } else {
+                    http::Response::builder()
+                        .status(201)
+                        .body(kube::client::Body::from(body.to_vec()))
+                };
+                Ok::<_, kube::Error>(response.unwrap())
+            }
+        });
+        (kube::Client::new(service, "default"), requests)
+    }
+
+    async fn wait_requests(
+        requests: &Requests,
+        n: usize,
+    ) -> Vec<(String, String, serde_json::Value)> {
+        for _ in 0..500 {
+            let seen = requests.lock().unwrap().clone();
+            if seen.len() >= n {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("expected {n} requests, got {:?}", requests.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn publish_posts_service_and_pod_events() {
+        let (client, requests) = mock_client();
+        let events = Events::spawn(
+            client,
+            "pk-0".into(),
+            "pingap-k8s".into(),
+            Some("pod-uid".into()),
+        );
+        let missing = ResolveWarning::ServiceMissing(key("web"));
+        events.post(Notice::resolve_warning(
+            "up",
+            &missing,
+            Some("svc-uid".into()),
+        ));
+        events.post(Notice::etcd(false));
+        events.post(Notice::etcd(false));
+
+        let seen = wait_requests(&requests, 3).await;
+        let (method, path, body) = &seen[0];
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/apis/events.k8s.io/v1/namespaces/apps/events");
+        assert_eq!(body["regarding"]["kind"], "Service");
+        assert_eq!(body["regarding"]["name"], "web");
+        assert_eq!(body["regarding"]["uid"], "svc-uid");
+        assert_eq!(body["reason"], "ServiceMissing");
+        assert_eq!(body["type"], "Warning");
+        assert_eq!(body["reportingController"], REPORTING_CONTROLLER);
+        assert_eq!(body["reportingInstance"], "pk-0");
+        assert_eq!(body["note"], format!("upstream up: {missing}"));
+
+        let (method, path, body) = &seen[1];
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/apis/events.k8s.io/v1/namespaces/pingap-k8s/events");
+        assert_eq!(body["regarding"]["kind"], "Pod");
+        assert_eq!(body["regarding"]["name"], "pk-0");
+        assert_eq!(body["regarding"]["uid"], "pod-uid");
+        assert_eq!(body["reason"], "EtcdUnreachable");
+
+        // The same Event again: the recorder updates its series instead of a new Event.
+        let (method, path, body) = &seen[2];
+        assert_eq!(method, "PATCH");
+        let name = seen[1].2["metadata"]["name"].as_str().unwrap();
+        assert_eq!(
+            path,
+            &format!("/apis/events.k8s.io/v1/namespaces/pingap-k8s/events/{name}")
+        );
+        assert_eq!(body["series"]["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn publish_applies_the_spam_filter_and_survives_errors() {
+        let (client, requests) = mock_client();
+        let events = Events::spawn(client, "pk-0".into(), "pingap-k8s".into(), None);
+        let denied = ResolveWarning::ServiceMissing(ServiceKey {
+            namespace: "denied".into(),
+            name: "web".into(),
+        });
+        events.post(Notice::resolve_warning("up", &denied, None));
+        let missing = ResolveWarning::ServiceMissing(key("web"));
+        for _ in 0..BURST + 5 {
+            events.post(Notice::resolve_warning("up", &missing, None));
+        }
+        events.post(Notice::etcd(true));
+
+        let seen = wait_requests(&requests, 1 + BURST as usize + 1).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let seen_after = requests.lock().unwrap().clone();
+        assert_eq!(seen_after.len(), seen.len(), "{seen_after:?}");
+        assert!(seen[0].1.contains("/namespaces/denied/"));
+        let web = seen
+            .iter()
+            .filter(|r| r.1.contains("/namespaces/apps/"))
+            .count();
+        assert_eq!(web, BURST as usize);
+        let last = seen.last().unwrap();
+        assert_eq!(last.2["reason"], "EtcdRecovered");
+        assert!(last.2["regarding"].get("uid").is_none());
+    }
+
     #[test]
     fn post_never_blocks_and_disabled_posts_nothing() {
         Events::disabled().post(Notice::etcd(true));

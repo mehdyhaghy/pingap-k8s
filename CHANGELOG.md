@@ -31,6 +31,10 @@ Security:
   when more than one Service matches.
 
 Tests and CI:
+- Kubernetes Events publishing tested against a mock API server: the request paths and bodies,
+  series updates, the spam filter and a forbidden namespace.
+- e2e test 04 records why a failed request failed (curl exit code, time, address) and prints the
+  Pingap log when it fails.
 - OTLP export test against an in-process receiver, and kubectl plugin tests against a fake
   `kubectl`, both in `cargo test`.
 - New CI job `integration` runs the etcd integration tests and the kind watcher tests. Before
