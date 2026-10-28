@@ -6,6 +6,32 @@
 #   kubectl create namespace pingap-k8s
 #   kubectl apply -f deploy/pingap-k8s.yaml
 ---
+# Source: pingap-k8s/templates/networkpolicy.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pingap-k8s
+  namespace: pingap-k8s
+  labels:
+    helm.sh/chart: pingap-k8s-0.16.10
+    app.kubernetes.io/version: "0.16.10"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: pingap-k8s
+    app.kubernetes.io/name: pingap-k8s
+    app.kubernetes.io/instance: pingap-k8s
+    app.kubernetes.io/component: controller
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: pingap-k8s
+      app.kubernetes.io/instance: pingap-k8s
+      app.kubernetes.io/component: controller
+  policyTypes:
+    - Ingress
+  # No sources listed: nothing may reach the metrics port (probes still work).
+  ingress: []
+
+---
 # Source: pingap-k8s/templates/pdb.yaml
 apiVersion: policy/v1
 kind: PodDisruptionBudget

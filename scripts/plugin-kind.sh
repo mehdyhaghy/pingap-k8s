@@ -32,6 +32,9 @@ image:
   pullPolicy: Never
 status:
   enabled: true
+# The probe pod below runs in the release namespace.
+networkPolicy:
+  allowSameNamespace: true
 etcd:
   deploy: true
 pingap:

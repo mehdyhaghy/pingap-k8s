@@ -194,12 +194,12 @@ status:
   enabled: false
   port: 9091
 
-# Optional NetworkPolicy for the controller pods. When enabled, the
-# metrics/health port accepts traffic only from the sources below; everything
-# else is denied. Kubelet probes keep working (node-to-pod traffic is always
-# allowed). Egress is not restricted.
+# NetworkPolicy for the controller pods (on by default). The metrics/health port
+# accepts traffic only from the sources below; everything else is denied, so
+# list your Prometheus here to scrape /metrics. Kubelet probes and port-forward
+# keep working (node-to-pod traffic is always allowed). Egress is not restricted.
 networkPolicy:
-  enabled: false
+  enabled: true
   # Allow pods in the release namespace (for example a scraper running there).
   allowSameNamespace: false
   # NetworkPolicy "from" peers allowed to scrape /metrics, for example:

@@ -7,6 +7,10 @@ one digit for our own releases (Pingap 0.16.1: 0.16.10 to 0.16.19). `make versio
 release workflow enforce it.
 
 Security:
+- The controller NetworkPolicy is now on by default (`networkPolicy.enabled: true`): the metrics
+  port is closed to other pods. **To keep scraping `/metrics`, list your Prometheus in
+  `networkPolicy.metricsFrom`** (or set `networkPolicy.allowSameNamespace`). Probes and
+  port-forward are not affected.
 - The quickstart Pingap gets a NetworkPolicy (on by default): only the proxy port is open to other
   pods, and the admin port is closed except to `pingap.networkPolicy.adminFrom`. Port-forward
   keeps working. Extra listener ports go in `pingap.networkPolicy.extraPorts`.

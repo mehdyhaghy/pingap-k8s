@@ -15,6 +15,13 @@ logLevel: "info,pingap_k8s=debug"
 events:
   enabled: true
 
+# The tests scrape the controller's metrics from the client pod.
+networkPolicy:
+  metricsFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: e2e-app
+
 etcd:
   deploy: true
   replicas: 1

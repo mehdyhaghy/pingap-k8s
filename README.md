@@ -162,7 +162,7 @@ Main chart values:
 | `events.enabled` | `false` | post Kubernetes Events (see [Observability](#observability)); adds `create/patch` on `events.k8s.io` `events` to the Roles, the controller's only Kubernetes write permission |
 | `logFormat` / `logLevel` | `text` / `info` | log output (`text` or `json`) and filter |
 | `podDisruptionBudget.minAvailable` | `1` | |
-| `networkPolicy.enabled` | `false` | NetworkPolicy on the controller pods: only the sources below may reach the metrics port (none when both are empty); probes are not affected |
+| `networkPolicy.enabled` | `true` | NetworkPolicy on the controller pods: only the sources below may reach the metrics port (none when both are empty); probes and port-forward are not affected |
 | `networkPolicy.allowSameNamespace` / `networkPolicy.metricsFrom` | `false` / `[]` | allow pods of the release namespace / extra NetworkPolicy `from` peers (e.g. a monitoring namespace) |
 | `etcd.deploy` | `false` | deploy a bundled etcd (below) |
 | `etcd.tls.peerAllowedCN` | `""` | CN required of etcd peer certificates; empty: the generated server CN with `etcd.tls.autoGenerate` |
@@ -694,7 +694,17 @@ The controller serves on port `9090` (cluster-internal only):
 `pingap_k8s_etcd_up` follows every etcd call (writes, the owned-key watch, the election's
 keep-alives every 2 s), so a follower shows 0 within seconds of etcd going away too.
 
-The chart's metrics Service is `pingap-k8s-metrics` (`ClusterIP`, release `pingap-k8s`).
+The chart's metrics Service is `pingap-k8s-metrics` (`ClusterIP`, release `pingap-k8s`). The
+chart's NetworkPolicy closes the port to other pods by default; to scrape it, list Prometheus in
+`networkPolicy.metricsFrom`, for example:
+
+```yaml
+networkPolicy:
+  metricsFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+```
 
 With `events.enabled: true` the controller also posts Kubernetes Events (`reportingController`
 `pingap-k8s`), once per episode, like its warning logs: `ServiceMissing`, `PortNotInService`,
@@ -761,9 +771,10 @@ and pass it with `extraEnv` and `valueFrom.secretKeyRef`, not as a plain value.
   broadcast and multicast addresses are skipped, so a hand-written EndpointSlice can not point an
   upstream at the node or at cloud metadata.
 - **Cluster-internal endpoints**: the metrics/health port, etcd and the quickstart Pingap admin UI
-  are `ClusterIP` only. `networkPolicy.enabled: true` also limits who may reach the controller's
-  metrics port (`networkPolicy.allowSameNamespace`, `networkPolicy.metricsFrom`); kubelet probes
-  keep working. We recommend turning it on in production. CI fails if the chart renders a
+  are `ClusterIP` only. A NetworkPolicy (`networkPolicy.enabled`, on by default) closes the
+  controller's metrics port to other pods; open it to your Prometheus with
+  `networkPolicy.metricsFrom` (or `networkPolicy.allowSameNamespace`). Kubelet probes and
+  port-forward keep working. CI fails if the chart renders a
   `LoadBalancer` or `NodePort` Service other than the quickstart proxy listener, or any
   cluster-wide RBAC.
 - **The quickstart Pingap admin port is closed to other pods** by a NetworkPolicy
