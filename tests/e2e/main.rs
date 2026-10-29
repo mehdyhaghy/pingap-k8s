@@ -32,13 +32,15 @@
 //! loop and pod tracker for the timing tests).
 //!
 //! The end-to-end tests 1–14 are in [`spec`] (`spec::e2e_01_initial_sync` ...
-//! `spec::e2e_14_events`); filter with e.g. `scripts/e2e-run.sh e2e_04`.
+//! `spec::e2e_14_events`); filter with e.g. `scripts/e2e-run.sh e2e_04`. The tests 19–27 of
+//! the Gateway API provider are in [`gateway`] (`gateway::e2e_19_gateway_class_status` ...).
 
 // Helpers are shared with the tests in [`spec`]; not every one is used by every test.
 #![allow(dead_code)]
 
 mod controller;
 mod etcd;
+mod gateway;
 mod harness;
 mod k8s;
 mod kubectl;

@@ -187,7 +187,7 @@ async fn baseline(env: &Env) -> Vec<String> {
 }
 
 /// Runs `body`, then `restore` whether or not `body` panicked, then re-raises the panic.
-async fn guarded<B, R>(body: B, restore: R)
+pub(crate) async fn guarded<B, R>(body: B, restore: R)
 where
     B: Future<Output = ()>,
     R: Future<Output = anyhow::Result<()>>,
@@ -205,8 +205,8 @@ where
     }
 }
 
-/// Runs a host command (docker, helm) off the runtime; non-zero exit is an error.
-async fn host_cmd(program: &str, args: Vec<String>) -> anyhow::Result<String> {
+/// Runs a host command (docker, helm, openssl) off the runtime; non-zero exit is an error.
+pub(crate) async fn host_cmd(program: &str, args: Vec<String>) -> anyhow::Result<String> {
     let shown = format!("{program} {}", args.join(" "));
     let mut cmd = std::process::Command::new(program);
     cmd.args(&args);

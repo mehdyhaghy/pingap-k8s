@@ -9,9 +9,10 @@
 //!    those of Secrets a listener still names but that are missing or invalid (fail
 //!    static: a bad Secret update does not take TLS away from its hosts);
 //! 2. put new or changed locations. A location whose upstream is not stored yet is
-//!    written without it (Pingap answers 503, as the Gateway API asks for a backend
-//!    without endpoints) and reported as deferred; one that names a missing hand-made
-//!    plugin is deferred (a stored version is kept, a new one waits);
+//!    deferred: a stored version keeps serving through its old upstream until the new one
+//!    is stored, a new location is written without it (Pingap answers 503, as the Gateway
+//!    API asks for a backend without endpoints). One that names a missing hand-made
+//!    plugin is deferred too (a stored version is kept, a new one waits);
 //! 3. set the owned part of every stored server's `locations`: each server lists its live
 //!    generated locations, highest weight first; other servers lose every owned name;
 //! 4. delete stale owned locations;
@@ -222,6 +223,8 @@ pub fn plan(input: &PlanInput<'_>) -> Plan {
     // Owned locations stored or written after this plan, with the upstream and plugins
     // they name.
     let mut live: BTreeMap<&str, (Option<String>, Vec<String>)> = BTreeMap::new();
+    // Deferred locations whose stored version stays as it is.
+    let mut kept_stored: BTreeSet<&str> = BTreeSet::new();
     let mut step = StepOps::default();
     for (name, location) in &desired.locations {
         if !is_owned(name) || check_name(name).is_err() {
@@ -233,6 +236,7 @@ pub fn plan(input: &PlanInput<'_>) -> Plan {
                 .insert(name.clone(), Deferred::MissingPlugin(plugin.clone()));
             if let Some(entry) = stored.locations.get(name) {
                 live.insert(name, stored_refs(&entry.value, name));
+                kept_stored.insert(name.as_str());
             }
             continue;
         }
@@ -242,6 +246,11 @@ pub fn plan(input: &PlanInput<'_>) -> Plan {
         {
             out.deferred
                 .insert(name.clone(), Deferred::MissingUpstream(upstream.clone()));
+            if let Some(entry) = stored.locations.get(name) {
+                live.insert(name, stored_refs(&entry.value, name));
+                kept_stored.insert(name.as_str());
+                continue;
+            }
             location.upstream = None;
         }
         let rendered = render::render_location(name, &location);
@@ -329,8 +338,8 @@ pub fn plan(input: &PlanInput<'_>) -> Plan {
     }
     step.finish("stale locations", &mut out.steps);
 
-    // What the remaining locations name: live ones as written (one waiting for a plugin
-    // by its kept stored version too), others as stored.
+    // What the remaining locations name: live ones as written (a deferred one by its kept
+    // stored version too), others as stored.
     let mut referenced_upstreams: BTreeSet<String> = BTreeSet::new();
     let mut referenced_plugins: BTreeSet<String> = BTreeSet::new();
     let mut readable = true;
@@ -338,9 +347,7 @@ pub fn plan(input: &PlanInput<'_>) -> Plan {
         if deleted_locations.contains(name.as_str()) {
             continue;
         }
-        if live.contains_key(name.as_str())
-            && !matches!(out.deferred.get(name), Some(Deferred::MissingPlugin(_)))
-        {
+        if live.contains_key(name.as_str()) && !kept_stored.contains(name.as_str()) {
             continue;
         }
         match toml::from_str::<toml::Table>(&entry.value) {
@@ -812,40 +819,57 @@ mod tests {
     }
 
     #[test]
-    fn missing_upstream_writes_the_location_without_it() {
+    fn missing_upstream_keeps_a_stored_location_and_writes_a_new_one_without_it() {
         let mut fake = Fake::new();
         fake.upstream("k8s-old");
         fake.server("http", &[]);
         let mut case = Case::new();
         case.location("k8s-shop-web-1", loc("web", "k8s-old"));
         case.converge(&mut fake);
+        let before = fake.get("locations", "k8s-shop-web-1").cloned();
 
-        // The new upstream is not stored yet: the location answers 503 until it is, and
-        // the old upstream goes.
+        // The new upstream is not stored yet: the stored location keeps serving through
+        // the old one, and a new location answers 503 until the upstream is there.
         let mut case = Case::new();
         case.location("k8s-shop-web-1", loc("web", "k8s-new"));
+        case.location("k8s-shop-web-2", loc("web", "k8s-new"));
         let plan = case.plan(&fake);
         fake.apply(&plan);
         assert_eq!(
             plan.deferred,
-            BTreeMap::from([(
-                "k8s-shop-web-1".to_string(),
-                Deferred::MissingUpstream("k8s-new".into())
-            )])
+            BTreeMap::from([
+                (
+                    "k8s-shop-web-1".to_string(),
+                    Deferred::MissingUpstream("k8s-new".into())
+                ),
+                (
+                    "k8s-shop-web-2".to_string(),
+                    Deferred::MissingUpstream("k8s-new".into())
+                ),
+            ])
         );
-        let stored = fake.get("locations", "k8s-shop-web-1").unwrap();
+        assert_eq!(fake.get("locations", "k8s-shop-web-1").cloned(), before);
+        assert!(fake.has("upstreams", "k8s-old"));
+        let new = fake.get("locations", "k8s-shop-web-2").unwrap();
         assert_eq!(
-            render::location_upstream(stored, "k8s-shop-web-1").unwrap(),
+            render::location_upstream(new, "k8s-shop-web-2").unwrap(),
             None
         );
-        assert!(!fake.has("upstreams", "k8s-old"));
-        assert!(plan.programmed.contains("k8s-shop-web-1"));
+        assert_eq!(
+            plan.programmed,
+            set_of(&["k8s-shop-web-1", "k8s-shop-web-2"])
+        );
 
-        // Once the endpoint writer stores it, the location names it.
+        // Once the endpoint writer stores it, both name it and the old one goes.
         fake.upstream("k8s-new");
         let plan = case.converge(&mut fake);
-        assert_eq!(whats(&plan), vec!["locations"]);
+        assert_eq!(whats(&plan), vec!["locations", "stale upstreams"]);
         assert!(plan.deferred.is_empty());
+        assert!(!fake.has("upstreams", "k8s-old"));
+    }
+
+    fn set_of(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
