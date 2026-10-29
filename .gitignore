@@ -162,10 +162,11 @@ temp/
 *.rej
 *.bak
 
-# Local notes and the design spec, kept private (not in the repository)
+# Local notes and the design spec, kept private (not in the repository).
+# No leading slash: these match in every folder, not only at the root.
 ISSUE-*-RESPONSE.md
-/SPEC.md
-/notes/
+SPEC.md
+notes/
 *.private.md
 
 # ---------------------------------------------------------------------------
@@ -199,9 +200,29 @@ ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
 
-# Local work checkpoint and AI coding tool state, never committed
+# Local work checkpoint, memory and AI coding tool state, never committed. Tools
+# create these in any folder they run in, so none of the patterns is anchored.
 .checkpoint/
+.checkpoints/
+memory/
+.memory/
+.claude/
+.codex/
 .cursor/
 .aider*
-.codex/
 .windsurf/
+.gemini/
+.continue/
+.copilot/
+.roo/
+.kiro/
+.junie/
+.amazonq/
+.opencode/
+.goose/
+.serena/
+.specstory/
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.md
+GEMINI.md
