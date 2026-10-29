@@ -521,7 +521,7 @@ How the resources map:
 
 | Gateway API | Pingap |
 |---|---|
-| Gateway listener (port, HTTP or HTTPS) | an **existing** Pingap server with that port in `addr`; HTTPS needs `global_certificates = true`. The controller never creates servers (a new server needs a Pingap restart): a listener without a matching server gets `Accepted=False` with reason `PortUnavailable`. Gateways of the class share the servers. |
+| Gateway listener (port, HTTP or HTTPS) | an **existing** Pingap server with that port in `addr`; HTTPS needs `global_certificates = true`. The controller never creates servers (a new server needs a Pingap restart): a listener without a matching server gets `Accepted=False` with reason `PortUnavailable`. Gateways of the class share the servers: they are merged onto them, so listeners of different Gateways with the same port and hostname are all programmed and their routes are served side by side (there is no per-Gateway isolation, and all of them get the same `gateway.addresses`). Only listeners of one Gateway can be conflicted. |
 | HTTPS `certificateRefs` (a `kubernetes.io/tls` Secret) | a certificate with the listener hostname as `domains`, chosen by SNI. A Secret renewal rewrites it. |
 | HTTPRoute rule match | one location per server, host and match: `Exact` → `=path`, `PathPrefix` → a segment-aware regex (`/foo` matches `/foo` and `/foo/x`, not `/foobar`), `RegularExpression` → an anchored regex, exact header and query matches → `match_headers` / `match_query`. Every location gets an explicit `weight` that encodes Gateway API precedence. |
 | `backendRefs` (Services, weighted) | an upstream kept current by the endpoint writer; each Service gets its share of the weight, split over its addresses. Backends that are missing, not permitted or of another kind get a 500 for their share (the `mock` plugin); a new backend without endpoints gets a 503 until it has some (later, like every upstream, the last addresses are kept). |
@@ -536,6 +536,14 @@ named rules. Not supported: method matching and regular-expression header or que
 has no such location matching), request mirroring, CORS, timeouts, backend TLS, GRPCRoute,
 TLSRoute, TCPRoute and UDPRoute. A rule that uses an unsupported field is dropped and the route
 reports `PartiallyInvalid`.
+
+`scripts/conformance.sh` runs the official v1.6.3 conformance suite (profile `GATEWAY-HTTP`, the
+features of `status.supportedFeatures`) on a kind cluster of its own (`pk8s-conf`) and writes the
+report to `target/conformance/report.yaml`. Every extended test of the claimed features passes,
+and every core test but `HTTPRouteMultipleGateways`: it attaches a route for `/` to each of two
+Gateways with the same port and expects each Gateway's address to reach its own backend, which
+needs one data plane per Gateway. Here Gateways share the Pingap servers and their address, so
+one of the two routes wins on both.
 
 Generated entries are named `k8s-...` and carry a `pingap-k8s` remark. The controller only
 changes or deletes `k8s-` entries; hand-made locations, plugins and upstreams stay as they are,

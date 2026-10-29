@@ -1,0 +1,73 @@
+# Helm values for the Gateway API conformance run (scripts/conformance.sh): the
+# bundled etcd and the quickstart Pingap with the listeners the conformance
+# Gateways use. Release "pingap-k8s" in namespace "pingap-k8s".
+#
+# The controller image is built locally and loaded into kind (never pulled).
+image:
+  repository: pingap-k8s
+  tag: conformance
+  pullPolicy: Never
+
+logLevel: "info,pingap_k8s=debug"
+
+# Gateway API provider: the GatewayClass "pingap". Backends and listener Secrets
+# live in the namespaces of conformance/base/manifests.yaml (created by the script
+# before the install, so the Roles can go there). The addresses are the
+# pingap-k8s-gateway Service the script creates (ports 80, 443, 8080, 8090), the
+# address the in-cluster suite sends its requests to.
+gateway:
+  enabled: true
+  namespaces:
+    - gateway-conformance-infra
+    - gateway-conformance-app-backend
+    - gateway-conformance-web-backend
+  addresses: ["pingap-k8s-gateway.pingap-k8s.svc"]
+
+etcd:
+  deploy: true
+  replicas: 1
+  persistence:
+    enabled: false
+
+pingap:
+  deploy: true
+  # The chart's proxy Service and readiness probe use the port-80 listener.
+  httpPort: 80
+  service:
+    type: ClusterIP
+    port: 80
+  # Pingap runs as non-root: let it bind ports below 1024 (a namespaced, safe sysctl).
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+    sysctls:
+      - name: net.ipv4.ip_unprivileged_port_start
+        value: "0"
+  networkPolicy:
+    extraPorts: [443, 8080, 8090]
+  seed:
+    enabled: true
+    # One server per listener port of the conformance Gateways: 80, 8080 and 8090
+    # plain HTTP, 443 HTTPS with the certificates the controller stores. The
+    # controller lists its generated locations on them.
+    config: |
+      [basic]
+      grace_period = "30s"
+      graceful_shutdown_timeout = "10s"
+
+      [servers.gw-80]
+      addr = "[::]:80"
+
+      [servers.gw-443]
+      addr = "[::]:443"
+      global_certificates = true
+
+      [servers.gw-8080]
+      addr = "[::]:8080"
+
+      [servers.gw-8090]
+      addr = "[::]:8090"

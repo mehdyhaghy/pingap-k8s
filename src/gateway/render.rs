@@ -160,12 +160,20 @@ pub fn server_info(toml: &str, name: &str) -> Option<ServerInfo> {
 }
 
 /// `[certificates.<name>]`; `domains` is a comma-separated string, as Pingap reads it.
+/// Without domains (a listener without hostname, which matches every host) the entry
+/// has no `domains`, so Pingap serves it for the names of the certificate, and
+/// `is_default = true`, so it is also served for any other or no SNI. An empty
+/// `domains` string would serve it for no name at all.
 pub fn render_certificate(name: &str, certificate: &CertificateEntry) -> String {
     let mut entry = Table::new();
-    entry.insert(
-        "domains",
-        toml_edit::value(certificate.domains.join(",").as_str()),
-    );
+    if certificate.domains.is_empty() {
+        entry.insert("is_default", toml_edit::value(true));
+    } else {
+        entry.insert(
+            "domains",
+            toml_edit::value(certificate.domains.join(",").as_str()),
+        );
+    }
     entry.insert("tls_cert", toml_edit::value(certificate.tls_cert.as_str()));
     entry.insert("tls_key", toml_edit::value(certificate.tls_key.as_str()));
     entry.insert(
@@ -501,6 +509,7 @@ mod tests {
     #[serde(deny_unknown_fields)]
     struct CertificateConf {
         domains: Option<String>,
+        is_default: Option<bool>,
         tls_cert: Option<String>,
         tls_key: Option<String>,
         remark: Option<String>,
@@ -618,6 +627,29 @@ mod tests {
         assert_eq!(conf.tls_cert.as_deref(), Some(cert.tls_cert.as_str()));
         assert_eq!(conf.tls_key.as_deref(), Some(cert.tls_key.as_str()));
         assert_eq!(conf.remark.as_deref(), Some("pingap-k8s secret shop/tls"));
+        assert_eq!(conf.is_default, None);
+    }
+
+    #[test]
+    fn certificate_without_domains_is_the_default() {
+        let cert = CertificateEntry {
+            secret: SecretKey {
+                namespace: "shop".into(),
+                name: "tls".into(),
+            },
+            domains: Vec::new(),
+            tls_cert: "-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n".into(),
+            tls_key: format!(
+                "-----BEGIN {k}-----\nBBB\n-----END {k}-----\n",
+                k = "PRIVATE KEY"
+            ),
+        };
+        let out = render_certificate("k8s-shop-tls-1", &cert);
+        let conf = parse::<CertificateConf>(&out, "certificates")
+            .remove("k8s-shop-tls-1")
+            .unwrap();
+        assert_eq!(conf.domains, None);
+        assert_eq!(conf.is_default, Some(true));
     }
 
     fn external(addr: &str) -> ExternalUpstream {

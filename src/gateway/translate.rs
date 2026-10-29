@@ -5,9 +5,12 @@
 //! programmed on every stored server (limited to `servers` of the options when set)
 //! whose ports contain the listener port and whose TLS mode matches its protocol (HTTPS
 //! on `global_certificates` servers, HTTP on the others). Gateways of our classes share
-//! those servers. Listeners that are not distinct across all of them are conflicted:
-//! inside one Gateway all of them, across Gateways the one of the newer Gateway
-//! (creationTimestamp, then namespace/name).
+//! those servers: they are merged onto them, so listeners of different Gateways with
+//! the same port and hostname are all programmed and their routes served side by side
+//! (precedence across them as across routes of one Gateway). Inside one Gateway,
+//! listeners that are not distinct are all conflicted. HTTPS listeners of different
+//! Gateways with the same hostname and different certificates leave the choice of the
+//! certificate to Pingap.
 //!
 //! **Locations.** Every (server, host, route match) becomes one location with one host.
 //! Gateway API matching maps onto Pingap's matchers:
@@ -759,11 +762,12 @@ fn http_route_kind() -> GatewayStatusListenersSupportedKinds {
     }
 }
 
-/// Marks the listeners `indices` (one Gateway) that are not distinct among themselves
-/// or from the listeners of older Gateways (all before them in `listeners`).
+/// Marks the listeners `indices` (one Gateway) that are not distinct among themselves.
+/// Listeners of different Gateways are never conflicted: Gateways sharing a server are
+/// merged onto it (the `GatewaySpec.listeners` "MAY merge separate Gateways" case), and
+/// their routes are served side by side.
 fn mark_conflicts(listeners: &mut [Listener<'_>], indices: &[usize]) {
     let candidates = |l: &Listener<'_>| l.supported_protocol && l.accepted.is_ok();
-    let first = indices.first().copied().unwrap_or(listeners.len());
     let mut found: Vec<(usize, &'static str, String)> = Vec::new();
     for &i in indices {
         let l = &listeners[i];
@@ -792,34 +796,6 @@ fn mark_conflicts(listeners: &mut [Listener<'_>], indices: &[usize]) {
                     i,
                     "HostnameConflict",
                     format!("listener {} uses the same port and hostname", o.spec.name),
-                ));
-                break;
-            }
-        }
-        // Against the older Gateways sharing the Pingap servers: they keep theirs.
-        for o in &listeners[..first] {
-            if !candidates(o) || o.conflicted.is_some() || o.spec.port != l.spec.port {
-                continue;
-            }
-            if o.spec.protocol != l.spec.protocol {
-                found.push((
-                    i,
-                    "ProtocolConflict",
-                    format!(
-                        "listener {} of the older Gateway {} uses port {} with protocol {}",
-                        o.spec.name, o.gateway_key, o.spec.port, o.spec.protocol
-                    ),
-                ));
-                break;
-            }
-            if o.hostname == l.hostname {
-                found.push((
-                    i,
-                    "HostnameConflict",
-                    format!(
-                        "listener {} of the older Gateway {} uses the same port and hostname",
-                        o.spec.name, o.gateway_key
-                    ),
                 ));
                 break;
             }
@@ -3380,22 +3356,18 @@ mod tests {
             listener_cond(&d, "old", "http", "Conflicted"),
             tf("False", "NoConflicts")
         );
-        assert_eq!(
-            listener_cond(&d, "new", "same", "Conflicted"),
-            tf("True", "HostnameConflict")
-        );
-        assert_eq!(
-            listener_cond(&d, "new", "same", "Accepted"),
-            tf("False", "HostnameConflict")
-        );
-        assert_eq!(
-            listener_cond(&d, "new", "other", "Conflicted"),
-            tf("False", "NoConflicts")
-        );
-        assert_eq!(
-            gateway_cond(&d, "new", "Accepted"),
-            tf("True", "ListenersNotValid")
-        );
+        // Across Gateways: merged, not conflicted.
+        for name in ["same", "other"] {
+            assert_eq!(
+                listener_cond(&d, "new", name, "Conflicted"),
+                tf("False", "NoConflicts")
+            );
+            assert_eq!(
+                listener_cond(&d, "new", name, "Programmed"),
+                tf("True", "Programmed")
+            );
+        }
+        assert_eq!(gateway_cond(&d, "new", "Accepted"), tf("True", "Accepted"));
         assert_eq!(
             listener_cond(&d, "mixed", "plain", "Conflicted"),
             tf("True", "ProtocolConflict")
@@ -3429,6 +3401,32 @@ mod tests {
             gateway_cond(&d, "gw2", "Programmed"),
             tf("True", "Programmed")
         );
+    }
+
+    #[test]
+    fn gateways_with_the_same_listener_are_merged() {
+        // The conformance base Gateways: three plain HTTP listeners on port 80 without
+        // hostname, each with its routes.
+        let w = World::new()
+            .gw(gateway("ns", "gw", 0, json!([http_listener("http", 80, None)])))
+            .gw(gateway("ns", "gw2", 1, json!([http_listener("http", 80, None)])))
+            .rt(route("ns", "a", 0, json!({"rules": [{"matches": [{"path": {"type": "PathPrefix", "value": "/a"}}], "backendRefs": [backend("web", 80)]}]})))
+            .rt(route("ns", "b", 1, json!({"parentRefs": [{"name": "gw2"}], "rules": [{"matches": [{"path": {"type": "PathPrefix", "value": "/b"}}], "backendRefs": [backend("web", 80)]}]})));
+        let d = w.run();
+        for g in ["gw", "gw2"] {
+            assert_eq!(gateway_cond(&d, g, "Accepted"), tf("True", "Accepted"));
+            assert_eq!(gateway_cond(&d, g, "Programmed"), tf("True", "Programmed"));
+            assert_eq!(
+                listener_cond(&d, g, "http", "Conflicted"),
+                tf("False", "NoConflicts")
+            );
+        }
+        let mut paths: Vec<&str> = locations(&d, "http")
+            .iter()
+            .map(|l| l.path.as_str())
+            .collect();
+        paths.sort_unstable();
+        assert_eq!(paths, vec!["~^/a(/|$)", "~^/b(/|$)"]);
     }
 
     #[test]

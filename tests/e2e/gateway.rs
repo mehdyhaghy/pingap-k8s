@@ -776,9 +776,10 @@ async fn e2e_19_gateway_class_status() {
 /// Gateway. The Gateway is accepted (reason ListenersNotValid, as some listeners are
 /// invalid) and programmed, its address is the configured one, the valid listeners are
 /// accepted and programmed with the right attachedRoutes, the invalid ones get
-/// Accepted=False/PortUnavailable. A newer Gateway with the same port and hostname gets
-/// a conflicted listener, the older one keeps its own. Without the invalid listeners the
-/// Gateway is accepted with reason Accepted for the new generation.
+/// Accepted=False/PortUnavailable. A newer Gateway with the same port and hostname is
+/// merged onto the same server: both listeners are programmed and not conflicted.
+/// Without the invalid listeners the Gateway is accepted with reason Accepted for the
+/// new generation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_20_gateway_status() {
     const T: &str = "e2e_20";
@@ -865,13 +866,14 @@ async fn e2e_20_gateway_status() {
             wait_route(&env, &ns, r, "t20", &[("Accepted", "True", "Accepted"), ("ResolvedRefs", "True", "ResolvedRefs")]).await;
         }
 
-        // A newer Gateway with the same port and hostname: its listener is conflicted.
+        // A newer Gateway with the same port and hostname: merged onto the same server,
+        // both listeners programmed, neither conflicted.
         apply(&env, &gateway(&ns, "t20-dup", vec![http_listener("http", host)]))
             .await
             .unwrap();
-        let dup = wait_gateway(&env, &ns, "t20-dup", "Gateway t20-dup conflicted", |g| {
-            listener_cond_is(g, "http", "Conflicted", "True", "HostnameConflict")
-                && listener(g, "http").is_some_and(|l| cond_is(&l["conditions"], "Programmed", "False", None))
+        let dup = wait_gateway(&env, &ns, "t20-dup", "Gateway t20-dup merged", |g| {
+            listener_cond_is(g, "http", "Conflicted", "False", "NoConflicts")
+                && listener_cond_is(g, "http", "Programmed", "True", "Programmed")
         })
         .await;
         println!(
@@ -879,7 +881,7 @@ async fn e2e_20_gateway_status() {
             show(&dup["status"]["conditions"]),
             show(&listener(&dup, "http").unwrap()["conditions"])
         );
-        assert!(cond_is(&dup["status"]["conditions"], "Accepted", "False", Some("ListenersNotValid")));
+        assert!(cond_is(&dup["status"]["conditions"], "Accepted", "True", Some("Accepted")));
         let gw = get_obj(&env.kubectl, GATEWAYS, Some(&ns), "t20").await.unwrap().unwrap();
         assert!(listener_cond_is(&gw, "http", "Conflicted", "False", "NoConflicts"));
         assert!(listener_cond_is(&gw, "http", "Programmed", "True", "Programmed"));
