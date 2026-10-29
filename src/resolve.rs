@@ -2,7 +2,7 @@
 //! Kubernetes state of an upstream's Services to Pingap `addrs`.
 //!
 //! No I/O happens here. The caller (reconcile) decides what to do with an
-//! empty result (keep the last `addrs`) and logs the warnings.
+//! empty result (it keeps the last `addrs`) and logs the warnings.
 //!
 //! Rules implemented:
 //! - Port resolution: the configured port (name or Service `port`
@@ -17,10 +17,10 @@
 //!   draining, the draining ones are written and `fallback` is set. With
 //!   `drain_terminating = false`, draining endpoints count as ready.
 //!
-//! - Target mode: with `target = "service"` the Service and its port
-//!   are checked as in 5.2, and each entry contributes one
-//!   `<service>.<namespace>.svc.<cluster_domain>:<service port>` address
-//!   instead of pod IPs. Slices and readiness are not consulted, `ready`
+//! - Target mode: with `target = "service"` the Service and its port are
+//!   checked as for pods, and each entry contributes its ClusterIP (or, when
+//!   headless, its DNS name) instead of pod IPs, once a slice has a ready or
+//!   serving endpoint on that port (see `resolve_service_target`). `ready`
 //!   counts the addresses written, and the drain fallback never applies.
 //!
 //! Dedupe is by `ip:port` across all slices and all Services of the upstream.
@@ -90,7 +90,7 @@ impl fmt::Display for ResolveWarning {
 pub struct Resolved {
     /// Sorted by the final string, deduped by `ip:port`, in Pingap form
     /// `ip:port[ weight]` (IPv6 as `[ip]:port`). Empty means "nothing to
-    /// write" (, the caller keeps the last `addrs`).
+    /// write" (the caller keeps the last `addrs`).
     pub addrs: Vec<String>,
     /// Unique ready endpoints. With `drain_terminating = false` this includes
     /// the terminating-but-serving ones.

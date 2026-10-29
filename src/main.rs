@@ -470,7 +470,7 @@ async fn run(
     let registry = WatchRegistry::new(client, metrics.clone());
     registry.set_services(config.service_keys());
     status_board.set_watches(Arc::new(registry.clone()));
-    // never write a partial set, so nothing starts before every watcher listed once.
+    // Never write a partial set, so nothing starts before every watcher listed once.
     if !wait_synced(&registry, &readiness, &mut reload_drain(), &shutdown_rx).await {
         return finish(server_task, None, None).await;
     }

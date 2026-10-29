@@ -66,8 +66,8 @@ pub enum UpstreamTarget {
     /// Ready pod IPs from EndpointSlices.
     #[default]
     Pods,
-    /// One `<service>.<namespace>.svc.<cluster_domain>:<service port>` per
-    /// Service; `cluster_domain` comes from `[kubernetes]`.
+    /// One `<ClusterIP>:<service port>` per Service; a headless Service gets
+    /// `<service>.<namespace>.svc.<cluster_domain>`, `cluster_domain` from `[kubernetes]`.
     Service { cluster_domain: String },
 }
 
@@ -99,7 +99,7 @@ pub enum WriteOutcome {
 /// Writes an upstream's `addrs` into Pingap's config storage.
 /// `etcd::EtcdWriter` is the only production implementation.
 pub trait AddrsWriter: Send + Sync + 'static {
-    /// `addrs` is already sorted and non-empty (D12 is enforced by the caller).
+    /// `addrs` is already sorted and non-empty (an empty result never reaches the writer).
     fn write_addrs(
         &self,
         upstream: &str,

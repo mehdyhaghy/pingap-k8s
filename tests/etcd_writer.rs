@@ -165,7 +165,7 @@ async fn empty_addrs_never_written() {
     let Some(w) = writer("empty").await else {
         return;
     };
-    // neither an existing entry nor a missing key gets an empty list.
+    // Neither an existing entry nor a missing key gets an empty list.
     let key = w.upstream_key("api");
     let before = put(&w.client(), &key, ENTRY).await;
     let err = w.write_addrs("api", &[]).await.unwrap_err();

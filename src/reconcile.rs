@@ -34,8 +34,8 @@
 //! result does not overwrite it: the foreign write may be the newer one in
 //! etcd, so `last_written` stays unknown and the next pass asks the writer.
 //!
-//! an empty result keeps the last desired state (no write) and warns once
-//! per episode. fallback start and end are logged once each and exported
+//! An empty result keeps the last desired state (no write) and warns once
+//! per episode. Drain fallback start and end are logged once each and exported
 //! as `pingap_k8s_drain_fallback`. Each distinct resolve warning is logged
 //! once until it clears.
 //!
@@ -45,8 +45,8 @@
 //! effort by looking for an [`EtcdError`] in the error chain:
 //! `Conflict` (CAS retries exhausted in the writer) counts as
 //! `result="conflict"` and uses the normal backoff; a malformed stored entry
-//! (`Toml`, `MissingTable`, `InvalidAddrs`, `NotUtf8`, `InvalidName`, spec
-//! 5.6) is logged as an error once per episode and retried only slowly
+//! (`Toml`, `MissingTable`, `InvalidAddrs`, `NotUtf8`, `InvalidName`)
+//! is logged as an error once per episode and retried only slowly
 //! ([`MALFORMED_RETRY`]) or on the next event or resync, never in a tight
 //! loop; anything else uses the normal backoff.
 //!
@@ -795,7 +795,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
         }
         st.warnings = current;
 
-        // D2 fallback, logged on enter and exit.
+        // Drain fallback, logged on enter and exit.
         let fallback_changed = resolved.fallback != st.fallback;
         if fallback_changed {
             if resolved.fallback {
@@ -824,7 +824,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
             return;
         };
 
-        // empty keeps the last addrs.
+        // An empty result keeps the last addrs.
         if resolved.addrs.is_empty() {
             if !st.empty {
                 tracing::warn!(upstream = %name, "no endpoints; keeping the last addrs");
