@@ -169,18 +169,70 @@ fn find_slice_port(slice: &EndpointSlice, port_name: &str) -> Option<u16> {
 struct Entry {
     weight: Option<u32>,
     class: Class,
+    /// Index of the first `services` entry that gave the address.
+    source: usize,
+}
+
+/// Total of the weights written with `spread_weights`. Pingora's weighted selection keeps
+/// one slot per unit of weight, so the total must stay small.
+pub const SPREAD_TOTAL: u64 = 1000;
+
+/// `spread_weights`: `(address, source, weight)` with the Service weight of `source`
+/// becomes `(address, weight)` where every Service's share of [`SPREAD_TOTAL`] is split
+/// evenly over its addresses (at least 1 each). Services with weight 0 never reach here.
+fn spread(entries: Vec<(String, usize, u32)>) -> Vec<(String, Option<u32>)> {
+    let mut per_source: HashMap<usize, (u64, u64)> = HashMap::new();
+    for (_, source, weight) in &entries {
+        let e = per_source.entry(*source).or_insert((u64::from(*weight), 0));
+        e.1 += 1;
+    }
+    let total: u64 = per_source.values().map(|(w, _)| *w).sum();
+    if total == 0 {
+        return entries.into_iter().map(|(a, _, _)| (a, None)).collect();
+    }
+    entries
+        .into_iter()
+        .map(|(addr, source, _)| {
+            let (weight, count) = per_source[&source];
+            let share = (weight * SPREAD_TOTAL + total * count / 2) / (total * count);
+            (addr, Some(u32::try_from(share.max(1)).unwrap_or(u32::MAX)))
+        })
+        .collect()
+}
+
+/// Formats `ip:port[ weight]`, spreading the weights first when asked.
+fn format_addrs(entries: Vec<(String, usize, Option<u32>)>, spread_weights: bool) -> Vec<String> {
+    let weighted: Vec<(String, Option<u32>)> = if spread_weights {
+        spread(
+            entries
+                .into_iter()
+                .map(|(a, s, w)| (a, s, w.unwrap_or(1)))
+                .collect(),
+        )
+    } else {
+        entries.into_iter().map(|(a, _, w)| (a, w)).collect()
+    };
+    let mut addrs: Vec<String> = weighted
+        .into_iter()
+        .map(|(addr, w)| match w {
+            Some(w) => format!("{addr} {w}"),
+            None => addr,
+        })
+        .collect();
+    addrs.sort();
+    addrs
 }
 
 /// Resolves the `addrs` of one upstream from its `services` entries, in
 /// config order.
 pub fn resolve(inputs: &[ServiceInput<'_>], opts: &UpstreamOptions) -> Resolved {
     if let UpstreamTarget::Service { cluster_domain } = &opts.target {
-        return resolve_service_target(inputs, cluster_domain, opts.ipv4_only);
+        return resolve_service_target(inputs, cluster_domain, opts);
     }
     let mut warnings = Vec::new();
     let mut seen: HashMap<SocketAddr, Entry> = HashMap::new();
 
-    for input in inputs {
+    for (source, input) in inputs.iter().enumerate() {
         let sref = input.service_ref;
         let Some(service) = input.snapshot.service.as_deref() else {
             warnings.push(ResolveWarning::ServiceMissing(sref.key.clone()));
@@ -244,6 +296,7 @@ pub fn resolve(inputs: &[ServiceInput<'_>], opts: &UpstreamOptions) -> Resolved 
                     .or_insert(Entry {
                         weight: sref.weight,
                         class,
+                        source,
                     });
             }
         }
@@ -266,15 +319,13 @@ pub fn resolve(inputs: &[ServiceInput<'_>], opts: &UpstreamOptions) -> Resolved 
         (Class::Ready, false)
     };
 
-    let mut addrs: Vec<String> = seen
-        .iter()
-        .filter(|(_, e)| e.class == wanted)
-        .map(|(addr, e)| match e.weight {
-            Some(w) => format!("{addr} {w}"),
-            None => addr.to_string(),
-        })
-        .collect();
-    addrs.sort();
+    let addrs = format_addrs(
+        seen.iter()
+            .filter(|(_, e)| e.class == wanted)
+            .map(|(addr, e)| (addr.to_string(), e.source, e.weight))
+            .collect(),
+        opts.spread_weights,
+    );
 
     warnings.sort();
     warnings.dedup();
@@ -300,13 +351,14 @@ pub fn resolve(inputs: &[ServiceInput<'_>], opts: &UpstreamOptions) -> Resolved 
 fn resolve_service_target(
     inputs: &[ServiceInput<'_>],
     cluster_domain: &str,
-    ipv4_only: bool,
+    opts: &UpstreamOptions,
 ) -> Resolved {
+    let ipv4_only = opts.ipv4_only;
     let mut warnings = Vec::new();
-    // address -> weight; the first entry in config order keeps its weight.
-    let mut seen: HashMap<String, Option<u32>> = HashMap::new();
+    // address -> (source, weight); the first entry in config order keeps its weight.
+    let mut seen: HashMap<String, (usize, Option<u32>)> = HashMap::new();
 
-    for input in inputs {
+    for (source, input) in inputs.iter().enumerate() {
         let sref = input.service_ref;
         let Some(service) = input.snapshot.service.as_deref() else {
             warnings.push(ResolveWarning::ServiceMissing(sref.key.clone()));
@@ -341,17 +393,14 @@ fn resolve_service_target(
                 sref.key.name, sref.key.namespace
             ),
         };
-        seen.entry(format!("{host}:{port}")).or_insert(sref.weight);
+        seen.entry(format!("{host}:{port}"))
+            .or_insert((source, sref.weight));
     }
 
-    let mut addrs: Vec<String> = seen
-        .into_iter()
-        .map(|(addr, weight)| match weight {
-            Some(w) => format!("{addr} {w}"),
-            None => addr,
-        })
-        .collect();
-    addrs.sort();
+    let addrs = format_addrs(
+        seen.into_iter().map(|(a, (s, w))| (a, s, w)).collect(),
+        opts.spread_weights,
+    );
     warnings.sort();
     warnings.dedup();
 
@@ -424,6 +473,7 @@ mod tests {
             debounce: Duration::from_millis(500),
             debounce_max: Duration::from_secs(2),
             target: UpstreamTarget::Pods,
+            spread_weights: false,
         }
     }
 
@@ -1141,6 +1191,68 @@ mod tests {
             },
         ];
         assert_eq!(resolve(&inputs_rev, &opts()).addrs, want);
+    }
+
+    #[test]
+    fn spread_weights_split_each_service_over_its_addresses() {
+        let blue = sref("web-blue", named("http"), Some(9));
+        let green = sref("web-green", named("http"), Some(1));
+        let sb = snap(
+            http_svc(),
+            vec![v4(vec![
+                ep("10.0.0.9", READY),
+                ep("10.0.0.10", READY),
+                ep("10.0.0.11", READY),
+            ])],
+        );
+        let sg = snap(http_svc(), vec![v4(vec![ep("10.0.1.1", READY)])]);
+        let inputs = [
+            ServiceInput {
+                service_ref: &blue,
+                snapshot: &sb,
+            },
+            ServiceInput {
+                service_ref: &green,
+                snapshot: &sg,
+            },
+        ];
+        let opts = UpstreamOptions {
+            spread_weights: true,
+            ..opts()
+        };
+        // 90 % over three pods, 10 % on one: 300 each and 100.
+        assert_eq!(
+            resolve(&inputs, &opts).addrs,
+            vec![
+                "10.0.0.10:8080 300",
+                "10.0.0.11:8080 300",
+                "10.0.0.9:8080 300",
+                "10.0.1.1:8080 100",
+            ]
+        );
+
+        // Huge Gateway API weights are scaled down; a tiny share still gets 1.
+        let big = sref("web-blue", named("http"), Some(1_000_000));
+        let tiny = sref("web-green", named("http"), Some(1));
+        let inputs = [
+            ServiceInput {
+                service_ref: &big,
+                snapshot: &sb,
+            },
+            ServiceInput {
+                service_ref: &tiny,
+                snapshot: &sg,
+            },
+        ];
+        assert_eq!(
+            resolve(&inputs, &opts).addrs,
+            vec![
+                "10.0.0.10:8080 333",
+                "10.0.0.11:8080 333",
+                "10.0.0.9:8080 333",
+                "10.0.1.1:8080 1",
+            ]
+        );
     }
 
     #[test]

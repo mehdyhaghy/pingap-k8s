@@ -1,6 +1,8 @@
 pub mod config;
 pub mod etcd;
 pub mod events;
+pub mod gateway;
+pub mod health_check;
 pub mod leader;
 pub mod metrics;
 pub mod reconcile;

@@ -1,0 +1,15 @@
+# CI render check for the Gateway API provider: a GatewayClass, the [gateway]
+# config table, the gateway ClusterRole, and secret rules in the Role of each
+# gateway namespace (restricted by name).
+gateway:
+  enabled: true
+  namespaces: ["web", "shop"]
+  secretNames: ["web-tls", "shop-tls"]
+  servers: ["http", "https"]
+  externalName: true
+  addresses: ["203.0.113.10", "2001:db8::10", "lb.example.com"]
+  healthCheck: "http://k8s/healthz?connection_timeout=1s&check_frequency=5s"
+config:
+  upstreams:
+    api:
+      services: ["api.prod:http"]

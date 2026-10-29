@@ -155,14 +155,35 @@ app.kubernetes.io/component: proxy
 {{/* ---------------- RBAC namespaces ---------------- */}}
 
 {{/*
-Namespaces the controller reads, as a JSON list: rbac.namespaces plus, with
-rbac.fromConfig, the namespace of every config.upstreams[*].services entry
+Namespaces of the Gateway API provider's backend Services and listener Secrets, as
+a JSON list ([] when gateway is off).
+*/}}
+{{- define "pingap-k8s.gatewayNamespaces" -}}
+{{- $nss := list }}
+{{- if .Values.gateway.enabled }}
+{{- range .Values.gateway.namespaces }}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" .) }}
+{{- fail (printf "gateway.namespaces: %q is not a valid namespace name" .) }}
+{{- end }}
+{{- $nss = append $nss . }}
+{{- end }}
+{{- end }}
+{{- $nss | uniq | sortAlpha | toJson }}
+{{- end }}
+
+{{/*
+Namespaces the controller reads, as a JSON list: rbac.namespaces, the
+gateway.namespaces when gateway is enabled, plus, with rbac.fromConfig, the
+namespace of every config.upstreams[*].services entry
 ("<service>[.<namespace>]:<port> [weight]").
 */}}
 {{- define "pingap-k8s.rbacNamespaces" -}}
 {{- $default := default .Release.Namespace .Values.config.kubernetes.default_namespace }}
 {{- $nss := list }}
 {{- range .Values.rbac.namespaces }}
+{{- $nss = append $nss . }}
+{{- end }}
+{{- range (include "pingap-k8s.gatewayNamespaces" . | fromJsonArray) }}
 {{- $nss = append $nss . }}
 {{- end }}
 {{- if .Values.rbac.fromConfig }}
@@ -255,6 +276,18 @@ events = {{ ternary "true" "false" (.Values.events.enabled | default false) }}
 {{- end }}
 {{- if .Values.status.enabled }}
 status_listen = {{ printf "127.0.0.1:%d" (int .Values.status.port) | include "pingap-k8s.tomlString" }}
+{{- end }}
+{{- end }}
+{{- if .Values.gateway.enabled }}
+
+[gateway]
+enabled = true
+controller_name = {{ include "pingap-k8s.tomlString" (required "gateway.controllerName is required" .Values.gateway.controllerName) }}
+servers = {{ include "pingap-k8s.tomlValue" (.Values.gateway.servers | default (list)) }}
+external_name = {{ ternary "true" "false" (.Values.gateway.externalName | default false) }}
+addresses = {{ include "pingap-k8s.tomlValue" (.Values.gateway.addresses | default (list)) }}
+{{- with .Values.gateway.healthCheck }}
+health_check = {{ include "pingap-k8s.tomlString" . }}
 {{- end }}
 {{- end }}
 {{- range $name := keys .Values.config.upstreams | sortAlpha }}

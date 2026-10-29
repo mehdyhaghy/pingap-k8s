@@ -91,6 +91,7 @@ fn upstreams(target: UpstreamTarget) -> BTreeMap<String, UpstreamConfig> {
         debounce: Duration::from_millis(500),
         debounce_max: Duration::from_secs(2),
         target,
+        spread_weights: false,
     };
     let mut upstreams = BTreeMap::new();
     upstreams.insert(
@@ -105,6 +106,7 @@ fn upstreams(target: UpstreamTarget) -> BTreeMap<String, UpstreamConfig> {
                 weight: None,
             }],
             options,
+            health_check: None,
         },
     );
     upstreams

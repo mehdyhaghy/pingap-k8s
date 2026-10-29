@@ -40,6 +40,27 @@ impl EndpointClass {
     }
 }
 
+/// `result` label of `pingap_k8s_gateway_sync_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewaySyncResult {
+    /// The plan was applied and changed etcd.
+    Ok,
+    /// Nothing to change.
+    Unchanged,
+    /// Applying failed (CAS conflict or etcd error); re-planned or retried later.
+    Error,
+}
+
+impl GatewaySyncResult {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GatewaySyncResult::Ok => "ok",
+            GatewaySyncResult::Unchanged => "unchanged",
+            GatewaySyncResult::Error => "error",
+        }
+    }
+}
+
 /// `result` label of `pingap_k8s_writes_total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriteResult {
@@ -77,6 +98,9 @@ struct Gauges {
     is_leader: u64,
     /// `None` until the first etcd interaction (reported as 0).
     etcd_up: Option<bool>,
+    /// Gateway provider gauges; `None` (not reported) while it is off.
+    gateway_locations: Option<u64>,
+    gateway_deferred: Option<u64>,
 }
 
 pub struct Metrics {
@@ -87,6 +111,7 @@ pub struct Metrics {
     foreign_writes: Counter<u64>,
     watch_errors: Counter<u64>,
     event_to_write: Histogram<f64>,
+    gateway_sync: Counter<u64>,
 }
 
 impl Default for Metrics {
@@ -165,6 +190,28 @@ impl Metrics {
             .with_description("1 when the last etcd interaction got an answer, else 0.")
             .with_callback(move |o| o.observe(u64::from(lock(&g).etcd_up == Some(true)), &[]))
             .build();
+        let g = gauges.clone();
+        meter
+            .u64_observable_gauge("pingap_k8s.gateway_locations")
+            .with_description("Generated Gateway API locations live in Pingap.")
+            .with_callback(move |o| {
+                if let Some(v) = lock(&g).gateway_locations {
+                    o.observe(v, &[]);
+                }
+            })
+            .build();
+        let g = gauges.clone();
+        meter
+            .u64_observable_gauge("pingap_k8s.gateway_deferred")
+            .with_description(
+                "Generated Gateway API locations waiting for their upstream or a plugin.",
+            )
+            .with_callback(move |o| {
+                if let Some(v) = lock(&g).gateway_deferred {
+                    o.observe(v, &[]);
+                }
+            })
+            .build();
 
         Metrics {
             writes: meter
@@ -184,6 +231,10 @@ impl Metrics {
                 .with_unit("s")
                 .with_description("Time from the first pending Kubernetes event to the etcd write.")
                 .with_boundaries(EVENT_TO_WRITE_BUCKETS.to_vec())
+                .build(),
+            gateway_sync: meter
+                .u64_counter("pingap_k8s.gateway_sync")
+                .with_description("Gateway sync passes that applied a plan, by result.")
                 .build(),
             registry,
             provider,
@@ -294,6 +345,18 @@ impl Metrics {
 
     pub fn set_leader(&self, leader: bool) {
         lock(&self.gauges).is_leader = u64::from(leader);
+    }
+
+    /// Gateway provider gauges after a pass: programmed and deferred locations.
+    pub fn set_gateway_locations(&self, programmed: usize, deferred: usize) {
+        let mut g = lock(&self.gauges);
+        g.gateway_locations = Some(programmed as u64);
+        g.gateway_deferred = Some(deferred as u64);
+    }
+
+    pub fn record_gateway_sync(&self, result: GatewaySyncResult) {
+        self.gateway_sync
+            .add(1, &[KeyValue::new("result", result.as_str())]);
     }
 
     /// Sets `etcd_up` and returns the previous value (`None` before the
@@ -510,6 +573,30 @@ mod tests {
         a.set_leader(true);
         assert!(a.encode().contains("pingap_k8s_is_leader 1"));
         assert!(b.encode().contains("pingap_k8s_is_leader 0"));
+    }
+
+    #[test]
+    fn gateway_series_only_when_used() {
+        let m = Metrics::new();
+        assert!(!m.encode().contains("gateway"), "{}", m.encode());
+        m.set_gateway_locations(3, 1);
+        m.record_gateway_sync(GatewaySyncResult::Ok);
+        m.record_gateway_sync(GatewaySyncResult::Error);
+        m.record_gateway_sync(GatewaySyncResult::Error);
+        m.record_gateway_sync(GatewaySyncResult::Unchanged);
+        let text = m.encode();
+        for line in [
+            "# TYPE pingap_k8s_gateway_locations gauge",
+            "pingap_k8s_gateway_locations 3",
+            "# TYPE pingap_k8s_gateway_deferred gauge",
+            "pingap_k8s_gateway_deferred 1",
+            "# TYPE pingap_k8s_gateway_sync_total counter",
+            r#"pingap_k8s_gateway_sync_total{result="ok"} 1"#,
+            r#"pingap_k8s_gateway_sync_total{result="error"} 2"#,
+            r#"pingap_k8s_gateway_sync_total{result="unchanged"} 1"#,
+        ] {
+            assert!(text.contains(line), "missing line {line:?} in:\n{text}");
+        }
     }
 
     #[test]

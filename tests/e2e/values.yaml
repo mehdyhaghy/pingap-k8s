@@ -15,6 +15,15 @@ logLevel: "info,pingap_k8s=debug"
 events:
   enabled: true
 
+# Gateway API provider: the GatewayClass "pingap" and the [gateway] table. Listeners
+# map onto the seed's gw-http (8082) and gw-https (8443, global_certificates) servers;
+# backends and listener Secrets live in e2e-app.
+gateway:
+  enabled: true
+  namespaces: ["e2e-app"]
+  servers: ["gw-http", "gw-https"]
+  addresses: ["pingap-k8s-pingap.pingap-k8s.svc"]
+
 # The tests scrape the controller's metrics from the client pod.
 networkPolicy:
   metricsFrom:
@@ -40,8 +49,8 @@ pingap:
     # tests know the credentials without reading the chart's generated Secret.
     existingSecret: pingap-k8s-pingap-admin-e2e
   networkPolicy:
-    # The gRPC listener of e2e test 12.
-    extraPorts: [8081]
+    # The gRPC listener of e2e test 12, and the Gateway API listeners.
+    extraPorts: [8081, 8082, 8443]
     # E2E tests 9 and 10 call the admin API from the client pod.
     adminFrom:
       - namespaceSelector:
@@ -73,6 +82,14 @@ pingap:
       addr = "[::]:8081"
       enabled_h2 = true
       locations = ["grpc"]
+
+      # Gateway API listeners: the controller lists its generated locations here.
+      [servers.gw-http]
+      addr = "[::]:8082"
+
+      [servers.gw-https]
+      addr = "[::]:8443"
+      global_certificates = true
 
       [locations.echo]
       upstream = "echo"

@@ -141,7 +141,7 @@ jobs:
       - name: plain manifests are up to date
         run: make manifests-check
 
-      - name: no public exposure of etcd, metrics or admin; no ClusterRole
+      - name: no public exposure of etcd, metrics or admin; no cluster-wide RBAC but the read-only gateway ClusterRole
         run: make exposure-check
 
   image:

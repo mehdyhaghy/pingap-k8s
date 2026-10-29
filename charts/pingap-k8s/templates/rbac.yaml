@@ -1,14 +1,20 @@
 {{- /*
 Read-only access to Services and EndpointSlices, one Role + RoleBinding per
-namespace the controller reads. Never a ClusterRole.
-With events.enabled, the only write permission: create and patch on
-events.k8s.io events in those namespaces (Service Events) and in the release
-namespace (Events about the controller Pod).
+namespace the controller reads.
+With events.enabled, create and patch on events.k8s.io events in those
+namespaces (Service Events) and in the release namespace (Events about the
+controller Pod).
+With gateway.enabled: in each gateway.namespaces namespace, read secrets
+(limited to gateway.secretNames when set); and the only ClusterRole: read the
+Gateway API resources and namespaces, patch the status of GatewayClasses,
+Gateways and HTTPRoutes. GatewayClasses are cluster-scoped and routes attach
+across namespaces, so this part can not be namespaced.
 */ -}}
 {{- if .Values.rbac.create }}
 {{- $fullname := include "pingap-k8s.fullname" . }}
 {{- $sa := include "pingap-k8s.serviceAccountName" . }}
 {{- $namespaces := include "pingap-k8s.rbacNamespaces" . | fromJsonArray }}
+{{- $gatewayNamespaces := include "pingap-k8s.gatewayNamespaces" . | fromJsonArray }}
 {{- range $ns := $namespaces }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -29,6 +35,14 @@ rules:
   - apiGroups: ["events.k8s.io"]
     resources: ["events"]
     verbs: ["create", "patch"]
+  {{- end }}
+  {{- if has $ns $gatewayNamespaces }}
+  - apiGroups: [""]
+    resources: ["secrets"]
+    {{- with $.Values.gateway.secretNames }}
+    resourceNames: {{ toJson . }}
+    {{- end }}
+    verbs: ["get", "list", "watch"]
   {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -72,6 +86,40 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: {{ $fullname }}-events
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- if .Values.gateway.enabled }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}-gateway
+  labels:
+    {{- include "pingap-k8s.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gatewayclasses", "gateways", "httproutes", "referencegrants"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gatewayclasses/status", "gateways/status", "httproutes/status"]
+    verbs: ["patch"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fullname }}-gateway
+  labels:
+    {{- include "pingap-k8s.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $fullname }}-gateway
 subjects:
   - kind: ServiceAccount
     name: {{ $sa }}

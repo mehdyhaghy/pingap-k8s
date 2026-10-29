@@ -50,6 +50,39 @@ events:
   # namespace for the Pod events. Never a ClusterRole.
   enabled: false
 
+gateway:
+  # Gateway API provider (off by default; needs the Gateway API v1.6.3
+  # Standard-channel CRDs installed). Gateways of the GatewayClasses whose
+  # spec.controllerName is controllerName, and the HTTPRoutes attached to them,
+  # become Pingap locations, certificates, plugins and upstreams (names starting
+  # with "k8s-") in the same etcd prefix. Changing enabled restarts the
+  # controller pods. Grants the chart's only ClusterRole (read the Gateway API
+  # resources and namespaces, patch their status).
+  enabled: false
+  controllerName: pingap.io/gateway-controller
+  # GatewayClass created by the chart (cluster-scoped); empty: none.
+  className: pingap
+  # Namespaces of backend Services and listener certificate Secrets. Each gets
+  # the Service/EndpointSlice read Role plus get/list/watch on secrets.
+  namespaces: []
+  # Restrict that Secret access to these names (Role resourceNames), e.g.
+  # ["web-tls"]. Empty: every Secret in those namespaces.
+  secretNames: []
+  # Pingap servers (already in etcd) listeners may be mapped onto, by port and
+  # TLS (global_certificates). Empty: every stored server. The controller never
+  # creates servers.
+  servers: []
+  # Allow ExternalName Service backends (Pingap DNS discovery on the external
+  # name).
+  externalName: false
+  # Written to status.addresses of accepted Gateways: IPs or hostnames clients
+  # use to reach Pingap.
+  addresses: []
+  # Pingap health_check of generated upstreams, e.g.
+  # "http://k8s/healthz?connection_timeout=1s&check_frequency=5s".
+  # Empty: Pingap's default TCP check.
+  healthCheck: ""
+
 etcd:
   # Pingap's etcd URL, the same string Pingap gets with --conf:
   #   etcd://host:port[,host:port]/<prefix>?ca=..&cert=..&key=..

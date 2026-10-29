@@ -2,23 +2,34 @@
 //! watches, reconcile, leader election, the metrics server, config reload and
 //! graceful shutdown. The logic lives in the library modules.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::{Parser, ValueEnum};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
-use pingap_k8s::config::{Config, ConfigError};
+use pingap_k8s::config::{Config, ConfigError, UpstreamConfig};
 use pingap_k8s::etcd::{EtcdError, EtcdTarget, EtcdWriter, parse_etcd_url};
 use pingap_k8s::events::Events;
+use pingap_k8s::gateway::controller::{
+    ControllerSettings, GatewayController, Inputs, Parts, Wired,
+};
+use pingap_k8s::gateway::model::{
+    GatewaySource, GeneratedUpstreams, PingapStore, SecretSource, StatusPublisher,
+};
+use pingap_k8s::gateway::secrets::SecretRegistry;
+use pingap_k8s::gateway::status::KubeStatus;
+use pingap_k8s::gateway::watch::GatewayWatch;
+use pingap_k8s::gateway::writer::{GatewayWriter, TxnLimits};
 use pingap_k8s::leader;
 use pingap_k8s::metrics::{EtcdHealth, Metrics};
 use pingap_k8s::reconcile::Reconciler;
@@ -455,24 +466,26 @@ async fn run(
     let client = kube_client(&config.kubernetes).await?;
     let events = kube_events(&config, &client, &namespace);
     let etcd_health = EtcdHealth::new(metrics.clone(), events.clone());
+    // Ready only once the Gateway API sources listed too (when the provider is on).
+    let gate = ReadyGate::new(readiness.clone(), config.gateway.is_none());
 
     let Some(writer) = retry("connecting to etcd", &shutdown_rx, || {
         EtcdWriter::connect(&target)
     })
     .await
     else {
-        return finish(server_task, None, None).await;
+        return finish(server_task, None, None, None).await;
     };
     let writer = writer.with_etcd_health(etcd_health.clone());
     etcd_health.report(true);
     info!(endpoints = ?target.endpoints, prefix = writer.prefix(), "connected to etcd");
 
-    let registry = WatchRegistry::new(client, metrics.clone());
+    let registry = WatchRegistry::new(client.clone(), metrics.clone());
     registry.set_services(config.service_keys());
     status_board.set_watches(Arc::new(registry.clone()));
     // Never write a partial set, so nothing starts before every watcher listed once.
-    if !wait_synced(&registry, &readiness, &mut reload_drain(), &shutdown_rx).await {
-        return finish(server_task, None, None).await;
+    if !wait_synced(&registry, &gate, &mut reload_drain(), &shutdown_rx).await {
+        return finish(server_task, None, None, None).await;
     }
 
     // Leader election, on its own client: a follower's Campaign blocks until it is
@@ -482,7 +495,7 @@ async fn run(
     })
     .await
     else {
-        return finish(server_task, None, None).await;
+        return finish(server_task, None, None, None).await;
     };
     let (leader_tx, leader_rx) = watch::channel(false);
     let election = tokio::spawn(leader::run_election_with_health(
@@ -503,7 +516,7 @@ async fn run(
     })
     .await
     else {
-        return finish(server_task, Some(election), None).await;
+        return finish(server_task, Some(election), None, None).await;
     };
 
     // Reconcile loop.
@@ -514,33 +527,230 @@ async fn run(
         readiness.clone(),
     )
     .with_status(status_board)
-    .with_events(events);
+    .with_events(events.clone());
     reconciler.set_upstreams(config.upstreams.clone());
     let reconcile_task = tokio::spawn(reconciler.clone().run(
         registry.subscribe(),
         foreign,
-        leader_rx,
+        leader_rx.clone(),
         config.defaults.resync,
         shutdown_signal(shutdown_rx.clone()),
     ));
     info!("reconciler started");
+
+    // Gateway API provider: generated upstreams come back over `generated` and are
+    // applied by the Controller below together with the config upstreams.
+    let (generated_tx, generated_rx) = mpsc::channel::<GeneratedUpstreams>(8);
+    let mut gateway_settings = None;
+    let mut gateway_task = None;
+    if let Some(settings) = ControllerSettings::from_config(&config) {
+        let (settings_tx, settings_rx) = watch::channel(settings.clone());
+        let (synced_tx, synced_rx) = watch::channel(false);
+        let start = GatewayStart {
+            client: client.clone(),
+            writer: writer.clone(),
+            registry: registry.clone(),
+            metrics: metrics.clone(),
+            controller_name: settings.translate.controller_name.clone(),
+            settings: settings_rx,
+            leader: leader_rx,
+            generated: generated_tx,
+            synced: synced_tx,
+            resync: config.defaults.resync,
+            shutdown: shutdown_rx.clone(),
+            max_txn_ops: config.gateway.as_ref().map_or(0, |g| g.max_txn_ops),
+        };
+        match start_gateway(start).await {
+            Some(task) => {
+                gate.follow_gateway(synced_rx, registry.clone());
+                gateway_settings = Some(settings_tx);
+                gateway_task = Some(task);
+                info!("gateway controller started");
+            }
+            None => gate.set_gateway_synced(true),
+        }
+    }
 
     // Config reload until shutdown.
     let _file_watcher = watch_config_file(&config_path, reload_tx);
     let mut controller = Controller {
         path: config_path,
         namespace,
+        applied_keys: config.service_keys(),
+        applied_names: owned_names(&config),
         boot: config.clone(),
         current: config,
         registry,
         reconciler,
         writer,
-        readiness,
+        gate,
         owned_watch_pending: false,
+        generated: BTreeMap::new(),
+        generated_services: BTreeSet::new(),
+        waiters: Vec::new(),
+        gateway_settings,
     };
-    controller.run(reload_rx, &shutdown_rx).await;
+    let generated_rx = gateway_task.is_some().then_some(generated_rx);
+    controller.run(reload_rx, generated_rx, &shutdown_rx).await;
 
-    finish(server_task, Some(election), Some(reconcile_task)).await
+    finish(
+        server_task,
+        Some(election),
+        Some(reconcile_task),
+        gateway_task,
+    )
+    .await
+}
+
+/// What the Gateway controller is built from.
+struct GatewayStart {
+    client: kube::Client,
+    writer: EtcdWriter,
+    registry: WatchRegistry,
+    metrics: Arc<Metrics>,
+    controller_name: String,
+    settings: watch::Receiver<ControllerSettings>,
+    leader: watch::Receiver<bool>,
+    generated: mpsc::Sender<GeneratedUpstreams>,
+    synced: watch::Sender<bool>,
+    resync: Duration,
+    shutdown: watch::Receiver<bool>,
+    max_txn_ops: usize,
+}
+
+/// Builds the Kubernetes and etcd parts of the Gateway API provider and spawns its
+/// controller. `None` when shutdown comes first.
+async fn start_gateway(start: GatewayStart) -> Option<JoinHandle<()>> {
+    let gateways = Arc::new(GatewayWatch::new(start.client.clone()));
+    let secrets = Arc::new(SecretRegistry::new(start.client.clone()));
+    let status = Arc::new(KubeStatus::new(
+        start.client.clone(),
+        start.controller_name.clone(),
+    ));
+    let limits = TxnLimits {
+        max_ops: start.max_txn_ops,
+        ..TxnLimits::default()
+    };
+    let store = GatewayWriter::new(&start.writer, limits);
+    let etcd_changes = retry(
+        "watching the Pingap entries",
+        &start.shutdown.clone(),
+        || store.watch_changes(),
+    )
+    .await?;
+    Some(spawn_gateway(
+        gateways,
+        secrets,
+        Arc::new(store),
+        status,
+        etcd_changes,
+        start,
+    ))
+}
+
+/// Spawns the Gateway controller on the given parts.
+fn spawn_gateway<G, S, St, P>(
+    gateways: Arc<G>,
+    secrets: Arc<S>,
+    store: Arc<St>,
+    status: Arc<P>,
+    etcd_changes: mpsc::Receiver<()>,
+    start: GatewayStart,
+) -> JoinHandle<()>
+where
+    G: GatewaySource,
+    S: SecretSource,
+    St: PingapStore,
+    P: StatusPublisher,
+{
+    let inputs = Inputs {
+        settings: start.settings,
+        leader: start.leader,
+        service_changes: start.registry.subscribe(),
+        etcd_changes,
+        generated: start.generated,
+        synced: start.synced,
+        resync: start.resync,
+    };
+    let controller = GatewayController::new(Parts {
+        gateways,
+        secrets,
+        services: Arc::new(start.registry),
+        store,
+        status,
+        logic: Arc::new(Wired {
+            prefix: start.writer.prefix().to_string(),
+        }),
+        metrics: start.metrics,
+    });
+    tokio::spawn(controller.run(inputs, shutdown_signal(start.shutdown)))
+}
+
+/// `/readyz` needs the Service watchers synced and, with the Gateway API provider on,
+/// its first complete pass (every Gateway API source listed once).
+#[derive(Clone)]
+struct ReadyGate {
+    readiness: Readiness,
+    gateway_synced: Arc<AtomicBool>,
+}
+
+impl ReadyGate {
+    fn new(readiness: Readiness, gateway_synced: bool) -> Self {
+        Self {
+            readiness,
+            gateway_synced: Arc::new(AtomicBool::new(gateway_synced)),
+        }
+    }
+
+    /// The Service watchers are (not) synced.
+    fn set(&self, watchers_synced: bool) {
+        self.readiness
+            .set_watchers_synced(watchers_synced && self.gateway_synced.load(Ordering::SeqCst));
+    }
+
+    fn set_gateway_synced(&self, synced: bool) {
+        self.gateway_synced.store(synced, Ordering::SeqCst);
+    }
+
+    /// Marks the Gateway API sources synced once the controller says so.
+    fn follow_gateway(&self, mut synced: watch::Receiver<bool>, registry: WatchRegistry) {
+        let gate = self.clone();
+        tokio::spawn(async move {
+            if synced.wait_for(|s| *s).await.is_ok() {
+                gate.set_gateway_synced(true);
+                gate.set(registry.is_synced());
+                info!("Gateway API sources synced");
+            }
+        });
+    }
+}
+
+/// Config upstreams plus generated ones. Config names win; they cannot clash, as
+/// `k8s-` names are reserved in the config while the Gateway API provider is on.
+fn merged_upstreams(
+    config: &Config,
+    generated: &BTreeMap<String, UpstreamConfig>,
+) -> BTreeMap<String, UpstreamConfig> {
+    let mut all = generated.clone();
+    all.extend(config.upstreams.clone());
+    all
+}
+
+/// The Services the endpoint writer must watch: those of the config upstreams,
+/// of the generated upstreams and the backends the Gateway controller asked for.
+fn merged_service_keys(
+    config: &Config,
+    generated: &BTreeMap<String, UpstreamConfig>,
+    generated_services: &BTreeSet<ServiceKey>,
+) -> BTreeSet<ServiceKey> {
+    let mut keys = config.service_keys();
+    keys.extend(generated_services.iter().cloned());
+    keys.extend(
+        generated
+            .values()
+            .flat_map(|u| u.services.iter().map(|s| s.key.clone())),
+    );
+    keys
 }
 
 /// Kubernetes Events per `[kubernetes] events`, as this pod.
@@ -562,12 +772,13 @@ fn reload_drain() -> mpsc::Receiver<Trigger> {
     mpsc::channel(1).1
 }
 
-/// Waits for the reconciler, the election (which resigns) and the HTTP server,
-/// each bounded, all in parallel.
+/// Waits for the reconciler, the Gateway controller, the election (which resigns)
+/// and the HTTP server, each bounded, all in parallel.
 async fn finish(
     server_task: JoinHandle<anyhow::Result<()>>,
     election: Option<JoinHandle<()>>,
     reconcile: Option<JoinHandle<()>>,
+    gateway: Option<JoinHandle<()>>,
 ) -> anyhow::Result<()> {
     async fn bounded<T>(what: &str, task: Option<JoinHandle<T>>) -> Option<T> {
         let task = task?;
@@ -583,8 +794,9 @@ async fn finish(
             }
         }
     }
-    let (_, _, served) = tokio::join!(
+    let (_, _, _, served) = tokio::join!(
         bounded("reconciler", reconcile),
+        bounded("gateway controller", gateway),
         bounded("leader election", election),
         bounded("metrics server", Some(server_task)),
     );
@@ -624,7 +836,7 @@ enum Flow {
 /// are still missing every [`SYNC_WAIT`]. Returns false on shutdown.
 async fn wait_synced(
     registry: &WatchRegistry,
-    readiness: &Readiness,
+    readiness: &ReadyGate,
     triggers: &mut mpsc::Receiver<Trigger>,
     shutdown: &watch::Receiver<bool>,
 ) -> bool {
@@ -636,7 +848,7 @@ async fn wait_synced(
 
 async fn wait_synced_or_reload(
     registry: &WatchRegistry,
-    readiness: &Readiness,
+    readiness: &ReadyGate,
     triggers: &mut mpsc::Receiver<Trigger>,
     shutdown: &watch::Receiver<bool>,
 ) -> Flow {
@@ -650,7 +862,7 @@ async fn wait_synced_or_reload(
             },
             () = shutdown_signal(shutdown.clone()) => return Flow::Shutdown,
         };
-        readiness.set_watchers_synced(synced);
+        readiness.set(synced);
         if synced {
             info!(services = registry.services().len(), "all watchers synced");
             return Flow::Done;
@@ -722,7 +934,7 @@ fn is_config_path(path: &Path, name: &std::ffi::OsStr) -> bool {
     }
 }
 
-/// Owns the running state that reloads change.
+/// Owns the running state that reloads and generated upstreams change.
 struct Controller {
     path: PathBuf,
     namespace: String,
@@ -733,27 +945,54 @@ struct Controller {
     registry: WatchRegistry,
     reconciler: AppReconciler,
     writer: EtcdWriter,
-    readiness: Readiness,
+    gate: ReadyGate,
     /// The owned upstream set changed but restarting the owned-key watch failed.
     owned_watch_pending: bool,
+    /// Services currently watched for the reconciler (a superset of what the
+    /// applied upstreams use while an old set may still be read).
+    applied_keys: BTreeSet<ServiceKey>,
+    /// Upstream names the reconciler owns (config and generated); the owned-key
+    /// watch covers these.
+    applied_names: Vec<String>,
+    /// The latest upstreams and backend Services from the Gateway controller.
+    generated: BTreeMap<String, UpstreamConfig>,
+    generated_services: BTreeSet<ServiceKey>,
+    /// `applied` of generated sets not applied yet; fired after the next apply.
+    waiters: Vec<oneshot::Sender<()>>,
+    /// Settings of the running Gateway controller.
+    gateway_settings: Option<watch::Sender<ControllerSettings>>,
+}
+
+/// What the Controller does next.
+enum Work {
+    Reload(Trigger),
+    Generated(GeneratedUpstreams),
 }
 
 impl Controller {
     async fn run(
         &mut self,
         mut triggers: mpsc::Receiver<Trigger>,
+        mut generated: Option<mpsc::Receiver<GeneratedUpstreams>>,
         shutdown: &watch::Receiver<bool>,
     ) {
         let mut next: Option<Trigger> = None;
         let mut retry_delay = RETRY_MIN;
         loop {
-            let trigger = match next.take() {
-                Some(t) => t,
+            let work = match next.take() {
+                Some(t) => Work::Reload(t),
                 None => tokio::select! {
                     () = shutdown_signal(shutdown.clone()) => return,
                     t = triggers.recv() => match t {
-                        Some(t) => t,
+                        Some(t) => Work::Reload(t),
                         None => return,
+                    },
+                    g = recv_generated(&mut generated) => match g {
+                        Some(g) => Work::Generated(g),
+                        None => {
+                            generated = None;
+                            continue;
+                        }
                     },
                     () = tokio::time::sleep(retry_delay), if self.owned_watch_pending => {
                         if self.restart_owned_watch().await {
@@ -765,11 +1004,25 @@ impl Controller {
                     }
                 },
             };
-            let trigger = match debounce(trigger, &mut triggers, shutdown).await {
-                Some(t) => t,
-                None => return,
+            let flow = match work {
+                Work::Reload(trigger) => {
+                    let trigger = match debounce(trigger, &mut triggers, shutdown).await {
+                        Some(t) => t,
+                        None => return,
+                    };
+                    self.reload(trigger, &mut triggers, shutdown).await
+                }
+                Work::Generated(g) => {
+                    self.take_generated(g);
+                    // Only the latest set matters; keep every `applied`.
+                    while let Some(g) = generated.as_mut().and_then(|rx| rx.try_recv().ok()) {
+                        self.take_generated(g);
+                    }
+                    self.apply(None, "generated upstreams", &mut triggers, shutdown)
+                        .await
+                }
             };
-            match self.reload(trigger, &mut triggers, shutdown).await {
+            match flow {
                 Flow::Done => {}
                 Flow::Shutdown => return,
                 Flow::Superseded(t) => {
@@ -778,6 +1031,12 @@ impl Controller {
                 }
             }
         }
+    }
+
+    fn take_generated(&mut self, g: GeneratedUpstreams) {
+        self.generated = g.upstreams;
+        self.generated_services = g.services;
+        self.waiters.push(g.applied);
     }
 
     /// Load, validate and apply the config. On error the old config stays.
@@ -808,37 +1067,64 @@ impl Controller {
                 "{field} changed; restart required to apply it (keeping the running value)"
             );
         }
+        if let (Some(tx), Some(settings)) = (
+            &self.gateway_settings,
+            ControllerSettings::from_config(&new),
+        ) {
+            tx.send_if_modified(|current| {
+                let changed = *current != settings;
+                *current = settings;
+                changed
+            });
+        }
+        self.apply(Some(new), trigger.as_str(), triggers, shutdown)
+            .await
+    }
 
+    /// Hands the config upstreams (of `new`, else the current config) plus the
+    /// generated ones to the reconciler. On success the current config is `new` and
+    /// the waiting `applied` senders fire.
+    async fn apply(
+        &mut self,
+        new: Option<Config>,
+        what: &str,
+        triggers: &mut mpsc::Receiver<Trigger>,
+        shutdown: &watch::Receiver<bool>,
+    ) -> Flow {
+        let config = new.as_ref().unwrap_or(&self.current);
         // Start watchers for new Services and wait for their first list before the
         // reconciler sees upstreams that use them. Old ones keep running until
         // the reconciler has switched.
-        let new_keys = new.service_keys();
-        let union: BTreeSet<ServiceKey> = self
-            .current
-            .service_keys()
-            .union(&new_keys)
-            .cloned()
-            .collect();
-        self.registry.set_services(union);
+        let new_keys = merged_service_keys(config, &self.generated, &self.generated_services);
+        let union: BTreeSet<ServiceKey> = self.applied_keys.union(&new_keys).cloned().collect();
+        self.registry.set_services(union.clone());
         if !self.registry.is_synced() {
-            self.readiness.set_watchers_synced(false);
-            let flow =
-                wait_synced_or_reload(&self.registry, &self.readiness, triggers, shutdown).await;
+            self.gate.set(false);
+            let flow = wait_synced_or_reload(&self.registry, &self.gate, triggers, shutdown).await;
             if flow != Flow::Done {
                 return flow;
             }
         }
 
-        let owned_changed = owned_names(&self.current) != owned_names(&new);
-        let generation = self.reconciler.set_upstreams(new.upstreams.clone());
-        self.current = new;
+        let config = new.as_ref().unwrap_or(&self.current);
+        let upstreams = merged_upstreams(config, &self.generated);
+        let names: Vec<String> = upstreams.keys().cloned().collect();
+        let owned_changed = names != self.applied_names;
+        let count = upstreams.len();
+        let generation = self.reconciler.set_upstreams(upstreams);
+        if let Some(new) = new {
+            self.current = new;
+        }
+        self.applied_names = names;
+        self.applied_keys = union;
         if owned_changed && !self.restart_owned_watch().await {
             self.owned_watch_pending = true;
         }
 
         info!(
-            trigger = trigger.as_str(),
-            upstreams = self.current.upstreams.len(),
+            trigger = what,
+            upstreams = count,
+            generated = self.generated.len(),
             services = new_keys.len(),
             owned_changed,
             "config reloaded"
@@ -857,9 +1143,14 @@ impl Controller {
             );
             return Flow::Done;
         }
-        self.registry.set_services(new_keys);
-        self.readiness
-            .set_watchers_synced(self.registry.is_synced());
+        self.registry.set_services(new_keys.clone());
+        self.applied_keys = new_keys;
+        self.gate.set(self.registry.is_synced());
+        // The reconciler owns the generated upstreams now: the Gateway controller
+        // may delete the ones it no longer generates.
+        for waiter in self.waiters.drain(..) {
+            let _ = waiter.send(());
+        }
         Flow::Done
     }
 
@@ -867,12 +1158,12 @@ impl Controller {
     /// the reconciler, preceded by a Resync (events between the old and the new
     /// watch may have been missed). Returns false on failure.
     async fn restart_owned_watch(&mut self) -> bool {
-        match self.writer.watch_owned(owned_names(&self.current)).await {
+        match self.writer.watch_owned(self.applied_names.clone()).await {
             Ok(rx) => {
                 self.reconciler.set_foreign_writes(with_resync(rx));
                 self.owned_watch_pending = false;
                 info!(
-                    upstreams = self.current.upstreams.len(),
+                    upstreams = self.applied_names.len(),
                     "owned-key watch restarted"
                 );
                 true
@@ -882,6 +1173,15 @@ impl Controller {
                 false
             }
         }
+    }
+}
+
+async fn recv_generated(
+    rx: &mut Option<mpsc::Receiver<GeneratedUpstreams>>,
+) -> Option<GeneratedUpstreams> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -929,6 +1229,20 @@ fn restart_required(boot: &Config, new: &Config) -> Vec<&'static str> {
     }
     if boot.defaults.resync != new.defaults.resync {
         fields.push("defaults.resync");
+    }
+    // The other [gateway] settings are applied on reload.
+    if boot.gateway.is_some() != new.gateway.is_some() {
+        fields.push("[gateway] enabled");
+    }
+    if let (Some(a), Some(b)) = (&boot.gateway, &new.gateway)
+        && a.max_txn_ops != b.max_txn_ops
+    {
+        fields.push("[gateway] max_txn_ops");
+    }
+    if let (Some(a), Some(b)) = (&boot.gateway, &new.gateway)
+        && a.controller_name != b.controller_name
+    {
+        fields.push("[gateway] controller_name");
     }
     fields
 }
@@ -1178,6 +1492,92 @@ services = ["api.prod:http"]
             restart_required(&base, &cfg("[kubernetes]\nevents = true\n")),
             vec!["[kubernetes] events"]
         );
+    }
+
+    const GATEWAY: &str = "[gateway]\nenabled = true\n";
+
+    #[test]
+    fn restart_required_gateway() {
+        let base = cfg("");
+        let on = cfg(GATEWAY);
+        assert_eq!(restart_required(&base, &on), vec!["[gateway] enabled"]);
+        assert_eq!(restart_required(&on, &base), vec!["[gateway] enabled"]);
+        // Everything else is applied on reload.
+        let live = cfg(
+            "[gateway]\nenabled = true\nservers = [\"web\"]\nexternal_name = true\n\
+             addresses = [\"203.0.113.7\"]\n",
+        );
+        assert!(restart_required(&on, &live).is_empty());
+        assert_eq!(
+            restart_required(
+                &on,
+                &cfg(&format!("{GATEWAY}controller_name = \"example.com/x\"\n"))
+            ),
+            vec!["[gateway] controller_name"]
+        );
+        assert_eq!(
+            restart_required(&on, &cfg(&format!("{GATEWAY}max_txn_ops = 32\n"))),
+            vec!["[gateway] max_txn_ops"]
+        );
+    }
+
+    fn generated_upstream(service: &str) -> UpstreamConfig {
+        let mut up = cfg("").upstreams.into_values().next().unwrap();
+        up.services[0].key = ServiceKey {
+            namespace: "apps".into(),
+            name: service.into(),
+        };
+        up
+    }
+
+    #[test]
+    fn generated_upstreams_merge_with_config() {
+        let config = cfg(GATEWAY);
+        let generated = BTreeMap::from([
+            ("k8s-apps-web-80-1".to_string(), generated_upstream("web")),
+            ("api".to_string(), generated_upstream("other")),
+        ]);
+        let merged = merged_upstreams(&config, &generated);
+        assert_eq!(
+            merged.keys().cloned().collect::<Vec<_>>(),
+            vec!["api".to_string(), "k8s-apps-web-80-1".to_string()]
+        );
+        // A config name wins.
+        assert_eq!(merged["api"], config.upstreams["api"]);
+
+        let backend = ServiceKey {
+            namespace: "apps".into(),
+            name: "backend".into(),
+        };
+        let keys = merged_service_keys(&config, &generated, &BTreeSet::from([backend.clone()]));
+        let names: BTreeSet<String> = keys.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            names,
+            BTreeSet::from([
+                "prod/api".to_string(),
+                "apps/web".to_string(),
+                "apps/other".to_string(),
+                "apps/backend".to_string(),
+            ])
+        );
+        assert!(merged_upstreams(&config, &BTreeMap::new()) == config.upstreams);
+    }
+
+    #[test]
+    fn ready_gate_waits_for_gateway() {
+        let readiness = Readiness::new();
+        readiness.set_last_write_ok(true);
+        let gate = ReadyGate::new(readiness.clone(), false);
+        gate.set(true);
+        assert!(!readiness.is_ready());
+        gate.set_gateway_synced(true);
+        gate.set(true);
+        assert!(readiness.is_ready());
+        gate.set(false);
+        assert!(!readiness.is_ready());
+        let open = ReadyGate::new(readiness.clone(), true);
+        open.set(true);
+        assert!(readiness.is_ready());
     }
 
     #[test]

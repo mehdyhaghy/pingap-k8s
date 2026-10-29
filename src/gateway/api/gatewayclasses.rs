@@ -1,0 +1,56 @@
+// Generated from the Gateway API v1.6.3 Standard-channel CRD gatewayclasses.gateway.networking.k8s.io
+// by scripts/gen-gateway-api.sh. Do not edit.
+
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
+use kube::CustomResource;
+use serde::{Deserialize, Serialize};
+
+#[derive(CustomResource, Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[kube(
+    group = "gateway.networking.k8s.io",
+    version = "v1",
+    kind = "GatewayClass",
+    plural = "gatewayclasses"
+)]
+#[kube(status = "GatewayClassStatus")]
+#[kube(schema = "disabled")]
+#[kube(derive = "Default")]
+#[kube(derive = "PartialEq")]
+pub struct GatewayClassSpec {
+    #[serde(rename = "controllerName")]
+    pub controller_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "parametersRef"
+    )]
+    pub parameters_ref: Option<GatewayClassParametersRef>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct GatewayClassParametersRef {
+    pub group: String,
+    pub kind: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct GatewayClassStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<Condition>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "supportedFeatures"
+    )]
+    pub supported_features: Option<Vec<GatewayClassStatusSupportedFeatures>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct GatewayClassStatusSupportedFeatures {
+    pub name: String,
+}

@@ -120,6 +120,32 @@ async fn missing_key_gets_minimal_upstream() {
 }
 
 #[tokio::test]
+async fn created_entry_gets_health_check_once() {
+    let Some(w) = writer("health-check").await else {
+        return;
+    };
+    let key = w.upstream_key("k8s-api");
+    let hc = "http://api/healthz?check_frequency=5s";
+    w.write_upstream("k8s-api", &s(&["10.0.0.1:80"]), Some(hc))
+        .await
+        .unwrap();
+    let (value, _) = get(&w.client(), &key).await.unwrap();
+    assert_eq!(
+        value,
+        format!("[upstreams.k8s-api]\naddrs = [\"10.0.0.1:80\"]\nhealth_check = \"{hc}\"\n")
+    );
+    // An existing entry only gets its addrs replaced, whatever health check is asked for.
+    let edited = value.replace("check_frequency=5s", "check_frequency=9s");
+    put(&w.client(), &key, &edited).await;
+    w.write_upstream("k8s-api", &s(&["10.0.0.2:80"]), Some(hc))
+        .await
+        .unwrap();
+    let (value, _) = get(&w.client(), &key).await.unwrap();
+    assert!(value.contains("check_frequency=9s"), "{value}");
+    assert!(value.contains("10.0.0.2:80"), "{value}");
+}
+
+#[tokio::test]
 async fn malformed_toml_not_written() {
     let Some(w) = writer("malformed").await else {
         return;

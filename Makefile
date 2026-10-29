@@ -40,16 +40,23 @@ helm-template:
 	done
 
 # Nothing but the quickstart proxy Service may leave the cluster (it is forced to
-# ClusterIP here), and RBAC is namespaced only: fail on any LoadBalancer or
-# NodePort Service and on any ClusterRole, for every values file.
+# ClusterIP here), for every values file. RBAC is namespaced, except the
+# `<release>-gateway` ClusterRole of the Gateway API provider (gateway.enabled):
+# fail on any other cluster-wide RBAC, and on that one if it grants anything on
+# secrets or any write besides patch.
 exposure-check:
 	@for f in "" $(CHART)/ci/*-values.yaml; do \
 		out=$$(helm template pingap-k8s $(CHART) $${f:+-f $$f} --set pingap.service.type=ClusterIP) || exit 1; \
 		if echo "$$out" | grep -nE 'type: (LoadBalancer|NodePort)'; then \
 			echo "a Service is exposed outside the cluster ($${f:-default values})" >&2; exit 1; \
 		fi; \
-		if echo "$$out" | grep -nE '^kind: (ClusterRole|ClusterRoleBinding)$$'; then \
-			echo "cluster-wide RBAC rendered ($${f:-default values})" >&2; exit 1; \
+		cluster=$$(echo "$$out" | yq 'select(.kind == "ClusterRole" or .kind == "ClusterRoleBinding")'); \
+		names=$$(echo "$$cluster" | yq '.metadata.name' | grep -vxE -- '---|null' | sort -u); \
+		if [ -n "$$names" ] && [ "$$names" != "pingap-k8s-gateway" ]; then \
+			echo "cluster-wide RBAC other than the gateway ClusterRole rendered ($${f:-default values}): $$names" >&2; exit 1; \
+		fi; \
+		if echo "$$cluster" | yq '.rules[]? | (.resources[], .verbs[])' | grep -nxE 'secrets|create|update|delete|deletecollection|escalate|bind|impersonate|\*'; then \
+			echo "the gateway ClusterRole grants more than reads and status patches ($${f:-default values})" >&2; exit 1; \
 		fi; \
 	done; echo "exposure-check: ok"
 

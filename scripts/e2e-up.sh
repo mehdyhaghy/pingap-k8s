@@ -99,6 +99,26 @@ if [[ "${E2E_PRELOAD:-1}" == "1" ]]; then
   done
 fi
 
+# --- Gateway API CRDs (before the chart: it creates a GatewayClass) -------------
+# The Standard channel of the release the generated types come from
+# (scripts/gen-gateway-api.sh), checked against its pinned digest.
+GATEWAY_API_VERSION=v1.6.3
+GATEWAY_API_SHA256=356c2b8e286a964dc20995435659ad1095386329974793af10bbfe3eff977fe5
+gateway_crds="$ROOT/target/e2e/gateway-api-$GATEWAY_API_VERSION-standard-install.yaml"
+mkdir -p "$(dirname "$gateway_crds")"
+if [[ ! -s "$gateway_crds" ]] || ! echo "$GATEWAY_API_SHA256  $gateway_crds" | shasum -a 256 -c - >/dev/null 2>&1; then
+  log "downloading the Gateway API $GATEWAY_API_VERSION CRDs"
+  curl -fsSL -o "$gateway_crds.tmp" \
+    "https://github.com/kubernetes-sigs/gateway-api/releases/download/$GATEWAY_API_VERSION/standard-install.yaml"
+  echo "$GATEWAY_API_SHA256  $gateway_crds.tmp" | shasum -a 256 -c - >/dev/null
+  mv "$gateway_crds.tmp" "$gateway_crds"
+fi
+log "installing the Gateway API $GATEWAY_API_VERSION CRDs"
+kubectl apply --server-side -f "$gateway_crds" >/dev/null
+kubectl wait --for=condition=Established --timeout=60s \
+  crd/gatewayclasses.gateway.networking.k8s.io crd/gateways.gateway.networking.k8s.io \
+  crd/httproutes.gateway.networking.k8s.io crd/referencegrants.gateway.networking.k8s.io
+
 # --- test app (before the chart: its RoleBinding goes into e2e-app) -------------
 log "applying the test app"
 kubectl apply -f "$ROOT/tests/e2e/manifests/app.yaml"

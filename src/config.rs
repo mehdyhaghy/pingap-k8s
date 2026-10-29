@@ -15,6 +15,8 @@
 //!   `spec.ports[].name`). A port made only of digits is a port number (1-65535).
 //! - `[kubernetes] cluster_domain` is a DNS-1123 subdomain: dot-separated
 //!   DNS-1123 labels, at most 253 chars, no trailing dot.
+//!
+//! `[gateway]` (optional) turns on the Gateway API provider; see [`GatewaySettings`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -40,6 +42,16 @@ pub const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
 /// node sets `net.ipv6.bindv6only=1`. Nodes booted with IPv6 disabled
 /// (`ipv6.disable=1`) cannot open it: set `listen = "0.0.0.0:9090"` there.
 pub const DEFAULT_LISTEN: &str = "[::]:9090";
+
+/// Default `[gateway] controller_name`: GatewayClasses with this `spec.controllerName`
+/// are handled.
+pub const DEFAULT_CONTROLLER_NAME: &str = "pingap.io/gateway-controller";
+/// Default `[gateway] max_txn_ops` (etcd's own default limit is 128).
+pub const DEFAULT_MAX_TXN_OPS: usize = 64;
+/// Bounds of `[gateway] max_txn_ops`: a step must fit a put and its compare.
+const MAX_TXN_OPS_RANGE: std::ops::RangeInclusive<usize> = 2..=1024;
+/// Upstream names starting with this belong to the Gateway API provider.
+pub const GATEWAY_OWNED_PREFIX: &str = "k8s-";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -77,6 +89,8 @@ pub struct Config {
     pub defaults: Defaults,
     pub upstreams: BTreeMap<String, UpstreamConfig>,
     pub server: ServerSection,
+    /// `[gateway]` with `enabled = true`; `None` when the table is absent or disabled.
+    pub gateway: Option<GatewaySettings>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -149,6 +163,53 @@ where
     s.trim().parse().map(Some).map_err(serde::de::Error::custom)
 }
 
+/// `[gateway]`: Gateways of the GatewayClasses with `controller_name`, and the HTTPRoutes
+/// attached to them, become Pingap locations, certificates, plugins and upstreams.
+/// `enabled` needs a restart; everything else is applied on reload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GatewaySettings {
+    /// `spec.controllerName` of the GatewayClasses handled (`<domain>/<path>`).
+    pub controller_name: String,
+    /// Pingap servers the generated locations may be listed in; empty: every stored
+    /// server whose port and TLS setting fit a listener.
+    pub servers: Vec<String>,
+    /// Allow `ExternalName` backends.
+    pub external_name: bool,
+    /// Written to `status.addresses` of accepted Gateways: the addresses clients reach
+    /// Pingap on.
+    pub addresses: Vec<String>,
+    /// Operations per etcd transaction of the Gateway writer.
+    pub max_txn_ops: usize,
+    /// Pingap `health_check` of generated upstreams; `None`: Pingap's default TCP check.
+    pub health_check: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawGateway {
+    enabled: bool,
+    controller_name: String,
+    servers: Vec<String>,
+    external_name: bool,
+    addresses: Vec<String>,
+    max_txn_ops: usize,
+    health_check: String,
+}
+
+impl Default for RawGateway {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            controller_name: DEFAULT_CONTROLLER_NAME.to_string(),
+            servers: Vec::new(),
+            external_name: false,
+            addresses: Vec::new(),
+            max_txn_ops: DEFAULT_MAX_TXN_OPS,
+            health_check: String::new(),
+        }
+    }
+}
+
 /// `[defaults]` after applying built-in defaults. `resync` is global; the
 /// other fields are per-upstream defaults.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,6 +247,7 @@ impl Defaults {
             debounce: self.debounce,
             debounce_max: self.debounce_max,
             target: self.target.clone(),
+            spread_weights: false,
         }
     }
 }
@@ -196,6 +258,9 @@ pub struct UpstreamConfig {
     /// In config order (order matters for dedupe in `resolve`).
     pub services: Vec<ServiceRef>,
     pub options: UpstreamOptions,
+    /// Pingap `health_check` written when the controller creates the entry (generated
+    /// Gateway upstreams only; the name changes with it, so it is never updated in place).
+    pub health_check: Option<String>,
 }
 
 // ---- raw (serde) layer ----
@@ -212,6 +277,7 @@ struct RawConfig {
     upstreams: BTreeMap<String, RawUpstream>,
     #[serde(default)]
     server: ServerSection,
+    gateway: Option<RawGateway>,
 }
 
 #[derive(Default, Deserialize)]
@@ -307,8 +373,21 @@ impl Config {
             )));
         }
 
+        let gateway = match raw.gateway {
+            Some(raw_gateway) => build_gateway(raw_gateway)?,
+            None => None,
+        };
+
         let mut upstreams = BTreeMap::new();
         for (name, raw_up) in raw.upstreams {
+            if gateway.is_some() && name.starts_with(GATEWAY_OWNED_PREFIX) {
+                return Err(ConfigError::Upstream {
+                    upstream: name,
+                    reason: format!(
+                        "names starting with {GATEWAY_OWNED_PREFIX:?} are reserved for the Gateway API provider"
+                    ),
+                });
+            }
             let upstream =
                 build_upstream(&name, raw_up, &defaults, default_namespace, cluster_domain)?;
             upstreams.insert(name, upstream);
@@ -320,6 +399,7 @@ impl Config {
             defaults,
             upstreams,
             server: raw.server,
+            gateway,
         })
     }
 
@@ -383,6 +463,7 @@ fn build_upstream(
         debounce: raw.debounce.unwrap_or(defaults.debounce),
         debounce_max: raw.debounce_max.unwrap_or(defaults.debounce_max),
         target,
+        spread_weights: false,
     };
     check_debounce(&options).map_err(upstream_err)?;
 
@@ -412,7 +493,85 @@ fn build_upstream(
         services.push(service_ref);
     }
 
-    Ok(UpstreamConfig { services, options })
+    Ok(UpstreamConfig {
+        services,
+        options,
+        health_check: None,
+    })
+}
+
+/// Validates `[gateway]`. Every field is checked even when it is disabled, so a typo
+/// shows before it is turned on. `None` when disabled.
+fn build_gateway(raw: RawGateway) -> Result<Option<GatewaySettings>, ConfigError> {
+    let fail = |reason: String| ConfigError::Invalid(format!("gateway.{reason}"));
+
+    validate_controller_name(&raw.controller_name)
+        .map_err(|r| fail(format!("controller_name: {:?}: {r}", raw.controller_name)))?;
+    let mut servers: Vec<String> = Vec::with_capacity(raw.servers.len());
+    for server in &raw.servers {
+        if !is_valid_upstream_name(server) {
+            return Err(fail(format!(
+                "servers: {server:?}: a Pingap server name must be non-empty and contain only A-Z, a-z, 0-9, '_' or '-'"
+            )));
+        }
+        if servers.contains(server) {
+            return Err(fail(format!(
+                "servers: {server:?} is listed more than once"
+            )));
+        }
+        servers.push(server.clone());
+    }
+    for address in &raw.addresses {
+        if address.parse::<std::net::IpAddr>().is_err() {
+            validate_cluster_domain(address).map_err(|r| {
+                fail(format!(
+                    "addresses: {address:?} is neither an IP address nor a host name: {r}"
+                ))
+            })?;
+        }
+    }
+    if !MAX_TXN_OPS_RANGE.contains(&raw.max_txn_ops) {
+        return Err(fail(format!(
+            "max_txn_ops must be in {}-{}",
+            MAX_TXN_OPS_RANGE.start(),
+            MAX_TXN_OPS_RANGE.end()
+        )));
+    }
+    let health_check = raw.health_check.trim();
+    if !health_check.is_empty() {
+        crate::health_check::validate(health_check)
+            .map_err(|r| fail(format!("health_check: {health_check:?}: {r}")))?;
+    }
+    let health_check = (!health_check.is_empty()).then(|| health_check.to_string());
+    if !raw.enabled {
+        return Ok(None);
+    }
+    Ok(Some(GatewaySettings {
+        controller_name: raw.controller_name,
+        servers,
+        external_name: raw.external_name,
+        addresses: raw.addresses,
+        max_txn_ops: raw.max_txn_ops,
+        health_check,
+    }))
+}
+
+/// A GatewayClass `controllerName`: `<domain>/<path>`, at most 253 characters, the
+/// domain a DNS-1123 subdomain and the path made of URL path characters (the CRD's own
+/// validation).
+fn validate_controller_name(name: &str) -> Result<(), String> {
+    if name.len() > 253 {
+        return Err("longer than 253 characters".into());
+    }
+    let (domain, path) = name
+        .split_once('/')
+        .ok_or_else(|| "must be <domain>/<path>".to_string())?;
+    validate_cluster_domain(domain)?;
+    let path_char = |c: char| c.is_ascii_alphanumeric() || "/-._~%!$&'()*+,;=:".contains(c);
+    if path.is_empty() || !path.chars().all(path_char) {
+        return Err("the path after the domain must be non-empty URL path characters".into());
+    }
+    Ok(())
 }
 
 /// `target = "pods" | "service"`.
@@ -887,6 +1046,7 @@ debounce_max = "1m"
                 debounce: Duration::from_millis(100),
                 debounce_max: Duration::from_secs(1),
                 target: UpstreamTarget::Pods,
+                spread_weights: false,
             }
         );
         assert_eq!(
@@ -898,6 +1058,7 @@ debounce_max = "1m"
                 debounce: Duration::from_secs(1),
                 debounce_max: Duration::from_secs(60),
                 target: UpstreamTarget::Pods,
+                spread_weights: false,
             }
         );
     }
@@ -1141,6 +1302,113 @@ target = "service"
         let c = cfg("[kubernetes]\nevents = true\n[upstreams.a]\nservices = [\"a:80\"]\n").unwrap();
         assert!(c.kubernetes.events);
         assert!(cfg("[kubernetes]\nevents = \"yes\"\n").is_err());
+    }
+
+    // ---- [gateway] ----
+
+    #[test]
+    fn gateway_absent_or_disabled_is_none() {
+        assert_eq!(cfg("").unwrap().gateway, None);
+        assert_eq!(cfg("[gateway]\n").unwrap().gateway, None);
+        // Disabled: `k8s-` upstream names stay allowed.
+        let c =
+            cfg("[gateway]\nenabled = false\n[upstreams.k8s-a]\nservices = [\"a:80\"]\n").unwrap();
+        assert!(c.upstreams.contains_key("k8s-a"));
+    }
+
+    #[test]
+    fn gateway_defaults() {
+        let c = cfg("[gateway]\nenabled = true\n").unwrap();
+        assert_eq!(
+            c.gateway,
+            Some(GatewaySettings {
+                controller_name: "pingap.io/gateway-controller".into(),
+                servers: vec![],
+                external_name: false,
+                addresses: vec![],
+                max_txn_ops: 64,
+                health_check: None,
+            })
+        );
+    }
+
+    #[test]
+    fn gateway_all_fields() {
+        let c = cfg(r#"
+[gateway]
+enabled = true
+controller_name = "edge.example.com/pingap"
+servers = ["web_1", "tls"]
+external_name = true
+addresses = ["203.0.113.7", "2001:db8::1", "lb.example.com"]
+max_txn_ops = 128
+health_check = "http://k8s/healthz?connection_timeout=1s&check_frequency=5s"
+"#)
+        .unwrap();
+        let g = c.gateway.unwrap();
+        assert_eq!(g.controller_name, "edge.example.com/pingap");
+        assert!(g.external_name);
+        assert_eq!(g.servers, vec!["web_1".to_string(), "tls".to_string()]);
+        assert_eq!(g.addresses.len(), 3);
+        assert_eq!(g.max_txn_ops, 128);
+        assert_eq!(
+            g.health_check.as_deref(),
+            Some("http://k8s/healthz?connection_timeout=1s&check_frequency=5s")
+        );
+    }
+
+    #[test]
+    fn gateway_rejections() {
+        let base = "[gateway]\nenabled = true\n";
+        let cases = [
+            ("controller_name = \"\"\n", "gateway.controller_name"),
+            ("controller_name = \"pingap\"\n", "gateway.controller_name"),
+            (
+                "controller_name = \"Pingap.io/x\"\n",
+                "gateway.controller_name",
+            ),
+            (
+                "controller_name = \"pingap.io/\"\n",
+                "gateway.controller_name",
+            ),
+            (
+                "controller_name = \"pingap.io/a b\"\n",
+                "gateway.controller_name",
+            ),
+            ("servers = [\"a/b\"]\n", "gateway.servers"),
+            ("servers = [\"\"]\n", "gateway.servers"),
+            ("servers = [\"h\", \"h\"]\n", "more than once"),
+            (
+                "health_check = \"http://k8s/?check_frequency=5\"\n",
+                "gateway.health_check",
+            ),
+            ("health_check = \"udp://k8s\"\n", "gateway.health_check"),
+            ("addresses = [\"bad host\"]\n", "gateway.addresses"),
+            ("max_txn_ops = 1\n", "max_txn_ops"),
+            ("max_txn_ops = 5000\n", "max_txn_ops"),
+        ];
+        for (rest, needle) in cases {
+            let m = err(&format!("{base}{rest}"));
+            assert!(m.contains(needle), "{rest:?}: {m}");
+        }
+        // Checked even when disabled.
+        assert!(err("[gateway]\ncontroller_name = \"x\"\n").contains("gateway.controller_name"));
+        // Unknown keys and wrong types.
+        assert!(cfg("[gateway]\nenabled = true\nfoo = 1\n").is_err());
+        assert!(cfg("[gateway]\nenabled = \"yes\"\n").is_err());
+        assert!(cfg("[gateway]\nservers = \"a\"\n").is_err());
+    }
+
+    #[test]
+    fn k8s_upstream_names_reserved_when_gateway_enabled() {
+        let m = err("[gateway]\nenabled = true\n[upstreams.k8s-web]\nservices = [\"a:80\"]\n");
+        assert!(
+            m.contains("upstream \"k8s-web\"") && m.contains("reserved"),
+            "{m}"
+        );
+        assert!(
+            cfg("[gateway]\nenabled = true\n[upstreams.k8sweb]\nservices = [\"a:80\"]\n").is_ok()
+        );
     }
 
     /// A directory in the system temp dir, removed on drop (also when the

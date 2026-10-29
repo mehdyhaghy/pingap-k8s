@@ -58,6 +58,10 @@ pub struct UpstreamOptions {
     pub debounce: Duration,
     pub debounce_max: Duration,
     pub target: UpstreamTarget,
+    /// Each `services` weight is the weight of the whole Service, split over its
+    /// addresses, and the weights are scaled to a small total (Gateway API `backendRefs`
+    /// semantics). Off: the weight is written on every address as it is.
+    pub spread_weights: bool,
 }
 
 /// What an upstream's `addrs` point at.
@@ -105,6 +109,18 @@ pub trait AddrsWriter: Send + Sync + 'static {
         upstream: &str,
         addrs: &[String],
     ) -> impl Future<Output = anyhow::Result<WriteOutcome>> + Send;
+
+    /// [`AddrsWriter::write_addrs`]; an entry it creates also gets `health_check`
+    /// (already validated). An existing entry's `health_check` is left alone.
+    fn write_upstream(
+        &self,
+        upstream: &str,
+        addrs: &[String],
+        health_check: Option<&str>,
+    ) -> impl Future<Output = anyhow::Result<WriteOutcome>> + Send {
+        let _ = health_check;
+        self.write_addrs(upstream, addrs)
+    }
 }
 
 /// A change to an owned upstream key that the controller did not make.

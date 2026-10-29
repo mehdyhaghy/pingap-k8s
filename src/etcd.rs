@@ -260,7 +260,7 @@ impl EtcdTarget {
 }
 
 /// Pingap's `pingap_util::path_join`, byte for byte.
-fn path_join(value1: &str, value2: &str) -> String {
+pub(crate) fn path_join(value1: &str, value2: &str) -> String {
     let end_slash = value1.ends_with('/');
     let value2 = match value2.strip_prefix('/') {
         Some(rest) if end_slash => rest,
@@ -432,11 +432,17 @@ pub fn parse_etcd_url(url: &str) -> Result<EtcdTarget, EtcdError> {
 }
 
 /// Pingap rejects names with a path separator or NUL (`manager.rs` `get_key`).
-fn check_name(upstream: &str) -> Result<(), EtcdError> {
+pub(crate) fn check_name(upstream: &str) -> Result<(), EtcdError> {
     if upstream.is_empty() || upstream.contains(['/', '\\', '\0']) {
         return Err(EtcdError::InvalidName(upstream.to_string()));
     }
     Ok(())
+}
+
+/// The key Pingap reads for entry `<category>/<name>` (`servers`, `locations`,
+/// `upstreams`, `certificates`, `plugins`): `path_join(prefix, "<category>/<name>.toml")`.
+pub fn entry_key(prefix: &str, category: &str, name: &str) -> String {
+    path_join(prefix, &format!("{category}/{name}.toml"))
 }
 
 fn parse_doc(toml: &str) -> Result<DocumentMut, EtcdError> {
@@ -561,10 +567,13 @@ pub const SERVICE_UPDATE_FREQUENCY: &str = "5s";
 
 /// The entry written when an owned upstream key does not exist:
 /// `[upstreams.<name>]` with `addrs`, plus `update_frequency` when an address is a
-/// hostname ([`SERVICE_UPDATE_FREQUENCY`]).
-pub fn minimal_upstream(upstream: &str, addrs: &[String]) -> String {
+/// hostname ([`SERVICE_UPDATE_FREQUENCY`]) and `health_check` when given.
+pub fn minimal_upstream(upstream: &str, addrs: &[String], health_check: Option<&str>) -> String {
     let mut entry = Table::new();
     entry.insert("addrs", toml_edit::value(new_array(addrs)));
+    if let Some(health_check) = health_check {
+        entry.insert("health_check", toml_edit::value(health_check));
+    }
     if addrs.iter().any(|a| is_hostname(a)) {
         entry.insert(
             "update_frequency",
@@ -716,6 +725,7 @@ impl EtcdWriter {
         &self,
         upstream: &str,
         addrs: &[String],
+        health_check: Option<&str>,
     ) -> anyhow::Result<WriteOutcome> {
         check_name(upstream)?;
         if addrs.is_empty() {
@@ -752,7 +762,7 @@ impl EtcdWriter {
                         .when([Compare::create_revision(key.as_str(), CompareOp::Equal, 0)])
                         .and_then([TxnOp::put(
                             key.as_str(),
-                            minimal_upstream(upstream, addrs),
+                            minimal_upstream(upstream, addrs, health_check),
                             None,
                         )]);
                     (txn, true)
@@ -867,7 +877,16 @@ impl AddrsWriter for EtcdWriter {
         upstream: &str,
         addrs: &[String],
     ) -> impl Future<Output = anyhow::Result<WriteOutcome>> + Send {
-        self.write_addrs_inner(upstream, addrs)
+        self.write_addrs_inner(upstream, addrs, None)
+    }
+
+    fn write_upstream(
+        &self,
+        upstream: &str,
+        addrs: &[String],
+        health_check: Option<&str>,
+    ) -> impl Future<Output = anyhow::Result<WriteOutcome>> + Send {
+        self.write_addrs_inner(upstream, addrs, health_check)
     }
 }
 
@@ -1336,7 +1355,7 @@ connection_timeout = "10s"
 
     #[test]
     fn minimal_upstream_shape() {
-        let out = minimal_upstream("api-1", &s(&["10.0.0.1:80", "[::1]:80 2"]));
+        let out = minimal_upstream("api-1", &s(&["10.0.0.1:80", "[::1]:80 2"]), None);
         assert_eq!(
             out,
             "[upstreams.api-1]\naddrs = [\"10.0.0.1:80\", \"[::1]:80 2\"]\n"
@@ -1357,7 +1376,7 @@ connection_timeout = "10s"
 
     #[test]
     fn minimal_service_upstream_refreshes_dns_often() {
-        let out = minimal_upstream("legacy", &s(&["legacy.prod.svc.cluster.local:80 2"]));
+        let out = minimal_upstream("legacy", &s(&["legacy.prod.svc.cluster.local:80 2"]), None);
         let value: toml::Table = toml::from_str(&out).unwrap();
         assert_eq!(
             value["upstreams"]["legacy"]["update_frequency"].as_str(),
@@ -1366,6 +1385,26 @@ connection_timeout = "10s"
         assert_eq!(
             read_addrs(&out, "legacy").unwrap(),
             Some(s(&["legacy.prod.svc.cluster.local:80 2"]))
+        );
+    }
+
+    #[test]
+    fn minimal_upstream_with_health_check() {
+        let hc = "http://api/healthz?connection_timeout=1s&check_frequency=5s";
+        let out = minimal_upstream("k8s-api", &s(&["10.0.0.1:80"]), Some(hc));
+        let value: toml::Table = toml::from_str(&out).unwrap();
+        assert_eq!(
+            value["upstreams"]["k8s-api"]["health_check"].as_str(),
+            Some(hc)
+        );
+        // Updating addrs keeps it.
+        let updated = replace_addrs(&out, "k8s-api", &s(&["10.0.0.2:80"]))
+            .unwrap()
+            .unwrap();
+        let value: toml::Table = toml::from_str(&updated).unwrap();
+        assert_eq!(
+            value["upstreams"]["k8s-api"]["health_check"].as_str(),
+            Some(hc)
         );
     }
 

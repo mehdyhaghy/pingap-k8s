@@ -856,8 +856,11 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
         st.inflight = true;
         let writer = Arc::clone(&self.writer);
         let upstream = name.to_string();
+        let health_check = st.config.health_check.clone();
         let handle = self.inflight.spawn(async move {
-            let result = writer.write_addrs(&upstream, &desired).await;
+            let result = writer
+                .write_upstream(&upstream, &desired, health_check.as_deref())
+                .await;
             (upstream, desired, result)
         });
         self.inflight_ids.insert(handle.id(), name.to_string());
@@ -1202,7 +1205,9 @@ mod tests {
                 debounce: Duration::from_millis(500),
                 debounce_max: Duration::from_secs(2),
                 target: UpstreamTarget::Pods,
+                spread_weights: false,
             },
+            health_check: None,
         }
     }
 

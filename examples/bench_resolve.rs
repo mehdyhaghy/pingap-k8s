@@ -30,6 +30,7 @@ fn opts() -> UpstreamOptions {
         debounce: Duration::from_millis(500),
         debounce_max: Duration::from_secs(2),
         target: UpstreamTarget::Pods,
+        spread_weights: false,
     }
 }
 
