@@ -19,3 +19,10 @@ paths = ['''^target/''']
 description = "Test fixtures: the test-only JWTs of e2e test 17"
 targetRules = ["jwt"]
 paths = ['''^tests/e2e/spec\.rs$''']
+
+[[allowlists]]
+description = "Pinned release checksums and commit ids of the Gateway API CRDs"
+regexTarget = "match"
+regexes = [
+  '''GATEWAY_API_(SHA256|COMMIT)=''',
+]

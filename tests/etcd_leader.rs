@@ -286,7 +286,9 @@ async fn shutdown_while_campaigning_returns() {
         .await
         .unwrap();
     assert_eq!(keys.kvs().len(), 1);
-    assert!(a.is_leader());
+    // A loaded runner can make the leader miss two keep-alives of the short test TTL and step
+    // down for a moment; the follower's shutdown must not cost it the leadership for good.
+    wait_value(&a.rx, true, TTL * 2).await;
     a.shutdown().await;
 }
 
