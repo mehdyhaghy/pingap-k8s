@@ -1013,7 +1013,7 @@ Tests:
 | `cargo test` | unit tests (including Kubernetes Events against a mock API server); OTLP export to an in-process receiver (`tests/otlp_export.rs`); the plugin against a fake `kubectl` (`tests/kubectl_plugin.rs`) | `rust` |
 | `scripts/test-etcd.sh` | `tests/etcd_*.rs` against a throwaway etcd on 127.0.0.1: CAS writes, owned-key watch, compaction, leader election | `integration` |
 | `scripts/test-kind.sh` | `tests/watch_kind.rs`: the Service and EndpointSlice watchers on a throwaway kind cluster | `integration` |
-| `scripts/e2e-run.sh` | end-to-end tests 1 to 18 with the chart, Pingap and etcd on kind | `e2e` |
+| `scripts/e2e-run.sh` | end-to-end tests 1 to 27 with the chart, Pingap, etcd and the Gateway API CRDs on kind | `e2e` |
 | `scripts/otel-local.sh` | the binary exporting to a real OpenTelemetry Collector (docker) | no |
 | `cargo audit` | RustSec advisories for `Cargo.lock` | `dependencies` |
 | `gitleaks git . && gitleaks dir .` | secrets in the git history and the working tree (`.gitleaks.toml`) | `secrets` |
