@@ -430,7 +430,8 @@ pingap-k8s --check --config config.toml
 ## Pingap side
 
 - Tested with Pingap 0.16.1 (the quickstart default) on Kubernetes 1.35 and 1.37, IPv4 and
-  dual-stack; a weekly CI run checks Pingap `latest`.
+  dual-stack; a manual CI run with `pingap-latest` checks Pingap `latest`
+  (`gh workflow run ci -f pingap-latest=true`).
 - The controller version tells you the Pingap version it was tested with: `0.16.1x` means Pingap
   0.16.1 (see [Releasing](#releasing)).
 - Run Pingap with `--conf etcd://...` and `--autoreload`.
@@ -945,10 +946,14 @@ Tests:
 | `cargo test` | unit tests (including Kubernetes Events against a mock API server); OTLP export to an in-process receiver (`tests/otlp_export.rs`); the plugin against a fake `kubectl` (`tests/kubectl_plugin.rs`) | `rust` |
 | `scripts/test-etcd.sh` | `tests/etcd_*.rs` against a throwaway etcd on 127.0.0.1: CAS writes, owned-key watch, compaction, leader election | `integration` |
 | `scripts/test-kind.sh` | `tests/watch_kind.rs`: the Service and EndpointSlice watchers on a throwaway kind cluster | `integration` |
-| `scripts/e2e-run.sh` | end-to-end tests 1 to 14 with the chart, Pingap and etcd on kind | `e2e` |
+| `scripts/e2e-run.sh` | end-to-end tests 1 to 18 with the chart, Pingap and etcd on kind | `e2e` |
 | `scripts/otel-local.sh` | the binary exporting to a real OpenTelemetry Collector (docker) | no |
-| `cargo audit` | RustSec advisories for `Cargo.lock` | `dependencies` (also weekly) |
+| `cargo audit` | RustSec advisories for `Cargo.lock` | `dependencies` |
 | `gitleaks git . && gitleaks dir .` | secrets in the git history and the working tree (`.gitleaks.toml`) | `secrets` |
+
+The `ci` workflow does not run on every push: run `make check` and the scripts above locally
+while developing, start it by hand when you want a clean run (`gh workflow run ci`, or Actions >
+ci > Run workflow), and the `release` workflow runs all of it before it publishes anything.
 
 Line coverage: `cargo llvm-cov --lib --bins` (add `--test 'etcd_*'` with `PINGAP_K8S_TEST_ETCD`
 set to include the etcd tests).
@@ -987,7 +992,8 @@ version is `pingap.image.tag` in the chart values (the quickstart default). `mak
    ```
 
 The `release` workflow fails if the tag does not match both files or the version does not follow
-the Pingap version. Otherwise it runs the CI checks,
+the Pingap version. Otherwise it runs the whole `ci` workflow (all tests, the e2e suite on every
+Kubernetes version, secret scan, advisories) and publishes nothing unless it passes, then
 pushes the `linux/amd64` + `linux/arm64` image to `ghcr.io/mehdyhaghy/pingap-k8s:<version>` and
 `:latest` (with SBOM and provenance attestations), pushes the chart to
 `oci://ghcr.io/mehdyhaghy/charts/pingap-k8s`, and creates a GitHub Release with generated notes,

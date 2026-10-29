@@ -38,6 +38,9 @@ Security:
   when more than one Service matches.
 
 Tests and CI:
+- The `ci` workflow no longer runs on every push, pull request or weekly: it is started by hand
+  (`gh workflow run ci`, optionally with `pingap-latest` for the newest Pingap image), and the
+  `release` workflow runs all of it first and publishes nothing unless it passes.
 - New CI job `secrets` runs gitleaks over the whole git history and the working tree.
 - Workflow checkouts no longer keep the GitHub token in `.git/config`
   (`persist-credentials: false`).
@@ -55,7 +58,8 @@ Tests and CI:
   `kubectl`, both in `cargo test`.
 - New CI job `integration` runs the etcd integration tests and the kind watcher tests. Before
   this, CI skipped them.
-- New CI job `dependencies` runs `cargo audit`, also on the weekly schedule.
+- New CI job `dependencies` runs `cargo audit` (the release binary, checksum-checked, instead of
+  compiling it).
 - CI checks the `kind` download against its sha256.
 
 ## 0.1.0

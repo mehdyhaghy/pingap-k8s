@@ -35,6 +35,14 @@ env:
   CHART: charts/pingap-k8s
 
 jobs:
+  # The whole ci workflow (tests, integration, e2e on every Kubernetes version,
+  # secret scan, advisories): nothing is built for publishing unless it passes.
+  ci:
+    name: ci
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   verify:
     name: verify versions
     runs-on: ubuntu-24.04
@@ -138,7 +146,7 @@ jobs:
 
   image:
     name: image (linux/amd64, linux/arm64)
-    needs: [verify, rust, helm]
+    needs: [ci, verify, rust, helm]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -199,7 +207,7 @@ jobs:
   # Linux builds use Ubuntu 22.04 for an older glibc baseline.
   plugin:
     name: kubectl-pingap (${{ matrix.os }}/${{ matrix.arch }})
-    needs: [verify, rust]
+    needs: [ci, verify, rust]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: true

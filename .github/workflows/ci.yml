@@ -1,13 +1,16 @@
 name: ci
 
+# Not run on every push: run it by hand while developing (Actions > ci > Run
+# workflow, or `gh workflow run ci`), and the release workflow runs all of it
+# before it publishes anything.
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
-  schedule:
-    # Weekly e2e run against the newest Pingap image.
-    - cron: "0 3 * * 1"
+    inputs:
+      pingap-latest:
+        description: Run the e2e tests against the newest Pingap image instead of the pinned one
+        type: boolean
+        default: false
+  workflow_call:
 
 permissions:
   contents: read
@@ -157,20 +160,28 @@ jobs:
   dependencies:
     name: dependency advisories
     runs-on: ubuntu-24.04
+    env:
+      # The release binary (static musl build), checked against the release's digest;
+      # compiling it with cargo install took about 4 minutes.
+      CARGO_AUDIT_VERSION: 0.22.2
+      CARGO_AUDIT_SHA256: 7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          toolchain: stable
+      - name: install cargo-audit
+        run: |
+          set -euo pipefail
+          name="cargo-audit-x86_64-unknown-linux-musl-v${CARGO_AUDIT_VERSION}"
+          curl -fsSLo cargo-audit.tgz "https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv${CARGO_AUDIT_VERSION}/${name}.tgz"
+          echo "${CARGO_AUDIT_SHA256}  cargo-audit.tgz" | sha256sum -c -
+          tar -xzf cargo-audit.tgz -C "$RUNNER_TEMP" --strip-components=1 "${name}/cargo-audit"
+          rm cargo-audit.tgz
 
       # RustSec advisories for every crate in Cargo.lock.
       - name: cargo audit
-        run: |
-          cargo install cargo-audit --locked
-          cargo audit
+        run: '"$RUNNER_TEMP/cargo-audit" audit'
 
   docker:
     name: docker build (no push)
@@ -219,7 +230,7 @@ jobs:
       KIND_NODE_IMAGE: ${{ matrix.node }}
       E2E_IMAGE: pingap-k8s:e2e
       # Scheduled runs test the newest Pingap image instead of the pinned tag.
-      E2E_PINGAP_TAG: ${{ github.event_name == 'schedule' && 'latest' || '' }}
+      E2E_PINGAP_TAG: ${{ inputs.pingap-latest && 'latest' || '' }}
       # Built below with the gha cache; e2e-up.sh only loads it into kind.
       E2E_SKIP_BUILD: "1"
       # Kept until teardown so a failure can be inspected in the next step.
