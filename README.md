@@ -1,11 +1,13 @@
 # pingap-k8s
 
-Kubernetes endpoint discovery for [Pingap](https://github.com/vicanso/pingap).
+Kubernetes endpoint discovery and [Gateway API](https://gateway-api.sigs.k8s.io/) routing for
+[Pingap](https://github.com/vicanso/pingap).
 
 `pingap-k8s` is a small Rust controller that runs in your cluster. It watches Services and
 their EndpointSlices and writes the ready pod addresses into the upstreams of Pingap's etcd
 config storage. Pingap instances started with `--autoreload` pick up each change and rebuild only
-the upstream that changed, without a restart.
+the upstream that changed, without a restart. With the Gateway API provider on, it also turns
+Gateways and HTTPRoutes into Pingap locations, plugins, certificates and upstreams.
 
 ```
  Kubernetes API ──watch──▶ pingap-k8s ──put <prefix>/upstreams/api.toml──▶ etcd
@@ -22,13 +24,14 @@ the upstream that changed, without a restart.
 - **Only `addrs` is owned.** Health checks, timeouts, TLS and the balancing algorithm of an
   upstream stay editable in Pingap's admin UI.
 - **Least privilege.** Read-only access to Services and EndpointSlices in the namespaces you list.
-  No ClusterRole, no writes to the cluster.
+  No ClusterRole and no writes to the cluster, unless you turn on the Gateway API provider (it
+  reads the Gateway API resources cluster-wide and writes their status).
 - **Fail static.** If the Kubernetes API or the controller is down, Pingap keeps the last written
   addresses and its health checks remove dead pods.
 
-Status: phase 1 (endpoint discovery). Generating Pingap routes from the Kubernetes
-[Gateway API](https://gateway-api.sigs.k8s.io/) is planned next. The frozen Ingress API will not be
-supported.
+Status: endpoint discovery, plus the [Gateway API provider](#gateway-api) (Gateway API v1.6.3
+Standard channel: GatewayClass, Gateway, HTTPRoute, ReferenceGrant). The frozen Ingress API will
+not be supported.
 
 ## Contents
 
@@ -43,6 +46,7 @@ supported.
 - [Configuration reference](#configuration-reference)
 - [Pingap side](#pingap-side)
 - [Upstream target](#upstream-target)
+- [Gateway API](#gateway-api)
 - [Graceful shutdown of application pods (preStop)](#graceful-shutdown-of-application-pods-prestop)
 - [Headers, sticky sessions and auth](#headers-sticky-sessions-and-auth)
   - [Request headers](#request-headers)
@@ -140,7 +144,9 @@ The chart creates:
 | Object | Notes |
 |---|---|
 | ServiceAccount | used only by the controller |
-| Role + RoleBinding **per namespace** | `get/list/watch` on `services` and `endpointslices`. The namespaces come from `rbac.namespaces` plus every namespace referenced in `config.upstreams` (`rbac.fromConfig: true`). Never a ClusterRole. With `events.enabled`, also `create/patch` on `events.k8s.io` `events` there and in the release namespace. |
+| Role + RoleBinding **per namespace** | `get/list/watch` on `services` and `endpointslices`. The namespaces come from `rbac.namespaces`, `gateway.namespaces` (with `gateway.enabled`) and every namespace referenced in `config.upstreams` (`rbac.fromConfig: true`). With `events.enabled`, also `create/patch` on `events.k8s.io` `events` there and in the release namespace. With `gateway.enabled`, also `get/list/watch` on `secrets` in `gateway.namespaces` (only `gateway.secretNames` when set). |
+| ClusterRole + ClusterRoleBinding | only with `gateway.enabled`: `get/list/watch` on `gatewayclasses`, `gateways`, `httproutes`, `referencegrants` and `namespaces`, `patch` on the status of the first three. Nothing else. |
+| GatewayClass | only with `gateway.enabled` (`gateway.className`, default `pingap`) |
 | ConfigMap | the controller config, rendered as TOML from `config` (or a Secret with `config.useSecret: true`) |
 | Deployment | 2 replicas, non-root, read-only root filesystem, all capabilities dropped, probes on `/healthz` and `/readyz` |
 | PodDisruptionBudget | `minAvailable: 1` |
@@ -403,6 +409,13 @@ drain_terminating = true # any [defaults] key can be overridden per upstream
 | `server.status_listen` | `""` (off) | loopback address of the read-only `/status` endpoint used by the [kubectl plugin](#kubectl-plugin), e.g. `127.0.0.1:9091` (restart required). Non-loopback addresses are rejected. The chart sets it with `status.enabled` |
 | `server.listen` | `[::]:9090` | address for `/metrics`, `/healthz` and `/readyz` (restart required). `[::]` also accepts IPv4 on Linux unless the node sets `net.ipv6.bindv6only=1`; on nodes with IPv6 disabled at boot use `0.0.0.0:9090` |
 | `upstreams.<name>.services` | (required) | list of `<service>[.<namespace>]:<port> [weight]` |
+| `gateway.enabled` | `false` | turn on the [Gateway API provider](#gateway-api) (restart required). Upstream names starting with `k8s-` are then reserved |
+| `gateway.controller_name` | `pingap.io/gateway-controller` | GatewayClasses with this `spec.controllerName` are handled (restart required) |
+| `gateway.servers` | `[]` | Pingap servers listeners may be mapped onto; empty: every stored server |
+| `gateway.addresses` | `[]` | IPs or host names written to `status.addresses` of accepted Gateways |
+| `gateway.external_name` | `false` | allow `ExternalName` Service backends (Pingap DNS discovery) |
+| `gateway.health_check` | `""` | Pingap `health_check` of generated upstreams; empty: Pingap's default TCP check |
+| `gateway.max_txn_ops` | `64` | operations per etcd transaction of the Gateway writer (restart required) |
 
 - `<port>` is a Service port **name** or **number** (the `port` field, not `targetPort`).
 - `weight` is a positive integer, written as `ip:port weight` for every endpoint of that Service.
@@ -489,6 +502,48 @@ target = "service"
   `config.kubernetes.cluster_domain`. To add the quickstart Pingap pods to another layer that
   selects pods by label or annotation, use `pingap.podLabels` and `pingap.podAnnotations`
   (`podLabels` and `podAnnotations` for the controller).
+
+## Gateway API
+
+The Gateway API provider (`gateway.enabled: true`, off by default) turns
+[Gateway API](https://gateway-api.sigs.k8s.io/) v1.6.3 Standard-channel resources into Pingap
+config, in the same etcd prefix. Install the CRDs before the chart:
+
+```sh
+kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.3/standard-install.yaml
+```
+
+The chart creates the GatewayClass `pingap` (controllerName `pingap.io/gateway-controller`).
+Without the CRDs the controller logs a warning, keeps serving phase 1, and starts the provider
+when the CRDs appear.
+
+How the resources map:
+
+| Gateway API | Pingap |
+|---|---|
+| Gateway listener (port, HTTP or HTTPS) | an **existing** Pingap server with that port in `addr`; HTTPS needs `global_certificates = true`. The controller never creates servers (a new server needs a Pingap restart): a listener without a matching server gets `Accepted=False` with reason `PortUnavailable`. Gateways of the class share the servers. |
+| HTTPS `certificateRefs` (a `kubernetes.io/tls` Secret) | a certificate with the listener hostname as `domains`, chosen by SNI. A Secret renewal rewrites it. |
+| HTTPRoute rule match | one location per server, host and match: `Exact` → `=path`, `PathPrefix` → a segment-aware regex (`/foo` matches `/foo` and `/foo/x`, not `/foobar`), `RegularExpression` → an anchored regex, exact header and query matches → `match_headers` / `match_query`. Every location gets an explicit `weight` that encodes Gateway API precedence. |
+| `backendRefs` (Services, weighted) | an upstream kept current by the endpoint writer; each Service gets its share of the weight, split over its addresses. Backends that are missing, not permitted or of another kind get a 500 for their share (the `mock` plugin); a new backend without endpoints gets a 503 until it has some (later, like every upstream, the last addresses are kept). |
+| `RequestHeaderModifier`, `ResponseHeaderModifier` | `request_headers` and `response_headers` plugins (Host goes to `proxy_set_headers`) |
+| `RequestRedirect`, `URLRewrite` | the `redirect` plugin; the location `rewrite` and `proxy_set_headers` |
+| status | `Accepted`, `Programmed`, `ResolvedRefs`, listener and route parent conditions, written by the leader |
+
+The GatewayClass lists the supported features in `status.supportedFeatures`: the core of
+Gateway, HTTPRoute and ReferenceGrant, plus query matching, response header modification, path,
+port and scheme redirects, 303/307/308 redirects, host and path rewrites, `parentRef` ports and
+named rules. Not supported: method matching and regular-expression header or query matches (Pingap
+has no such location matching), request mirroring, CORS, timeouts, backend TLS, GRPCRoute,
+TLSRoute, TCPRoute and UDPRoute. A rule that uses an unsupported field is dropped and the route
+reports `PartiallyInvalid`.
+
+Generated entries are named `k8s-...` and carry a `pingap-k8s` remark. The controller only
+changes or deletes `k8s-` entries; hand-made locations, plugins and upstreams stay as they are,
+and a server's hand-made locations keep their place. Generated locations get weights from 65000
+down, above the weights Pingap computes for hand-made locations.
+
+Header values that start with `$` or `:` are refused: Pingap would read them as variables, and `$`
+values from its own environment.
 
 ## Graceful shutdown of application pods (preStop)
 
@@ -841,9 +896,12 @@ and pass it with `extraEnv` and `valueFrom.secretKeyRef`, not as a plain value.
 Report vulnerabilities privately, as described in [SECURITY.md](SECURITY.md).
 
 - **Kubernetes access is read-only and namespaced**: `get/list/watch` on `services` and
-  `endpointslices`, through one Role per namespace. Never a ClusterRole. The only write
-  permission is opt-in: `events.enabled` adds `create/patch` on `events.k8s.io` `events` in those
-  namespaces and the release namespace. API server TLS is always
+  `endpointslices`, through one Role per namespace. Write permissions are opt-in:
+  `events.enabled` adds `create/patch` on `events.k8s.io` `events` in those namespaces and the
+  release namespace. `gateway.enabled` adds the only ClusterRole: read the Gateway API resources
+  and namespaces, and patch the status of GatewayClasses, Gateways and HTTPRoutes. Secrets are
+  read only in `gateway.namespaces`, one watch per named Secret, and can be limited to
+  `gateway.secretNames`. API server TLS is always
   verified; there is no insecure option. The ServiceAccount token is re-read on rotation.
 - **etcd write access is the main risk**: whoever can write `<prefix>/` can redirect traffic.
   - Keep etcd on the private or cluster network only: a `ClusterIP` Service plus a NetworkPolicy
@@ -857,6 +915,10 @@ Report vulnerabilities privately, as described in [SECURITY.md](SECURITY.md).
     etcdctl role add pingap-k8s
     etcdctl role grant-permission pingap-k8s readwrite /pingap/upstreams/ --prefix=true
     etcdctl role grant-permission pingap-k8s readwrite /pingap-k8s-election/ --prefix=true
+    # With gateway.enabled, also the entries it generates:
+    for c in servers locations plugins certificates; do
+      etcdctl role grant-permission pingap-k8s readwrite /pingap/$c/ --prefix=true
+    done
     etcdctl user add pingap-k8s --no-password   # authenticated by the certificate CN
     etcdctl user grant-role pingap-k8s pingap-k8s
     ```
@@ -877,7 +939,7 @@ Report vulnerabilities privately, as described in [SECURITY.md](SECURITY.md).
   `networkPolicy.metricsFrom` (or `networkPolicy.allowSameNamespace`). Kubelet probes and
   port-forward keep working. CI fails if the chart renders a
   `LoadBalancer` or `NodePort` Service other than the quickstart proxy listener, or any
-  cluster-wide RBAC.
+  cluster-wide RBAC other than the read-only gateway ClusterRole.
 - **The quickstart Pingap admin port is closed to other pods** by a NetworkPolicy
   (`pingap.networkPolicy.enabled`, on by default). Only the proxy port (`pingap.httpPort`, plus
   `pingap.networkPolicy.extraPorts` for more listeners) is open. To reach the admin from other
@@ -914,12 +976,16 @@ At 50 upstreams × 20 endpoints: event-to-write p50 0.52 s (the 500 ms debounce)
 
 ## Limitations
 
-- Phase 1 manages upstream `addrs` only. Locations, servers and certificates are not generated
-  (Gateway API support is planned; Ingress will not be supported).
+- Servers are never generated: Gateway listeners need a Pingap server on their port. Ingress will
+  not be supported.
+- Gateway API: HTTPRoute only (no GRPCRoute, TLSRoute, TCPRoute or UDPRoute), no method or regex
+  header/query matching, no mirroring, CORS or timeouts. All Gateways of the class share the same
+  Pingap servers and certificates (no per-Gateway infrastructure, no listener isolation).
 - etcd is the only write target. Pingap file or ConfigMap storage is not supported.
 - Pingap must be able to reach pod IPs, or with `target = "service"` resolve and reach the
   Service names (normally: run Pingap inside the cluster).
-- `ExternalName` Services are not supported.
+- `ExternalName` Services are not supported in `config.upstreams` (the Gateway API provider
+  supports them as backends with `gateway.external_name`).
 - When the controller is down, Pingap keeps serving the last addresses, but new pods get no
   traffic until it is back.
 - Bundled etcd: the member count (1 or 3) is fixed at install; changing `etcd.replicas` later does

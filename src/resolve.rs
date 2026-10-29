@@ -173,13 +173,21 @@ struct Entry {
     source: usize,
 }
 
-/// Total of the weights written with `spread_weights`. Pingora's weighted selection keeps
-/// one slot per unit of weight, so the total must stay small.
+/// Largest total of the weights written with `spread_weights`. Pingora's weighted
+/// round robin keeps one slot per unit of weight and walks the slots in order, so a
+/// backend with weight `w` gets `w` requests in a row: the weights must stay small.
 pub const SPREAD_TOTAL: u64 = 1000;
 
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
 /// `spread_weights`: `(address, source, weight)` with the Service weight of `source`
-/// becomes `(address, weight)` where every Service's share of [`SPREAD_TOTAL`] is split
-/// evenly over its addresses (at least 1 each). Services with weight 0 never reach here.
+/// becomes `(address, weight)`, every Service's share split evenly over its addresses.
+/// The weights are the smallest exact integers (Service weight times the least common
+/// multiple of the address counts, divided by the address count, all divided by their
+/// greatest common divisor); when those add up to more than [`SPREAD_TOTAL`], each
+/// share of [`SPREAD_TOTAL`] is rounded instead (at least 1 per address).
 fn spread(entries: Vec<(String, usize, u32)>) -> Vec<(String, Option<u32>)> {
     let mut per_source: HashMap<usize, (u64, u64)> = HashMap::new();
     for (_, source, weight) in &entries {
@@ -190,12 +198,30 @@ fn spread(entries: Vec<(String, usize, u32)>) -> Vec<(String, Option<u32>)> {
     if total == 0 {
         return entries.into_iter().map(|(a, _, _)| (a, None)).collect();
     }
+    let lcm = per_source
+        .values()
+        .try_fold(1u64, |l, (_, n)| (l / gcd(l, *n)).checked_mul(*n));
+    let exact: Option<HashMap<usize, u64>> = lcm.and_then(|lcm| {
+        let per_addr: HashMap<usize, u64> = per_source
+            .iter()
+            .map(|(s, (w, n))| Some((*s, w.checked_mul(lcm)? / n)))
+            .collect::<Option<_>>()?;
+        let g = per_addr.values().fold(0, |g, w| gcd(g, *w)).max(1);
+        let per_addr: HashMap<usize, u64> = per_addr.into_iter().map(|(s, w)| (s, w / g)).collect();
+        let sum: u64 = per_source.iter().map(|(s, (_, n))| per_addr[s] * n).sum();
+        (sum <= SPREAD_TOTAL).then_some(per_addr)
+    });
     entries
         .into_iter()
         .map(|(addr, source, _)| {
-            let (weight, count) = per_source[&source];
-            let share = (weight * SPREAD_TOTAL + total * count / 2) / (total * count);
-            (addr, Some(u32::try_from(share.max(1)).unwrap_or(u32::MAX)))
+            let weight = match &exact {
+                Some(per_addr) => per_addr[&source],
+                None => {
+                    let (weight, count) = per_source[&source];
+                    (weight * SPREAD_TOTAL + total * count / 2) / (total * count)
+                }
+            };
+            (addr, Some(u32::try_from(weight.max(1)).unwrap_or(u32::MAX)))
         })
         .collect()
 }
@@ -1220,18 +1246,42 @@ mod tests {
             spread_weights: true,
             ..opts()
         };
-        // 90 % over three pods, 10 % on one: 300 each and 100.
+        // 90 % over three pods, 10 % on one: 3 each and 1 (smallest exact weights).
         assert_eq!(
             resolve(&inputs, &opts).addrs,
             vec![
-                "10.0.0.10:8080 300",
-                "10.0.0.11:8080 300",
-                "10.0.0.9:8080 300",
-                "10.0.1.1:8080 100",
+                "10.0.0.10:8080 3",
+                "10.0.0.11:8080 3",
+                "10.0.0.9:8080 3",
+                "10.0.1.1:8080 1",
             ]
         );
 
-        // Huge Gateway API weights are scaled down; a tiny share still gets 1.
+        // Equal halves over three pods and one pod: 1 each and 3.
+        let half_a = sref("web-blue", named("http"), Some(1));
+        let half_b = sref("web-green", named("http"), Some(1));
+        let inputs_half = [
+            ServiceInput {
+                service_ref: &half_a,
+                snapshot: &sb,
+            },
+            ServiceInput {
+                service_ref: &half_b,
+                snapshot: &sg,
+            },
+        ];
+        assert_eq!(
+            resolve(&inputs_half, &opts).addrs,
+            vec![
+                "10.0.0.10:8080 1",
+                "10.0.0.11:8080 1",
+                "10.0.0.9:8080 1",
+                "10.0.1.1:8080 3",
+            ]
+        );
+
+        // Exact weights that would add up to too much are scaled down instead; a tiny
+        // share still gets 1.
         let big = sref("web-blue", named("http"), Some(1_000_000));
         let tiny = sref("web-green", named("http"), Some(1));
         let inputs = [

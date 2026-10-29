@@ -6,6 +6,23 @@ Version 0.16.10. Versions now follow Pingap: the Pingap version the release is t
 one digit for our own releases (Pingap 0.16.1: 0.16.10 to 0.16.19). `make version-check` and the
 release workflow enforce it.
 
+Gateway API provider (off by default, `gateway.enabled`):
+- Gateway API v1.6.3 Standard channel: GatewayClasses with the controller's `controllerName`,
+  their Gateways and the attached HTTPRoutes become Pingap locations, plugins, certificates and
+  upstreams (named `k8s-...`). ReferenceGrants allow cross-namespace backends and certificates.
+- Listeners map onto existing Pingap servers by port and TLS. Locations get explicit weights for
+  Gateway API precedence, segment-aware prefixes, and exact header and query matches. Invalid
+  backends answer 500, backends without endpoints 503.
+- Filters: request and response header modifiers, redirects (host, scheme, port, path, all
+  status codes) and URL rewrites (host and path).
+- Weighted backendRefs: each Service gets its share of the weight, split over its addresses, with
+  the smallest exact integer weights.
+- Status for GatewayClasses (with `supportedFeatures`), Gateways and HTTPRoutes, written by the
+  leader; other controllers' route status entries are kept.
+- Chart: `gateway.*` values, a GatewayClass, and a ClusterRole that only reads the Gateway API
+  resources and namespaces and patches their status. Secrets stay namespaced. `make
+  exposure-check` allows only that ClusterRole.
+
 Changes:
 - `target = "service"` writes the Service's ClusterIP instead of its DNS name (a headless Service
   keeps the name). A Service deleted and recreated with a new ClusterIP is now followed within the

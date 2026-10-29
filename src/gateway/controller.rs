@@ -761,4 +761,598 @@ async fn sleep_or_pending(deadline: Option<Instant>) {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use k8s_openapi::api::core::v1::{Namespace, Secret};
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
+    use crate::gateway::api::gatewayclasses::{GatewayClass, GatewayClassSpec, GatewayClassStatus};
+    use crate::gateway::api::gateways::{Gateway, GatewayStatus};
+    use crate::gateway::api::httproutes::{HttpRoute, HttpRouteStatus};
+    use crate::gateway::api::referencegrants::ReferenceGrant;
+    use crate::gateway::model::{Deferred, Expect, Op, SecretKey, Step, StoredEntry};
+    use crate::types::{PortRef, ServiceRef, ServiceSnapshot};
+
+    fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        m.lock().unwrap()
+    }
+
+    fn skey(name: &str) -> ServiceKey {
+        ServiceKey {
+            namespace: "apps".into(),
+            name: name.into(),
+        }
+    }
+
+    fn set(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn class(name: &str) -> Arc<GatewayClass> {
+        Arc::new(GatewayClass {
+            metadata: ObjectMeta {
+                name: Some(name.into()),
+                ..Default::default()
+            },
+            spec: GatewayClassSpec {
+                controller_name: "pingap.io/gateway-controller".into(),
+                ..Default::default()
+            },
+            status: None,
+        })
+    }
+
+    // ---- fakes ----
+
+    struct FakeGateways {
+        classes: Mutex<Vec<Arc<GatewayClass>>>,
+        synced: AtomicBool,
+        tx: broadcast::Sender<()>,
+    }
+
+    impl GatewaySource for FakeGateways {
+        fn classes(&self) -> Vec<Arc<GatewayClass>> {
+            lock(&self.classes).clone()
+        }
+        fn gateways(&self) -> Vec<Arc<Gateway>> {
+            Vec::new()
+        }
+        fn routes(&self) -> Vec<Arc<HttpRoute>> {
+            Vec::new()
+        }
+        fn grants(&self) -> Vec<Arc<ReferenceGrant>> {
+            Vec::new()
+        }
+        fn namespaces(&self) -> BTreeMap<String, Arc<Namespace>> {
+            BTreeMap::new()
+        }
+        fn is_synced(&self) -> bool {
+            self.synced.load(Ordering::SeqCst)
+        }
+        fn changes(&self) -> broadcast::Receiver<()> {
+            self.tx.subscribe()
+        }
+    }
+
+    struct FakeSecrets {
+        synced: AtomicBool,
+        tx: broadcast::Sender<()>,
+        wanted: Mutex<Vec<BTreeSet<SecretKey>>>,
+    }
+
+    impl SecretSource for FakeSecrets {
+        fn set_secrets(&self, keys: BTreeSet<SecretKey>) {
+            lock(&self.wanted).push(keys);
+        }
+        fn secrets(&self) -> BTreeMap<SecretKey, Arc<Secret>> {
+            BTreeMap::new()
+        }
+        fn is_synced(&self) -> bool {
+            self.synced.load(Ordering::SeqCst)
+        }
+        fn changes(&self) -> broadcast::Receiver<()> {
+            self.tx.subscribe()
+        }
+    }
+
+    struct FakeServices;
+
+    impl SnapshotSource for FakeServices {
+        fn snapshot(&self, _key: &ServiceKey) -> ServiceSnapshot {
+            ServiceSnapshot {
+                service: Some(Arc::new(Service::default())),
+                slices: Vec::new(),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeStore {
+        reads: AtomicUsize,
+        applied: Mutex<Vec<Plan>>,
+        /// Applies that fail before one succeeds.
+        failures: AtomicUsize,
+    }
+
+    impl FakeStore {
+        fn applies(&self) -> usize {
+            lock(&self.applied).len()
+        }
+    }
+
+    impl PingapStore for FakeStore {
+        async fn read_stored(&self) -> anyhow::Result<Stored> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let mut stored = Stored::default();
+            stored.plugins.insert(
+                "auth".into(),
+                StoredEntry {
+                    key: "/p/plugins/auth.toml".into(),
+                    value: String::new(),
+                    mod_revision: 1,
+                },
+            );
+            stored.servers.insert(
+                "http".into(),
+                StoredEntry {
+                    key: "/p/servers/http.toml".into(),
+                    value: "[servers.http]\naddr = \"0.0.0.0:80\"\n".into(),
+                    mod_revision: 1,
+                },
+            );
+            Ok(stored)
+        }
+
+        async fn apply(&self, plan: &Plan) -> anyhow::Result<ApplyOutcome> {
+            let failures = self.failures.load(Ordering::SeqCst);
+            if failures > 0 {
+                self.failures.store(failures - 1, Ordering::SeqCst);
+                bail!("compare failed");
+            }
+            lock(&self.applied).push(plan.clone());
+            Ok(if plan.steps.is_empty() {
+                ApplyOutcome::Unchanged
+            } else {
+                ApplyOutcome::Applied {
+                    revision: 2,
+                    puts: 1,
+                    deletes: 0,
+                }
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeStatus {
+        classes: Mutex<Vec<String>>,
+    }
+
+    impl StatusPublisher for FakeStatus {
+        async fn publish_class(
+            &self,
+            class: &GatewayClass,
+            _status: &GatewayClassStatus,
+        ) -> anyhow::Result<bool> {
+            lock(&self.classes).push(class.metadata.name.clone().unwrap_or_default());
+            Ok(true)
+        }
+        async fn publish_gateway(
+            &self,
+            _gateway: &Gateway,
+            _status: &GatewayStatus,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn publish_route(
+            &self,
+            _route: &HttpRoute,
+            _status: &HttpRouteStatus,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeLogic {
+        referenced: Mutex<Referenced>,
+        desired: Mutex<Desired>,
+        plan: Mutex<Plan>,
+        translations: AtomicUsize,
+        plans: AtomicUsize,
+        keeps: Mutex<Vec<BTreeSet<String>>>,
+        plugins: Mutex<BTreeSet<String>>,
+        servers: Mutex<Vec<ServerInfo>>,
+    }
+
+    impl Logic for FakeLogic {
+        fn referenced(&self, _input: &TranslateInput<'_>) -> Referenced {
+            lock(&self.referenced).clone()
+        }
+        fn translate(&self, input: &TranslateInput<'_>) -> Desired {
+            self.translations.fetch_add(1, Ordering::SeqCst);
+            *lock(&self.plugins) = input.plugins.clone();
+            *lock(&self.servers) = input.servers.to_vec();
+            lock(&self.desired).clone()
+        }
+        fn plan(
+            &self,
+            _desired: &Desired,
+            _stored: &Stored,
+            keep_upstreams: &BTreeSet<String>,
+        ) -> Plan {
+            self.plans.fetch_add(1, Ordering::SeqCst);
+            lock(&self.keeps).push(keep_upstreams.clone());
+            lock(&self.plan).clone()
+        }
+    }
+
+    // ---- harness ----
+
+    fn settings() -> ControllerSettings {
+        ControllerSettings {
+            translate: TranslateOptions {
+                controller_name: "pingap.io/gateway-controller".into(),
+                external_name: false,
+                upstream_defaults: crate::config::Defaults::default().upstream_options(),
+                health_check: None,
+                cluster_domain: "cluster.local".into(),
+                servers: vec![],
+                addresses: vec!["203.0.113.7".into()],
+            },
+        }
+    }
+
+    fn one_step_plan() -> Plan {
+        Plan {
+            steps: vec![Step {
+                what: "locations",
+                ops: vec![Op::Put {
+                    key: "/p/locations/k8s-apps-web-1.toml".into(),
+                    value: String::new(),
+                    expect: Expect::Absent,
+                }],
+            }],
+            deferred: BTreeMap::new(),
+            programmed: set(&["k8s-apps-web-1"]),
+        }
+    }
+
+    fn upstream(service: &str) -> UpstreamConfig {
+        UpstreamConfig {
+            services: vec![ServiceRef {
+                key: skey(service),
+                port: PortRef::Number(80),
+                weight: None,
+            }],
+            options: crate::config::Defaults::default().upstream_options(),
+            health_check: None,
+        }
+    }
+
+    struct Harness {
+        gateways: Arc<FakeGateways>,
+        secrets: Arc<FakeSecrets>,
+        store: Arc<FakeStore>,
+        status: Arc<FakeStatus>,
+        logic: Arc<FakeLogic>,
+        metrics: Arc<Metrics>,
+        leader: watch::Sender<bool>,
+        etcd: mpsc::Sender<()>,
+        synced: watch::Receiver<bool>,
+        /// Present when the test answers the endpoint writer itself.
+        generated: Option<mpsc::Receiver<GeneratedUpstreams>>,
+        _settings: watch::Sender<ControllerSettings>,
+        _services: broadcast::Sender<ServiceKey>,
+        _stop: watch::Sender<bool>,
+    }
+
+    struct Setup {
+        leader: bool,
+        gateways_synced: bool,
+        secrets_synced: bool,
+        auto_apply: bool,
+        logic: FakeLogic,
+    }
+
+    impl Default for Setup {
+        fn default() -> Self {
+            let logic = FakeLogic::default();
+            *lock(&logic.plan) = one_step_plan();
+            lock(&logic.desired)
+                .status
+                .classes
+                .insert("pingap".into(), GatewayClassStatus::default());
+            Setup {
+                leader: true,
+                gateways_synced: true,
+                secrets_synced: true,
+                auto_apply: true,
+                logic,
+            }
+        }
+    }
+
+    fn start(setup: Setup) -> Harness {
+        let gateways = Arc::new(FakeGateways {
+            classes: Mutex::new(vec![class("pingap"), class("other")]),
+            synced: AtomicBool::new(setup.gateways_synced),
+            tx: broadcast::channel(16).0,
+        });
+        let secrets = Arc::new(FakeSecrets {
+            synced: AtomicBool::new(setup.secrets_synced),
+            tx: broadcast::channel(16).0,
+            wanted: Mutex::new(Vec::new()),
+        });
+        let store = Arc::new(FakeStore::default());
+        let status = Arc::new(FakeStatus::default());
+        let logic = Arc::new(setup.logic);
+        let metrics = Arc::new(Metrics::new());
+        let (settings_tx, settings_rx) = watch::channel(settings());
+        let (leader_tx, leader_rx) = watch::channel(setup.leader);
+        let (etcd_tx, etcd_rx) = mpsc::channel(8);
+        let (gen_tx, mut gen_rx) = mpsc::channel::<GeneratedUpstreams>(8);
+        let (synced_tx, synced_rx) = watch::channel(false);
+        let (svc_tx, svc_rx) = broadcast::channel(16);
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+
+        let generated = if setup.auto_apply {
+            tokio::spawn(async move {
+                while let Some(g) = gen_rx.recv().await {
+                    let _ = g.applied.send(());
+                }
+            });
+            None
+        } else {
+            Some(gen_rx)
+        };
+
+        let controller = GatewayController::new(Parts {
+            gateways: gateways.clone(),
+            secrets: secrets.clone(),
+            services: Arc::new(FakeServices),
+            store: store.clone(),
+            status: status.clone(),
+            logic: logic.clone(),
+            metrics: metrics.clone(),
+        });
+        let inputs = Inputs {
+            settings: settings_rx,
+            leader: leader_rx,
+            service_changes: svc_rx,
+            etcd_changes: etcd_rx,
+            generated: gen_tx,
+            synced: synced_tx,
+            resync: Duration::from_secs(3600),
+        };
+        tokio::spawn(controller.run(inputs, async move {
+            let _ = stop_rx.wait_for(|s| *s).await;
+        }));
+        Harness {
+            gateways,
+            secrets,
+            store,
+            status,
+            logic,
+            metrics,
+            leader: leader_tx,
+            etcd: etcd_tx,
+            synced: synced_rx,
+            generated,
+            _settings: settings_tx,
+            _services: svc_tx,
+            _stop: stop_tx,
+        }
+    }
+
+    async fn sleep_ms(ms: u64) {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+
+    impl Harness {
+        fn plans(&self) -> usize {
+            self.logic.plans.load(Ordering::SeqCst)
+        }
+
+        async fn poke(&self) {
+            self.etcd.send(()).await.unwrap();
+            sleep_ms(3_000).await;
+        }
+    }
+
+    // ---- tests ----
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_is_planned_before_the_gateway_api_listed() {
+        let h = start(Setup {
+            gateways_synced: false,
+            ..Setup::default()
+        });
+        sleep_ms(5_000).await;
+        assert_eq!(h.store.reads.load(Ordering::SeqCst), 0);
+        assert_eq!(h.plans(), 0);
+        assert!(!*h.synced.borrow());
+
+        h.gateways.synced.store(true, Ordering::SeqCst);
+        let _ = h.gateways.tx.send(());
+        sleep_ms(3_000).await;
+        assert_eq!(h.store.applies(), 1);
+        assert!(*h.synced.borrow());
+        // Pingap's built-in plugins are known besides the stored ones, and the stored
+        // servers reach the translation.
+        let plugins = lock(&h.logic.plugins).clone();
+        assert!(plugins.contains("auth") && plugins.contains("pingap:ping"));
+        let servers = lock(&h.logic.servers).clone();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "http");
+        assert_eq!(servers[0].ports, BTreeSet::from([80]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_is_planned_before_secrets_listed() {
+        let setup = Setup {
+            secrets_synced: false,
+            ..Setup::default()
+        };
+        let secret = SecretKey::new("apps", "tls");
+        lock(&setup.logic.referenced).secrets.insert(secret.clone());
+        let h = start(setup);
+        sleep_ms(5_000).await;
+        // The Secret watches follow the referenced Secrets, but nothing is planned.
+        assert_eq!(
+            lock(&h.secrets.wanted).last(),
+            Some(&BTreeSet::from([secret]))
+        );
+        assert_eq!(h.plans(), 0);
+
+        h.secrets.synced.store(true, Ordering::SeqCst);
+        let _ = h.secrets.tx.send(());
+        sleep_ms(3_000).await;
+        assert_eq!(h.store.applies(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_is_planned_before_backend_services_listed() {
+        let setup = Setup {
+            auto_apply: false,
+            ..Setup::default()
+        };
+        lock(&setup.logic.referenced).services.insert(skey("api"));
+        let mut h = start(setup);
+        let mut rx = h.generated.take().unwrap();
+        // The first hand-over only asks for the Service watches.
+        let first = rx.recv().await.unwrap();
+        assert!(first.upstreams.is_empty());
+        assert_eq!(first.services, BTreeSet::from([skey("api")]));
+        sleep_ms(5_000).await;
+        assert_eq!(h.logic.translations.load(Ordering::SeqCst), 0);
+        assert_eq!(h.store.applies(), 0);
+        first.applied.send(()).unwrap();
+        sleep_ms(1_000).await;
+        assert!(rx.try_recv().is_err());
+        assert_eq!(h.logic.translations.load(Ordering::SeqCst), 1);
+        assert_eq!(h.store.applies(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn follower_plans_but_never_writes() {
+        let h = start(Setup {
+            leader: false,
+            ..Setup::default()
+        });
+        sleep_ms(3_000).await;
+        h.poke().await;
+        assert!(h.plans() >= 2);
+        assert_eq!(h.store.applies(), 0);
+        assert!(lock(&h.status.classes).is_empty());
+        // Gauges are computed on followers too.
+        assert_eq!(h.metrics.value("pingap_k8s_gateway_locations", &[]), 1);
+        assert_eq!(h.metrics.value("pingap_k8s_gateway_deferred", &[]), 0);
+        assert!(*h.synced.borrow());
+
+        // Promotion: a pass right away, with status for the desired classes only.
+        h.leader.send(true).unwrap();
+        sleep_ms(100).await;
+        assert_eq!(h.store.applies(), 1);
+        assert_eq!(*lock(&h.status.classes), vec!["pingap".to_string()]);
+        assert_eq!(
+            h.metrics
+                .value("pingap_k8s_gateway_sync_total", &[("result", "ok")]),
+            1
+        );
+
+        // Demoted again: no more writes.
+        h.leader.send(false).unwrap();
+        h.poke().await;
+        assert_eq!(h.store.applies(), 1);
+        assert_eq!(lock(&h.status.classes).len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deferred_locations_are_retried_with_backoff() {
+        let setup = Setup::default();
+        lock(&setup.logic.plan).deferred.insert(
+            "k8s-apps-web-1".into(),
+            Deferred::MissingUpstream("k8s-u".into()),
+        );
+        let h = start(setup);
+        // Passes at 0 s, then retries 1 s, 2 s and 4 s apart: 0, 1, 3, 7.
+        sleep_ms(500).await;
+        assert_eq!(h.plans(), 1);
+        assert_eq!(h.metrics.value("pingap_k8s_gateway_deferred", &[]), 1);
+        sleep_ms(1_000).await;
+        assert_eq!(h.plans(), 2);
+        sleep_ms(2_000).await;
+        assert_eq!(h.plans(), 3);
+        sleep_ms(2_000).await;
+        assert_eq!(h.plans(), 3);
+        sleep_ms(2_000).await;
+        assert_eq!(h.plans(), 4);
+
+        // Nothing deferred any more: one more timer pass, then none.
+        lock(&h.logic.plan).deferred.clear();
+        sleep_ms(8_000).await;
+        assert_eq!(h.plans(), 5);
+        sleep_ms(60_000).await;
+        assert_eq!(h.plans(), 5);
+        assert_eq!(h.metrics.value("pingap_k8s_gateway_deferred", &[]), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn garbage_collection_waits_for_applied() {
+        let setup = Setup {
+            auto_apply: false,
+            ..Setup::default()
+        };
+        lock(&setup.logic.desired)
+            .upstreams
+            .insert("k8s-apps-api-80-1".into(), upstream("api"));
+        let mut h = start(setup);
+        let mut rx = h.generated.take().unwrap();
+        let handed = rx.recv().await.unwrap();
+        assert_eq!(
+            handed.upstreams.keys().collect::<Vec<_>>(),
+            vec!["k8s-apps-api-80-1"]
+        );
+        // Not taken over yet: no plan, nothing deleted.
+        sleep_ms(10_000).await;
+        assert_eq!(h.plans(), 0);
+        assert_eq!(h.store.applies(), 0);
+
+        handed.applied.send(()).unwrap();
+        sleep_ms(100).await;
+        assert_eq!(h.store.applies(), 1);
+        // The generated upstreams are kept by the plan.
+        assert_eq!(
+            lock(&h.logic.keeps).last(),
+            Some(&set(&["k8s-apps-api-80-1"]))
+        );
+
+        // The same upstreams again are not handed over again.
+        h.poke().await;
+        assert_eq!(h.store.applies(), 2);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_applies_are_replanned_then_backed_off() {
+        let h = start(Setup::default());
+        h.store
+            .failures
+            .store(APPLY_ATTEMPTS as usize, Ordering::SeqCst);
+        sleep_ms(100).await;
+        // Every attempt of the first pass failed: re-read and re-planned each time.
+        assert_eq!(h.plans(), APPLY_ATTEMPTS as usize);
+        assert_eq!(h.store.applies(), 0);
+        assert_eq!(
+            h.metrics
+                .value("pingap_k8s_gateway_sync_total", &[("result", "error")]),
+            u64::from(APPLY_ATTEMPTS)
+        );
+        // The retry after the backoff succeeds.
+        sleep_ms(1_000).await;
+        assert_eq!(h.store.applies(), 1);
+    }
+}
