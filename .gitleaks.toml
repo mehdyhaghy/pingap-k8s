@@ -14,3 +14,8 @@ regexes = [
 [[allowlists]]
 description = "Build output"
 paths = ['''^target/''']
+
+[[allowlists]]
+description = "Test fixtures: the test-only JWTs of e2e test 17"
+targetRules = ["jwt"]
+paths = ['''^tests/e2e/spec\.rs$''']

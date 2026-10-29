@@ -26,8 +26,9 @@ the upstream that changed, without a restart.
 - **Fail static.** If the Kubernetes API or the controller is down, Pingap keeps the last written
   addresses and its health checks remove dead pods.
 
-Status: phase 1 (endpoint discovery). Generating Pingap locations from Ingress and Gateway API
-resources is planned for later phases.
+Status: phase 1 (endpoint discovery). Generating Pingap routes from the Kubernetes
+[Gateway API](https://gateway-api.sigs.k8s.io/) is planned next. The frozen Ingress API will not be
+supported.
 
 ## Contents
 
@@ -914,7 +915,7 @@ At 50 upstreams × 20 endpoints: event-to-write p50 0.52 s (the 500 ms debounce)
 ## Limitations
 
 - Phase 1 manages upstream `addrs` only. Locations, servers and certificates are not generated
-  (Ingress and Gateway API support are planned).
+  (Gateway API support is planned; Ingress will not be supported).
 - etcd is the only write target. Pingap file or ConfigMap storage is not supported.
 - Pingap must be able to reach pod IPs, or with `target = "service"` resolve and reach the
   Service names (normally: run Pingap inside the cluster).
