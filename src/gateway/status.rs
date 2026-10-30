@@ -1,5 +1,5 @@
-//! Gateway provider: the `status` subresources of GatewayClasses, Gateways, HTTPRoutes and
-//! BackendTLSPolicies.
+//! Gateway provider: the `status` subresources of GatewayClasses, Gateways, ListenerSets,
+//! HTTPRoutes and BackendTLSPolicies.
 //!
 //! The desired statuses come from the translation with a placeholder
 //! `lastTransitionTime`. Before comparing, every desired condition takes the stored time
@@ -14,11 +14,13 @@
 //! subresource carrying the `resourceVersion` it was based on; on a 409 Conflict the
 //! object is read again and the merge redone, a few times.
 //!
-//! GatewayClass and Gateway status is ours: conditions, listeners and addresses are
+//! GatewayClass, Gateway and ListenerSet status is ours: listeners and addresses are
 //! replaced whole; other fields (`supportedFeatures`, `attachedListenerSets`) are only
-//! written when the translation sets them. Route `status.parents` and BackendTLSPolicy
-//! `status.ancestors` are shared with other controllers: their entries are kept as they
-//! are, only ours are replaced or removed.
+//! written when the translation sets them. Conditions of a type this controller never
+//! sets (on the object or on a listener) belong to someone else and are kept as they
+//! are. Route `status.parents` and BackendTLSPolicy `status.ancestors` are shared with
+//! other controllers: their entries are kept as they are, only ours are replaced or
+//! removed.
 
 use std::fmt::Debug;
 
@@ -40,6 +42,7 @@ use super::api::gateways::{
     Gateway, GatewayStatus, GatewayStatusAddresses, GatewayStatusListeners,
 };
 use super::api::httproutes::{HttpRoute, HttpRouteStatus, HttpRouteStatusParents};
+use super::api::listenersets::{ListenerSet, ListenerSetStatus, ListenerSetStatusListeners};
 use super::model::GATEWAY_GROUP;
 
 /// Field manager of the status patches.
@@ -52,6 +55,12 @@ const MAX_ATTEMPTS: usize = 4;
 const DEFAULT_ADDRESS_TYPE: &str = "IPAddress";
 /// API server default of `parentRef.kind`.
 const DEFAULT_PARENT_KIND: &str = "Gateway";
+
+/// The condition types this controller sets, per object: other types are kept.
+const CLASS_CONDITIONS: &[&str] = &["Accepted", "SupportedVersion"];
+const GATEWAY_CONDITIONS: &[&str] = &["Accepted", "Programmed", "ResolvedRefs"];
+const LISTENER_SET_CONDITIONS: &[&str] = &["Accepted", "Programmed"];
+const LISTENER_CONDITIONS: &[&str] = &["Accepted", "Conflicted", "ResolvedRefs", "Programmed"];
 
 /// The current time, whole seconds (what the API server stores).
 pub fn now() -> Time {
@@ -75,6 +84,26 @@ pub fn merge_conditions(stored: &[Condition], desired: &[Condition], now: &Time)
             }
         })
         .collect()
+}
+
+/// [`merge_conditions`] followed by the `stored` conditions of the types this controller
+/// does not set (`owned`, or desired), unchanged.
+pub fn merge_keeping_foreign(
+    stored: &[Condition],
+    desired: &[Condition],
+    owned: &[&str],
+    now: &Time,
+) -> Vec<Condition> {
+    let mut out = merge_conditions(stored, desired, now);
+    out.extend(
+        stored
+            .iter()
+            .filter(|c| {
+                !owned.contains(&c.type_.as_str()) && !desired.iter().any(|d| d.type_ == c.type_)
+            })
+            .cloned(),
+    );
+    out
 }
 
 fn sorted_conditions(conditions: &[Condition]) -> Vec<Condition> {
@@ -106,7 +135,7 @@ pub fn merge_class_status(
         conditions: desired
             .conditions
             .as_deref()
-            .map(|d| merge_conditions(stored_conditions, d, now)),
+            .map(|d| merge_keeping_foreign(stored_conditions, d, CLASS_CONDITIONS, now)),
         supported_features: desired
             .supported_features
             .clone()
@@ -165,8 +194,9 @@ fn normalize_listener(mut listener: GatewayStatusListeners) -> GatewayStatusList
 }
 
 /// The Gateway status to store: `desired` with transition times merged (listener
-/// conditions within the stored listener of the same name) and API server defaults filled
-/// in. `attachedListenerSets` is kept from `stored` unless `desired` sets it.
+/// conditions within the stored listener of the same name), foreign conditions kept and
+/// API server defaults filled in. `attachedListenerSets` is kept from `stored` unless
+/// `desired` sets it.
 pub fn merge_gateway_status(
     stored: Option<&GatewayStatus>,
     desired: &GatewayStatus,
@@ -182,7 +212,12 @@ pub fn merge_gateway_status(
                     .find(|l| l.name == want.name)
                     .map_or(&[][..], |l| l.conditions.as_slice());
                 normalize_listener(GatewayStatusListeners {
-                    conditions: merge_conditions(old, &want.conditions, now),
+                    conditions: merge_keeping_foreign(
+                        old,
+                        &want.conditions,
+                        LISTENER_CONDITIONS,
+                        now,
+                    ),
                     ..want.clone()
                 })
             })
@@ -196,7 +231,7 @@ pub fn merge_gateway_status(
         conditions: desired
             .conditions
             .as_deref()
-            .map(|d| merge_conditions(stored_conditions, d, now)),
+            .map(|d| merge_keeping_foreign(stored_conditions, d, GATEWAY_CONDITIONS, now)),
         listeners: non_empty(listeners),
     }
 }
@@ -236,6 +271,92 @@ pub fn gateway_patch_body(status: &GatewayStatus) -> Value {
     let mut body =
         serde_json::to_value(status).unwrap_or_else(|_| Value::Object(Default::default()));
     set_null_if_absent(&mut body, &["addresses", "conditions", "listeners"]);
+    body
+}
+
+// ListenerSet
+
+fn normalize_set_listener(mut listener: ListenerSetStatusListeners) -> ListenerSetStatusListeners {
+    if let Some(kinds) = listener.supported_kinds.as_mut() {
+        for kind in kinds.iter_mut() {
+            kind.group.get_or_insert_with(|| GATEWAY_GROUP.to_string());
+        }
+    }
+    listener
+}
+
+/// The ListenerSet status to store, like [`merge_gateway_status`].
+pub fn merge_listener_set_status(
+    stored: Option<&ListenerSetStatus>,
+    desired: &ListenerSetStatus,
+    now: &Time,
+) -> ListenerSetStatus {
+    let stored_conditions = stored.and_then(|s| s.conditions.as_deref()).unwrap_or(&[]);
+    let stored_listeners = stored.and_then(|s| s.listeners.as_deref()).unwrap_or(&[]);
+    let listeners = desired.listeners.as_ref().map(|list| {
+        list.iter()
+            .map(|want| {
+                let old = stored_listeners
+                    .iter()
+                    .find(|l| l.name == want.name)
+                    .map_or(&[][..], |l| l.conditions.as_slice());
+                normalize_set_listener(ListenerSetStatusListeners {
+                    conditions: merge_keeping_foreign(
+                        old,
+                        &want.conditions,
+                        LISTENER_CONDITIONS,
+                        now,
+                    ),
+                    ..want.clone()
+                })
+            })
+            .collect()
+    });
+    ListenerSetStatus {
+        conditions: desired
+            .conditions
+            .as_deref()
+            .map(|d| merge_keeping_foreign(stored_conditions, d, LISTENER_SET_CONDITIONS, now)),
+        listeners: non_empty(listeners),
+    }
+}
+
+fn canonical_listener_set(status: Option<&ListenerSetStatus>) -> ListenerSetStatus {
+    let status = status.cloned().unwrap_or_default();
+    let listeners = non_empty(status.listeners).map(|list| {
+        let mut list: Vec<ListenerSetStatusListeners> = list
+            .into_iter()
+            .map(|l| {
+                let mut l = normalize_set_listener(l);
+                l.conditions = sorted_conditions(&l.conditions);
+                l.supported_kinds = non_empty(l.supported_kinds);
+                l
+            })
+            .collect();
+        list.sort_by(|a, b| a.name.cmp(&b.name));
+        list
+    });
+    ListenerSetStatus {
+        conditions: non_empty(status.conditions).map(|c| sorted_conditions(&c)),
+        listeners,
+    }
+}
+
+/// Whether two ListenerSet statuses are the same (conditions and listeners compared as
+/// sets, API server defaults filled in).
+pub fn listener_set_status_equal(
+    a: Option<&ListenerSetStatus>,
+    b: Option<&ListenerSetStatus>,
+) -> bool {
+    canonical_listener_set(a) == canonical_listener_set(b)
+}
+
+/// The `status` object of the merge patch: conditions and listeners are always written
+/// (null clears).
+pub fn listener_set_patch_body(status: &ListenerSetStatus) -> Value {
+    let mut body =
+        serde_json::to_value(status).unwrap_or_else(|_| Value::Object(Default::default()));
+    set_null_if_absent(&mut body, &["conditions", "listeners"]);
     body
 }
 
@@ -565,6 +686,33 @@ impl super::model::StatusPublisher for KubeStatus {
                 let merged = merge_gateway_status(obj.status.as_ref(), status, &now);
                 (!gateway_status_equal(obj.status.as_ref(), Some(&merged)))
                     .then(|| gateway_patch_body(&merged))
+            },
+        )
+        .await
+    }
+
+    async fn publish_listener_set(
+        &self,
+        listener_set: &ListenerSet,
+        status: &ListenerSetStatus,
+    ) -> anyhow::Result<bool> {
+        let namespace = listener_set
+            .metadata
+            .namespace
+            .as_deref()
+            .context("ListenerSet without a namespace")?;
+        let what = format!("ListenerSet {namespace}/{}", listener_set.name_any());
+        let rbac = format!("patch on listenersets/status in namespace {namespace}");
+        let now = now();
+        write_status(
+            Api::namespaced(self.client.clone(), namespace),
+            listener_set,
+            &what,
+            &rbac,
+            |obj: &ListenerSet| {
+                let merged = merge_listener_set_status(obj.status.as_ref(), status, &now);
+                (!listener_set_status_equal(obj.status.as_ref(), Some(&merged)))
+                    .then(|| listener_set_patch_body(&merged))
             },
         )
         .await
@@ -987,5 +1135,132 @@ mod tests {
         };
         let err = publisher.publish_route(&route, &other).await.unwrap_err();
         assert!(format!("{err:#}").contains("httproutes/status"), "{err:#}");
+    }
+
+    #[test]
+    fn foreign_conditions_are_kept() {
+        let mut foreign = cond("SomeoneElse", "True", 42);
+        foreign.observed_generation = Some(3);
+        foreign.reason = "Seeded".into();
+        let stored = GatewayStatus {
+            conditions: Some(vec![
+                cond("Accepted", "True", 100),
+                cond("Programmed", "True", 100),
+                foreign.clone(),
+            ]),
+            listeners: Some(vec![normalize_listener(listener(
+                "http",
+                vec![cond("Accepted", "True", 100), foreign.clone()],
+            ))]),
+            ..Default::default()
+        };
+        let mut desired = GatewayStatus {
+            conditions: Some(vec![
+                cond("Accepted", "True", 0),
+                cond("Programmed", "False", 0),
+            ]),
+            listeners: Some(vec![listener("http", vec![cond("Accepted", "True", 0)])]),
+            ..Default::default()
+        };
+        for c in desired.conditions.as_mut().unwrap() {
+            c.observed_generation = Some(4);
+        }
+        let merged = merge_gateway_status(Some(&stored), &desired, &at(500));
+        let conditions = merged.conditions.as_ref().unwrap();
+        assert_eq!(conditions.len(), 3);
+        assert!(conditions.contains(&foreign));
+        assert!(
+            merged.listeners.as_ref().unwrap()[0]
+                .conditions
+                .contains(&foreign)
+        );
+        assert!(!gateway_status_equal(Some(&stored), Some(&merged)));
+        // Written back whole: the merge patch replaces the list.
+        let body = gateway_patch_body(&merged);
+        assert_eq!(body["conditions"].as_array().unwrap().len(), 3);
+
+        // A type this controller sets but no longer wants is dropped, not kept.
+        let stored = GatewayStatus {
+            listeners: Some(vec![normalize_listener(listener(
+                "http",
+                vec![cond("Conflicted", "True", 100)],
+            ))]),
+            ..Default::default()
+        };
+        let merged = merge_gateway_status(Some(&stored), &desired, &at(500));
+        assert_eq!(merged.listeners.as_ref().unwrap()[0].conditions.len(), 1);
+
+        // GatewayClass too.
+        let stored = GatewayClassStatus {
+            conditions: Some(vec![cond("Accepted", "True", 100), foreign.clone()]),
+            supported_features: None,
+        };
+        let want = GatewayClassStatus {
+            conditions: Some(vec![cond("Accepted", "True", 0)]),
+            supported_features: None,
+        };
+        let merged = merge_class_status(Some(&stored), &want, &at(500));
+        assert!(merged.conditions.unwrap().contains(&foreign));
+    }
+
+    #[test]
+    fn listener_set_merge_and_compare() {
+        let set_listener = |conditions: Vec<Condition>| ListenerSetStatusListeners {
+            attached_routes: 2,
+            conditions,
+            name: "l".into(),
+            supported_kinds: Some(vec![
+                crate::gateway::api::listenersets::ListenerSetStatusListenersSupportedKinds {
+                    group: None,
+                    kind: "HTTPRoute".into(),
+                },
+            ]),
+        };
+        let foreign = cond("SomeoneElse", "True", 42);
+        let stored = ListenerSetStatus {
+            conditions: Some(vec![
+                cond("Programmed", "True", 100),
+                cond("Accepted", "True", 100),
+                foreign.clone(),
+            ]),
+            listeners: Some(vec![normalize_set_listener(set_listener(vec![cond(
+                "Accepted", "True", 100,
+            )]))]),
+        };
+        let desired = ListenerSetStatus {
+            conditions: Some(vec![
+                cond("Accepted", "True", 0),
+                cond("Programmed", "True", 0),
+            ]),
+            listeners: Some(vec![set_listener(vec![cond("Accepted", "True", 0)])]),
+        };
+        let merged = merge_listener_set_status(Some(&stored), &desired, &at(500));
+        assert!(listener_set_status_equal(Some(&stored), Some(&merged)));
+        assert!(merged.conditions.as_ref().unwrap().contains(&foreign));
+        let kinds = merged.listeners.as_ref().unwrap()[0]
+            .supported_kinds
+            .as_ref()
+            .unwrap();
+        assert_eq!(kinds[0].group.as_deref(), Some(GATEWAY_GROUP));
+
+        // Not allowed: the listeners are cleared.
+        let rejected = ListenerSetStatus {
+            conditions: Some(vec![
+                cond("Accepted", "False", 0),
+                cond("Programmed", "False", 0),
+            ]),
+            listeners: None,
+        };
+        let merged = merge_listener_set_status(Some(&stored), &rejected, &at(500));
+        assert!(!listener_set_status_equal(Some(&stored), Some(&merged)));
+        assert_eq!(listener_set_patch_body(&merged)["listeners"], Value::Null);
+        assert!(
+            merged
+                .conditions
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|c| c.type_ == "SomeoneElse" || c.last_transition_time == at(500))
+        );
     }
 }

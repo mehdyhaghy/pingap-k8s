@@ -152,6 +152,88 @@ app.kubernetes.io/component: proxy
 {{- default (printf "%s-admin" (include "pingap-k8s.pingap.fullname" .)) .Values.pingap.admin.existingSecret }}
 {{- end }}
 
+{{/* ---------------- Gateway server groups ---------------- */}}
+
+{{/*
+gateway.groups, checked and filled in, as a JSON list ([] when gateway is off). Each
+item: name, service (the group's Service name), addresses (default: the Service's
+DNS name), ports ([{port, targetPort, tls, server}], server = "gw-<name>-<port>").
+*/}}
+{{- define "pingap-k8s.gatewayGroups" -}}
+{{- $out := list }}
+{{- if .Values.gateway.enabled }}
+{{- $names := list }}
+{{- $targets := list }}
+{{- range $i, $g := .Values.gateway.groups | default (list) }}
+{{- $name := $g.name | default "" | toString }}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $name) }}
+{{- fail (printf "gateway.groups[%d].name: %q is not a DNS label" $i $name) }}
+{{- end }}
+{{- if has $name $names }}
+{{- fail (printf "gateway.groups[%d].name: %q is used more than once" $i $name) }}
+{{- end }}
+{{- $names = append $names $name }}
+{{- $service := printf "%s-gw-%s" (include "pingap-k8s.pingap.fullname" $) $name }}
+{{- if gt (len $service) 63 }}
+{{- fail (printf "gateway.groups[%d].name: the Service name %q is longer than 63 characters" $i $service) }}
+{{- end }}
+{{- $addresses := $g.addresses | default (list) }}
+{{- if not $addresses }}
+{{- if not $.Values.pingap.deploy }}
+{{- fail (printf "gateway.groups[%d].addresses: required when pingap.deploy is false (the chart creates no Service for the group)" $i) }}
+{{- end }}
+{{- $addresses = list (printf "%s.%s.svc" $service $.Release.Namespace) }}
+{{- end }}
+{{- $ports := list }}
+{{- $listenerPorts := list }}
+{{- range $j, $p := $g.ports | default (list) }}
+{{- $port := int ($p.port | default 0) }}
+{{- $target := int ($p.targetPort | default 0) }}
+{{- if or (lt $port 1) (gt $port 65535) (lt $target 1) (gt $target 65535) }}
+{{- fail (printf "gateway.groups[%d].ports[%d]: port and targetPort must be 1-65535" $i $j) }}
+{{- end }}
+{{- if has $port $listenerPorts }}
+{{- fail (printf "gateway.groups[%d].ports[%d]: port %d is listed more than once" $i $j $port) }}
+{{- end }}
+{{- if or (has $target $targets) (eq $target (int $.Values.pingap.httpPort)) (eq $target (int $.Values.pingap.admin.port)) }}
+{{- fail (printf "gateway.groups[%d].ports[%d]: targetPort %d is already in use (another group, pingap.httpPort or the admin port)" $i $j $target) }}
+{{- end }}
+{{- $listenerPorts = append $listenerPorts $port }}
+{{- $targets = append $targets $target }}
+{{- $ports = append $ports (dict "port" $port "targetPort" $target "tls" ($p.tls | default false) "server" (printf "gw-%s-%d" $name $port) "settings" ($p.settings | default dict)) }}
+{{- end }}
+{{- if not $ports }}
+{{- fail (printf "gateway.groups[%d].ports: at least one port is required" $i) }}
+{{- end }}
+{{- $out = append $out (dict "name" $name "service" $service "addresses" $addresses "ports" $ports) }}
+{{- end }}
+{{- end }}
+{{- $out | toJson }}
+{{- end }}
+
+{{/* The seed config of the group servers (TOML), empty without groups. */}}
+{{- define "pingap-k8s.gatewayGroupServers" -}}
+{{- range (include "pingap-k8s.gatewayGroups" . | fromJsonArray) }}
+{{- $group := .name }}
+{{- range .ports }}
+
+# Gateway server group {{ $group }}: listener port {{ int .port }}.
+{{- $server := .server }}
+[servers.{{ $server }}]
+addr = "[::]:{{ int .targetPort }}"
+{{- if .tls }}
+global_certificates = true
+{{- end }}
+{{- with .settings }}
+{{- if or (hasKey . "addr") (hasKey . "global_certificates") (hasKey . "locations") }}
+{{- fail (printf "gateway.groups: settings of server %s must not set addr, global_certificates or locations" $server) }}
+{{- end }}
+{{- include "pingap-k8s.tomlTable" . }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+
 {{/* ---------------- RBAC namespaces ---------------- */}}
 
 {{/*
@@ -302,6 +384,20 @@ addresses = {{ include "pingap-k8s.tomlValue" (.Values.gateway.addresses | defau
 health_check = {{ include "pingap-k8s.tomlString" . }}
 {{- end }}
 max_txn_ops = {{ .Values.gateway.maxTxnOps | default 64 | int }}
+{{- range (include "pingap-k8s.gatewayGroups" . | fromJsonArray) }}
+
+[[gateway.groups]]
+name = {{ include "pingap-k8s.tomlString" .name }}
+{{- $servers := list }}
+{{- $ports := list }}
+{{- range .ports }}
+{{- $servers = append $servers .server }}
+{{- $ports = append $ports (printf "%d:%d" (int .port) (int .targetPort)) }}
+{{- end }}
+servers = {{ include "pingap-k8s.tomlValue" $servers }}
+addresses = {{ include "pingap-k8s.tomlValue" .addresses }}
+ports = {{ include "pingap-k8s.tomlValue" $ports }}
+{{- end }}
 {{- end }}
 {{- range $name := keys .Values.config.upstreams | sortAlpha }}
 {{- if not (regexMatch "^[A-Za-z0-9_-]+$" $name) }}

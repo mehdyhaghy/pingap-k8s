@@ -185,6 +185,26 @@ pub struct GatewaySettings {
     pub max_txn_ops: usize,
     /// Pingap `health_check` of generated upstreams; `None`: Pingap's default TCP check.
     pub health_check: Option<String>,
+    /// Server groups of their own: each is given to one Gateway at a time, so routes
+    /// of Gateways with a group are never mixed with routes of other Gateways.
+    /// `servers` and `addresses` above are the shared group of the other Gateways.
+    pub groups: Vec<GatewayGroup>,
+}
+
+/// `[[gateway.groups]]`: Pingap servers reached on addresses of their own (in
+/// Kubernetes, a Service of their own), given to one Gateway at a time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GatewayGroup {
+    /// For logs and messages (a DNS label).
+    pub name: String,
+    /// Its Pingap servers: in no other group and not in `[gateway] servers`.
+    pub servers: Vec<String>,
+    /// The addresses its servers are reached on, written to the Gateway's
+    /// `status.addresses`.
+    pub addresses: Vec<String>,
+    /// Listener port -> port of the Pingap server (a Service `port` -> its
+    /// `targetPort`). A listener port that is not mapped is the server port.
+    pub ports: BTreeMap<u16, u16>,
 }
 
 #[derive(Deserialize)]
@@ -197,6 +217,19 @@ struct RawGateway {
     addresses: Vec<String>,
     max_txn_ops: usize,
     health_check: String,
+    groups: Vec<RawGatewayGroup>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGatewayGroup {
+    name: String,
+    #[serde(default)]
+    servers: Vec<String>,
+    #[serde(default)]
+    addresses: Vec<String>,
+    #[serde(default)]
+    ports: Vec<String>,
 }
 
 impl Default for RawGateway {
@@ -209,6 +242,7 @@ impl Default for RawGateway {
             addresses: Vec::new(),
             max_txn_ops: DEFAULT_MAX_TXN_OPS,
             health_check: String::new(),
+            groups: Vec::new(),
         }
     }
 }
@@ -537,28 +571,33 @@ fn build_gateway(raw: RawGateway) -> Result<Option<GatewaySettings>, ConfigError
 
     validate_controller_name(&raw.controller_name)
         .map_err(|r| fail(format!("controller_name: {:?}: {r}", raw.controller_name)))?;
-    let mut servers: Vec<String> = Vec::with_capacity(raw.servers.len());
-    for server in &raw.servers {
-        if !is_valid_upstream_name(server) {
+    let servers = check_server_names(&raw.servers).map_err(|r| fail(format!("servers: {r}")))?;
+    check_addresses(&raw.addresses).map_err(|r| fail(format!("addresses: {r}")))?;
+    let mut groups: Vec<GatewayGroup> = Vec::with_capacity(raw.groups.len());
+    for (i, group) in raw.groups.into_iter().enumerate() {
+        let group = build_gateway_group(group).map_err(|r| fail(format!("groups[{i}]: {r}")))?;
+        let taken =
+            |s: &String| servers.contains(s) || groups.iter().any(|g| g.servers.contains(s));
+        if let Some(server) = group.servers.iter().find(|s| taken(s)) {
             return Err(fail(format!(
-                "servers: {server:?}: a Pingap server name must be non-empty and contain only A-Z, a-z, 0-9, '_' or '-'"
+                "groups[{i}]: server {server:?} is already in gateway.servers or another group"
             )));
         }
-        if servers.contains(server) {
+        let used = |a: &String| {
+            raw.addresses.contains(a) || groups.iter().any(|g| g.addresses.contains(a))
+        };
+        if let Some(address) = group.addresses.iter().find(|a| used(a)) {
             return Err(fail(format!(
-                "servers: {server:?} is listed more than once"
+                "groups[{i}]: address {address:?} is already in gateway.addresses or another group"
             )));
         }
-        servers.push(server.clone());
-    }
-    for address in &raw.addresses {
-        if address.parse::<std::net::IpAddr>().is_err() {
-            validate_cluster_domain(address).map_err(|r| {
-                fail(format!(
-                    "addresses: {address:?} is neither an IP address nor a host name: {r}"
-                ))
-            })?;
+        if groups.iter().any(|g| g.name == group.name) {
+            return Err(fail(format!(
+                "groups[{i}]: name {:?} is used more than once",
+                group.name
+            )));
         }
+        groups.push(group);
     }
     if !MAX_TXN_OPS_RANGE.contains(&raw.max_txn_ops) {
         return Err(fail(format!(
@@ -583,7 +622,74 @@ fn build_gateway(raw: RawGateway) -> Result<Option<GatewaySettings>, ConfigError
         addresses: raw.addresses,
         max_txn_ops: raw.max_txn_ops,
         health_check,
+        groups,
     }))
+}
+
+/// Pingap server names: valid and each listed once.
+fn check_server_names(names: &[String]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::with_capacity(names.len());
+    for server in names {
+        if !is_valid_upstream_name(server) {
+            return Err(format!(
+                "{server:?}: a Pingap server name must be non-empty and contain only A-Z, a-z, 0-9, '_' or '-'"
+            ));
+        }
+        if out.contains(server) {
+            return Err(format!("{server:?} is listed more than once"));
+        }
+        out.push(server.clone());
+    }
+    Ok(out)
+}
+
+/// Gateway addresses: IP addresses or host names.
+fn check_addresses(addresses: &[String]) -> Result<(), String> {
+    for address in addresses {
+        if address.parse::<std::net::IpAddr>().is_err() {
+            validate_cluster_domain(address).map_err(|r| {
+                format!("{address:?} is neither an IP address nor a host name: {r}")
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// One `[[gateway.groups]]` entry on its own; the checks across groups are the
+/// caller's.
+fn build_gateway_group(raw: RawGatewayGroup) -> Result<GatewayGroup, String> {
+    check_dns_label(&raw.name, false).map_err(|r| format!("name: {:?}: {r}", raw.name))?;
+    if raw.servers.is_empty() {
+        return Err("servers: must not be empty".into());
+    }
+    let servers = check_server_names(&raw.servers).map_err(|r| format!("servers: {r}"))?;
+    if raw.addresses.is_empty() {
+        return Err("addresses: must not be empty".into());
+    }
+    check_addresses(&raw.addresses).map_err(|r| format!("addresses: {r}"))?;
+    let mut ports = BTreeMap::new();
+    for entry in &raw.ports {
+        let parse = |s: &str| s.trim().parse::<u16>().ok().filter(|p| *p > 0);
+        let pair = entry
+            .split_once(':')
+            .and_then(|(l, s)| Some((parse(l)?, parse(s)?)));
+        let Some((listener, server)) = pair else {
+            return Err(format!(
+                "ports: {entry:?} must be \"<listener port>:<server port>\" (ports 1-65535)"
+            ));
+        };
+        if ports.insert(listener, server).is_some() {
+            return Err(format!(
+                "ports: listener port {listener} is mapped more than once"
+            ));
+        }
+    }
+    Ok(GatewayGroup {
+        name: raw.name,
+        servers,
+        addresses: raw.addresses,
+        ports,
+    })
 }
 
 /// A GatewayClass `controllerName`: `<domain>/<path>`, at most 253 characters, the
@@ -1450,6 +1556,7 @@ target = "service"
                 addresses: vec![],
                 max_txn_ops: 64,
                 health_check: None,
+                groups: vec![],
             })
         );
     }
@@ -1477,6 +1584,119 @@ health_check = "http://k8s/healthz?connection_timeout=1s&check_frequency=5s"
             g.health_check.as_deref(),
             Some("http://k8s/healthz?connection_timeout=1s&check_frequency=5s")
         );
+    }
+
+    #[test]
+    fn gateway_groups() {
+        let c = cfg(r#"
+[gateway]
+enabled = true
+servers = ["gw-80"]
+addresses = ["shared.example.com"]
+
+[[gateway.groups]]
+name = "a"
+servers = ["gw-a-80", "gw-a-443"]
+addresses = ["a.example.com"]
+ports = ["80:9080", "443:9443"]
+
+[[gateway.groups]]
+name = "b"
+servers = ["gw-b-80"]
+addresses = ["192.0.2.9"]
+"#)
+        .unwrap();
+        let g = c.gateway.unwrap();
+        assert_eq!(
+            g.groups,
+            vec![
+                GatewayGroup {
+                    name: "a".into(),
+                    servers: vec!["gw-a-80".into(), "gw-a-443".into()],
+                    addresses: vec!["a.example.com".into()],
+                    ports: BTreeMap::from([(80, 9080), (443, 9443)]),
+                },
+                GatewayGroup {
+                    name: "b".into(),
+                    servers: vec!["gw-b-80".into()],
+                    addresses: vec!["192.0.2.9".into()],
+                    ports: BTreeMap::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn gateway_group_rejections() {
+        let base =
+            "[gateway]\nenabled = true\nservers = [\"s\"]\naddresses = [\"x.example.com\"]\n";
+        let group = |body: &str| format!("{base}[[gateway.groups]]\n{body}\n");
+        let ok = "name = \"a\"\nservers = [\"a\"]\naddresses = [\"a.example.com\"]\n";
+        assert!(cfg(&group(ok)).is_ok());
+        let cases = [
+            (
+                "name = \"A b\"\nservers = [\"a\"]\naddresses = [\"a.example.com\"]",
+                "groups[0]: name",
+            ),
+            (
+                "name = \"a\"\naddresses = [\"a.example.com\"]",
+                "servers: must not be empty",
+            ),
+            (
+                "name = \"a\"\nservers = [\"a\"]",
+                "addresses: must not be empty",
+            ),
+            (
+                "name = \"a\"\nservers = [\"a b\"]\naddresses = [\"a.example.com\"]",
+                "groups[0]: servers",
+            ),
+            (
+                "name = \"a\"\nservers = [\"a\"]\naddresses = [\"bad host\"]",
+                "groups[0]: addresses",
+            ),
+            (
+                "name = \"a\"\nservers = [\"s\"]\naddresses = [\"a.example.com\"]",
+                "already in gateway.servers",
+            ),
+            (
+                "name = \"a\"\nservers = [\"a\"]\naddresses = [\"x.example.com\"]",
+                "already in gateway.addresses",
+            ),
+            (
+                "name = \"a\"\nservers = [\"a\"]\naddresses = [\"a.example.com\"]\nports = [\"80\"]",
+                "ports",
+            ),
+            (
+                "name = \"a\"\nservers = [\"a\"]\naddresses = [\"a.example.com\"]\nports = [\"0:80\"]",
+                "ports",
+            ),
+            (
+                "name = \"a\"\nservers = [\"a\"]\naddresses = [\"a.example.com\"]\nports = [\"80:1\", \"80:2\"]",
+                "more than once",
+            ),
+            (
+                "name = \"a\"\nservers = [\"a\"]\naddresses = [\"a.example.com\"]\nfoo = 1",
+                "foo",
+            ),
+        ];
+        for (body, needle) in cases {
+            let m = err(&group(body));
+            assert!(m.contains(needle), "{body:?}: {m}");
+        }
+        // Across groups.
+        let two = |second: &str| format!("{}[[gateway.groups]]\n{second}\n", group(ok));
+        let m = err(&two(
+            "name = \"a\"\nservers = [\"b\"]\naddresses = [\"b.example.com\"]",
+        ));
+        assert!(m.contains("groups[1]: name"), "{m}");
+        let m = err(&two(
+            "name = \"b\"\nservers = [\"a\"]\naddresses = [\"b.example.com\"]",
+        ));
+        assert!(m.contains("groups[1]: server \"a\""), "{m}");
+        let m = err(&two(
+            "name = \"b\"\nservers = [\"b\"]\naddresses = [\"a.example.com\"]",
+        ));
+        assert!(m.contains("groups[1]: address"), "{m}");
     }
 
     #[test]

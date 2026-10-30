@@ -24,8 +24,9 @@
 //! 5. plan. The leader applies the plan; a failed apply (CAS conflict or etcd error)
 //!    re-reads and re-plans up to [`APPLY_ATTEMPTS`] times, then the pass is retried
 //!    with backoff (0.5 s doubling to 30 s);
-//! 6. the leader writes the status of the handled GatewayClasses, Gateways, HTTPRoutes
-//!    and BackendTLSPolicies where it differs from the stored one.
+//! 6. the leader writes the status of the handled GatewayClasses, Gateways,
+//!    ListenerSets, HTTPRoutes and BackendTLSPolicies where it differs from the
+//!    stored one.
 //!
 //! Followers run steps 1 to 5 without applying, so their gauges and the endpoint
 //! writer's desired state are ready for a promotion; they never write to etcd or to the
@@ -95,6 +96,7 @@ impl ControllerSettings {
                 cluster_domain: config.kubernetes.cluster_domain.clone(),
                 servers: gateway.servers.clone(),
                 addresses: gateway.addresses.clone(),
+                groups: gateway.groups.clone(),
             },
         })
     }
@@ -110,6 +112,7 @@ impl PartialEq for ControllerSettings {
             && a.cluster_domain == b.cluster_domain
             && a.servers == b.servers
             && a.addresses == b.addresses
+            && a.groups == b.groups
     }
 }
 
@@ -240,6 +243,7 @@ struct Objects {
     classes: Vec<Arc<crate::gateway::api::gatewayclasses::GatewayClass>>,
     gateways: Vec<Arc<crate::gateway::api::gateways::Gateway>>,
     routes: Vec<Arc<crate::gateway::api::httproutes::HttpRoute>>,
+    listener_sets: Vec<Arc<crate::gateway::api::listenersets::ListenerSet>>,
     grants: Vec<Arc<crate::gateway::api::referencegrants::ReferenceGrant>>,
     policies: Vec<Arc<crate::gateway::api::backendtlspolicies::BackendTlsPolicy>>,
     namespaces: BTreeMap<String, Arc<k8s_openapi::api::core::v1::Namespace>>,
@@ -465,6 +469,7 @@ where
             classes: g.classes(),
             gateways: g.gateways(),
             routes: g.routes(),
+            listener_sets: g.listener_sets(),
             grants: g.grants(),
             policies: g.backend_tls_policies(),
             namespaces: g.namespaces(),
@@ -486,6 +491,7 @@ where
             classes: &objects.classes,
             gateways: &objects.gateways,
             routes: &objects.routes,
+            listener_sets: &objects.listener_sets,
             grants: &objects.grants,
             namespaces: &objects.namespaces,
             services: &no_services,
@@ -538,6 +544,7 @@ where
                 classes: &objects.classes,
                 gateways: &objects.gateways,
                 routes: &objects.routes,
+                listener_sets: &objects.listener_sets,
                 grants: &objects.grants,
                 namespaces: &objects.namespaces,
                 services: &services,
@@ -682,6 +689,19 @@ where
                 Err(err) => warn!(gateway = %key, "updating the Gateway status failed: {err:#}"),
             }
         }
+        for set in &objects.listener_sets {
+            let key = object_key(&set.metadata);
+            let Some(want) = desired.status.listener_sets.get(&key) else {
+                continue;
+            };
+            match status.publish_listener_set(set, want).await {
+                Ok(true) => debug!(listenerset = %key, "ListenerSet status updated"),
+                Ok(false) => {}
+                Err(err) => {
+                    warn!(listenerset = %key, "updating the ListenerSet status failed: {err:#}")
+                }
+            }
+        }
         for route in &objects.routes {
             let key = object_key(&route.metadata);
             let Some(want) = desired.status.routes.get(&key) else {
@@ -800,6 +820,7 @@ mod tests {
     use crate::gateway::api::gatewayclasses::{GatewayClass, GatewayClassSpec, GatewayClassStatus};
     use crate::gateway::api::gateways::{Gateway, GatewayStatus};
     use crate::gateway::api::httproutes::{HttpRoute, HttpRouteStatus};
+    use crate::gateway::api::listenersets::{ListenerSet, ListenerSetStatus};
     use crate::gateway::api::referencegrants::ReferenceGrant;
     use crate::gateway::model::{ConfigMapKey, Deferred, Expect, Op, SecretKey, Step, StoredEntry};
     use crate::types::{PortRef, ServiceRef, ServiceSnapshot};
@@ -849,6 +870,9 @@ mod tests {
             Vec::new()
         }
         fn routes(&self) -> Vec<Arc<HttpRoute>> {
+            Vec::new()
+        }
+        fn listener_sets(&self) -> Vec<Arc<ListenerSet>> {
             Vec::new()
         }
         fn grants(&self) -> Vec<Arc<ReferenceGrant>> {
@@ -984,6 +1008,13 @@ mod tests {
         ) -> anyhow::Result<bool> {
             Ok(false)
         }
+        async fn publish_listener_set(
+            &self,
+            _listener_set: &ListenerSet,
+            _status: &ListenerSetStatus,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
         async fn publish_route(
             &self,
             _route: &HttpRoute,
@@ -1046,6 +1077,7 @@ mod tests {
                 cluster_domain: "cluster.local".into(),
                 servers: vec![],
                 addresses: vec!["203.0.113.7".into()],
+                groups: vec![],
             },
         }
     }

@@ -8,9 +8,9 @@ With gateway.enabled: in each gateway.namespaces namespace, read secrets
 (limited to gateway.secretNames when set) and configmaps (BackendTLSPolicy CA
 certificates; limited to gateway.configMapNames when set); and the only
 ClusterRole: read the Gateway API resources and namespaces, patch the status of
-GatewayClasses, Gateways, HTTPRoutes and BackendTLSPolicies. GatewayClasses are
-cluster-scoped and routes attach across namespaces, so this part cannot be
-namespaced.
+GatewayClasses, Gateways, ListenerSets, HTTPRoutes and BackendTLSPolicies.
+GatewayClasses are cluster-scoped and routes and ListenerSets attach across
+namespaces, so this part cannot be namespaced.
 */ -}}
 {{- if .Values.rbac.create }}
 {{- $fullname := include "pingap-k8s.fullname" . }}
@@ -109,10 +109,10 @@ metadata:
     {{- include "pingap-k8s.labels" . | nindent 4 }}
 rules:
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["gatewayclasses", "gateways", "httproutes", "referencegrants", "backendtlspolicies"]
+    resources: ["gatewayclasses", "gateways", "listenersets", "httproutes", "referencegrants", "backendtlspolicies"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["gatewayclasses/status", "gateways/status", "httproutes/status", "backendtlspolicies/status"]
+    resources: ["gatewayclasses/status", "gateways/status", "listenersets/status", "httproutes/status", "backendtlspolicies/status"]
     verbs: ["patch"]
   - apiGroups: [""]
     resources: ["namespaces"]
