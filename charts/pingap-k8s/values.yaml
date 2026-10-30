@@ -41,26 +41,20 @@ rbac:
   fromConfig: true
 
 events:
-  # Post Kubernetes Events (events.k8s.io/v1, reportingController "pingap-k8s")
-  # for resolve warnings (ServiceMissing, PortNotInService, PortNotInSlices,
-  # ExternalNameNotEnabled, ExternalNameInvalid, TrafficPolicyIgnored) and
-  # drain fallbacks on the Service, and for MalformedUpstream and
-  # EtcdUnreachable/EtcdRecovered on the controller Pod. This is the controller's
-  # only write permission in Kubernetes: with rbac.create, the Roles above also
-  # grant create and patch on events.k8s.io events, plus one Role in the release
-  # namespace for the Pod events. Never a ClusterRole.
+  # Post Kubernetes Events for resolve warnings, drain fallbacks and etcd
+  # reachability (reasons in the README, "Observability"). Adds create/patch on
+  # events.k8s.io events to the Roles above and to one in the release namespace.
+  # Restarts the controller pods.
   enabled: false
 
 gateway:
-  # Gateway API provider (off by default; needs the Gateway API v1.7.0
-  # Standard-channel CRDs installed). Gateways of the GatewayClasses whose
-  # spec.controllerName is controllerName, their ListenerSets and the HTTPRoutes
-  # attached to them, become Pingap locations, certificates, plugins and
-  # upstreams (names starting with "k8s-") in the same etcd prefix. Changing
-  # enabled, controllerName or maxTxnOps restarts the controller pods (the
-  # controller reads them at start only; the other settings apply live). Grants
-  # the chart's only ClusterRole (read the Gateway API resources and namespaces,
-  # patch their status).
+  # Gateway API provider (needs the Gateway API v1.7.0 Standard-channel CRDs;
+  # see the README, "Gateway API"). Gateways of the GatewayClasses with
+  # controllerName, and their ListenerSets, HTTPRoutes and GRPCRoutes, become
+  # Pingap entries named "k8s-..." in the same etcd prefix. Grants the chart's
+  # only ClusterRole (read the Gateway API resources, patch their status).
+  # Changing enabled, controllerName or maxTxnOps restarts the controller pods;
+  # the other settings apply live.
   enabled: false
   controllerName: pingap.io/gateway-controller
   # GatewayClass created by the chart (cluster-scoped); empty: none.
@@ -86,18 +80,14 @@ gateway:
   # Written to status.addresses of accepted Gateways: IPs or hostnames clients
   # use to reach Pingap.
   addresses: []
-  # Server groups, each given to one Gateway at a time, so the routes of a
-  # Gateway with a group of its own are never mixed with those of other
-  # Gateways (servers and addresses above are the shared group of the others).
-  # A group is Pingap servers "gw-<name>-<port>" on container ports of their
-  # own (added to pingap.seed.config, which is only written into an empty etcd
-  # prefix: add them by hand to an existing one and restart Pingap) and, with
-  # pingap.deploy, a Service "<release>-pingap-gw-<name>" (same type and
-  # annotations as pingap.service) mapping each listener port onto its server.
-  # The group's address is that Service's DNS name unless addresses is set.
-  # A Gateway keeps the group it has (its status.addresses); the oldest
-  # Gateways without one take the free groups; a Gateway whose spec.addresses
-  # are a group's addresses gets that group.
+  # Server groups: Pingap servers "gw-<name>-<port>" and an address given to one
+  # Gateway at a time (README, "Server groups"); servers and addresses above
+  # are shared by the other Gateways. The servers are added to the seed (empty
+  # etcd prefix only: add them by hand to an existing one and restart Pingap).
+  # With pingap.deploy, a Service "<release>-pingap-gw-<name>" (type and
+  # annotations of pingap.service) maps each listener port onto its server; its
+  # DNS name is the group's address unless addresses is set (required without
+  # pingap.deploy).
   #   - name: a
   #     ports:
   #       - port: 80          # Gateway listener port (Service port)
@@ -218,26 +208,20 @@ config:
     debounce_max: "2s"
     # Full re-list and re-reconcile, corrects drift.
     resync: "5m"
-    # Address families written (default "primary"): "primary" (one address per
-    # pod, in the Service's primary family, spec.ipFamilies[0]), "ipv4", "ipv6"
-    # or "both" (a pod of a dual-stack Service is written once per family).
-    # Replaces the deprecated ipv4_only (true is "ipv4", false is "primary");
-    # set one of the two, not both. Left unset here so values that still set
-    # ipv4_only keep working.
+    # Address families written: "primary" (default; one address per pod, in the
+    # Service's primary family), "ipv4", "ipv6" or "both". Replaces the
+    # deprecated ipv4_only (true is "ipv4", false is "primary"); set one of the
+    # two, not both. Left unset here so values that set ipv4_only keep working.
     # ip_family: primary
-    # ExternalName Services in services entries write <externalName>:<port>
-    # (Pingap resolves the name). Off: they are skipped with a warning in
-    # target "pods" mode. Anyone who can create Services in a listed namespace
-    # can then point the upstream at any host.
+    # ExternalName Services write <externalName>:<port> (Pingap resolves the
+    # name). Off: skipped with a warning in "pods" mode. On: anyone who can
+    # create Services in a listed namespace can point the upstream at any host.
     external_name: false
-    # What the controller writes into Pingap's addrs: "pods" (ready pod IPs
-    # from EndpointSlices) or "service" (the Service's ClusterIP; its DNS name
-    # for a headless Service; see README, "Upstream target"). Can be set per
-    # upstream as well. "pods" ignores the Service's trafficDistribution and
-    # internalTrafficPolicy: Local (a TrafficPolicyIgnored warning is logged).
+    # What the controller writes into Pingap's addrs: "pods" (ready pod IPs) or
+    # "service" (the Service's ClusterIP; README, "Upstream target").
     target: pods
-  # One entry per Pingap upstream the controller owns. Any [defaults] key can be
-  # overridden per upstream. Example:
+  # One entry per Pingap upstream the controller owns. Every key of defaults
+  # but resync (global) can be overridden per upstream. Example:
   #   upstreams:
   #     api:
   #       services: ["api.prod:http"]
@@ -249,9 +233,8 @@ config:
   #       target: service
   upstreams: {}
   # Optional [server] table (metrics/health listener), passed through as is.
-  # Leave empty for the built-in default ([::]:9090, which also accepts IPv4 on
-  # Linux unless the node sets net.ipv6.bindv6only=1). On nodes booted with IPv6
-  # disabled use {listen: "0.0.0.0:9090"}.
+  # Empty: [::]:9090 (also IPv4, see the seed listener note below); on nodes
+  # booted with IPv6 disabled use {listen: "0.0.0.0:9090"}. Restarts the pods.
   server: {}
   # Store the rendered config in a Secret instead of a ConfigMap.
   useSecret: false
@@ -408,28 +391,21 @@ pingap:
     #       matchLabels:
     #         kubernetes.io/metadata.name: ops
     adminFrom: []
-  # Seed Pingap's etcd prefix once, before Pingap starts, when it has no server
-  # yet. Servers (listeners) are only read at Pingap start, so the listener has
-  # to exist first. It is skipped when any server already exists.
+  # Seed Pingap's etcd prefix once, before Pingap starts, only when it has no
+  # server yet (Pingap reads servers and [basic] at start only).
   seed:
     enabled: true
     # Pingap TOML. The upstream "quickstart" starts with a placeholder address;
     # map it to a Service in config.upstreams and the controller fills it.
     #
-    # Listener: "[::]:8080" alone, not "0.0.0.0:8080,[::]:8080". Pingap passes
-    # each comma-separated address to pingora, which opens an IPv6 socket for
-    # "[::]" without setting IPV6_V6ONLY (Pingap never sets pingora's
-    # ipv6_only option). On Linux that socket is dual-stack and also takes
-    # IPv4, so binding 0.0.0.0 as well would fail with "address in use".
-    # On nodes booted with IPv6 disabled (ipv6.disable=1) use "0.0.0.0:8080".
+    # Listener: "[::]:8080" alone. On Linux an "[::]" socket also takes IPv4
+    # (unless net.ipv6.bindv6only=1), so adding "0.0.0.0:8080" would fail with
+    # "address in use". On nodes booted with IPv6 disabled use "0.0.0.0:8080".
     #
-    # [basic]: on SIGTERM pingora closes its listeners, lets in-flight requests
-    # finish, sleeps the whole grace_period (pingora default 5m, longer than any
-    # pod grace period) and then gives its runtimes graceful_shutdown_timeout
-    # (default 5s). Keep preStopSleepSeconds + grace_period +
-    # graceful_shutdown_timeout below terminationGracePeriodSeconds:
-    # 15s + 30s + 10s = 55s < 60s. Basic settings, like servers, are read at
-    # Pingap start only, and the seed does not run on a prefix that has servers.
+    # [basic]: on SIGTERM Pingap stops listening, sleeps grace_period (default
+    # 5m), then gives its runtimes graceful_shutdown_timeout. Keep
+    # preStopSleepSeconds + grace_period + graceful_shutdown_timeout below
+    # terminationGracePeriodSeconds: 15s + 30s + 10s = 55s < 60s.
     config: |
       [basic]
       grace_period = "30s"
@@ -470,10 +446,9 @@ pingap:
       memory: 64Mi
     limits:
       memory: 512Mi
-  # Pod lifecycle. Order on deletion: the pod leaves the Service endpoints and
-  # preStop sleeps preStopSleepSeconds (native sleep action, Kubernetes >= 1.32)
-  # while kube-proxy and load balancers catch up; then Pingap gets SIGTERM and
-  # shuts down gracefully (seed.config [basic]); SIGKILL comes at
+  # Pod lifecycle on deletion: the pod leaves the Service endpoints, preStop
+  # sleeps preStopSleepSeconds while load balancers catch up, then Pingap gets
+  # SIGTERM and shuts down gracefully (seed.config [basic]); SIGKILL comes at
   # terminationGracePeriodSeconds, counted from the start of preStop.
   terminationGracePeriodSeconds: 60
   # 0 disables the preStop hook.

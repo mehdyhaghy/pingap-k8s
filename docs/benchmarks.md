@@ -3,6 +3,8 @@
 The benchmarks measure four numbers at 50 upstreams × 20 endpoints: event-to-write latency,
 etcd write rate during a rollout, controller memory, and Pingap reload CPU per write. This page
 reports what was measured on one laptop, how, and what is estimated rather than measured.
+All numbers were measured with controller 0.1.0 on Kubernetes 1.32 (kind) and endpoint discovery
+only (no Gateway API provider); they have not been re-run for later versions.
 
 Summary (release build, default `debounce = 500ms`, `debounce_max = 2s`):
 
