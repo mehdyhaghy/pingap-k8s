@@ -88,7 +88,7 @@ if [[ "${E2E_PRELOAD:-1}" == "1" ]]; then
   for img in quay.io/coreos/etcd:v3.6.12 vicanso/pingap:0.16.1 \
       registry.k8s.io/e2e-test-images/agnhost:2.66.1 jmalloc/echo-server:v0.3.7 \
       fortio/fortio:1.75.3 ghcr.io/stefanprodan/podinfo:6.15.0 \
-      mccutchen/go-httpbin:2.25.0; do
+      mccutchen/go-httpbin:2.25.0 registry.k8s.io/gateway-api/conformance/echo-basic:v0.1.0; do
     if docker image inspect "$img" >/dev/null 2>&1; then
       log "preloading $img ($platform)"
       docker save "$img" | docker exec -i "$node" \
