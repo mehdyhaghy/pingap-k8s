@@ -103,6 +103,7 @@
         "className": { "type": "string" },
         "namespaces": { "$ref": "#/$defs/stringList" },
         "secretNames": { "$ref": "#/$defs/stringList" },
+        "configMapNames": { "$ref": "#/$defs/stringList" },
         "servers": { "$ref": "#/$defs/stringList" },
         "externalName": { "type": "boolean" },
         "addresses": { "$ref": "#/$defs/stringList" },
