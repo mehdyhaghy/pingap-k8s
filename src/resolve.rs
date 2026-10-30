@@ -479,6 +479,40 @@ fn is_pod_address(ip: &IpAddr) -> bool {
     !(special || ip.is_loopback() || ip.is_unspecified() || ip.is_multicast())
 }
 
+/// Service port `appProtocol` values of HTTP/2 cleartext with prior knowledge: the
+/// upstream gets Pingap `alpn = "H2"`. `kubernetes.io/h2c` is the Kubernetes standard
+/// name (KEP-3726); `grpc` is the common name of plain-text gRPC ports.
+pub const H2C_APP_PROTOCOLS: [&str; 2] = ["kubernetes.io/h2c", "grpc"];
+
+/// Whether an `appProtocol` is one of [`H2C_APP_PROTOCOLS`] (case-insensitive).
+pub fn is_h2c_app_protocol(protocol: &str) -> bool {
+    H2C_APP_PROTOCOLS.contains(&protocol.to_ascii_lowercase().as_str())
+}
+
+/// Whether the backends of an upstream speak h2c: every `services` entry whose Service
+/// and port exist has an h2c `appProtocol` (and at least one does). Missing Services and
+/// ports are left out, as in [`resolve`].
+pub fn h2c_backends(inputs: &[ServiceInput<'_>]) -> bool {
+    let mut any = false;
+    for input in inputs {
+        let Some(service) = input.snapshot.service.as_deref() else {
+            continue;
+        };
+        let Some(port) = find_service_port(service, &input.service_ref.port) else {
+            continue;
+        };
+        if !port
+            .app_protocol
+            .as_deref()
+            .is_some_and(is_h2c_app_protocol)
+        {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
 #[cfg(test)]
 #[allow(clippy::type_complexity)] // table-test tuples
 mod tests {
@@ -1634,5 +1668,43 @@ mod tests {
         assert!(!svc.fallback);
         assert_eq!(svc.addrs, vec!["web.prod.svc.cluster.local:80"]);
         assert_eq!((svc.ready, svc.draining), (1, 0));
+    }
+
+    #[test]
+    fn h2c_backends_need_every_present_port_to_be_h2c() {
+        let with_protocol = |protocol: Option<&str>| {
+            let mut s = (*service(&[("grpc", 9000, "TCP")])).clone();
+            s.spec.as_mut().unwrap().ports.as_mut().unwrap()[0].app_protocol =
+                protocol.map(String::from);
+            Arc::new(s)
+        };
+        let a = sref("a", named("grpc"), None);
+        let b = sref("b", named("grpc"), None);
+        let h2c = snap(Some(with_protocol(Some("kubernetes.io/h2c"))), vec![]);
+        let grpc = snap(Some(with_protocol(Some("GRPC"))), vec![]);
+        let http = snap(Some(with_protocol(Some("http"))), vec![]);
+        let none = snap(Some(with_protocol(None)), vec![]);
+        let missing = snap(None, vec![]);
+        let check = |entries: &[(&ServiceRef, &ServiceSnapshot)]| {
+            let inputs: Vec<ServiceInput<'_>> = entries
+                .iter()
+                .map(|(service_ref, snapshot)| ServiceInput {
+                    service_ref,
+                    snapshot,
+                })
+                .collect();
+            h2c_backends(&inputs)
+        };
+        assert!(check(&[(&a, &h2c)]));
+        assert!(check(&[(&a, &h2c), (&b, &grpc)]));
+        assert!(check(&[(&a, &h2c), (&b, &missing)]));
+        assert!(!check(&[(&a, &h2c), (&b, &http)]));
+        assert!(!check(&[(&a, &none)]));
+        assert!(!check(&[(&a, &missing)]));
+        assert!(!check(&[]));
+        // A port the Service does not have counts as missing.
+        let other = sref("a", named("http"), None);
+        assert!(!check(&[(&other, &h2c)]));
+        assert!(check(&[(&other, &h2c), (&b, &grpc)]));
     }
 }

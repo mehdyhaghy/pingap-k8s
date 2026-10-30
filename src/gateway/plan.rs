@@ -441,6 +441,7 @@ mod tests {
     fn loc(owner: &str, upstream: &str) -> LocationEntry {
         LocationEntry {
             owner: route(owner),
+            owner_kind: Default::default(),
             server: "http".into(),
             host: Some("shop.example.com".into()),
             path: String::new(),
@@ -698,6 +699,7 @@ mod tests {
             },
             addr: "legacy.example.com:80".into(),
             health_check: None,
+            h2c: false,
         };
         case.desired
             .external

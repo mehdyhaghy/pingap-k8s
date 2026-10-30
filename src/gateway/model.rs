@@ -11,6 +11,7 @@ use tokio::sync::{broadcast, oneshot};
 use crate::config::UpstreamConfig;
 use crate::gateway::api::gatewayclasses::{GatewayClass, GatewayClassStatus};
 use crate::gateway::api::gateways::{Gateway, GatewayStatus};
+use crate::gateway::api::grpcroutes::GrpcRoute;
 use crate::gateway::api::httproutes::{HttpRoute, HttpRouteStatus};
 use crate::gateway::api::referencegrants::ReferenceGrant;
 use crate::types::{ServiceKey, UpstreamOptions};
@@ -28,7 +29,26 @@ pub fn is_owned(name: &str) -> bool {
     name.starts_with(OWNED_PREFIX)
 }
 
-/// A namespaced object: a Gateway, an HTTPRoute or a Secret.
+/// The kind of a route. Every route is translated through the HTTPRoute model; a
+/// GRPCRoute is converted to it first ([`crate::gateway::grpc`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RouteKind {
+    #[default]
+    Http,
+    Grpc,
+}
+
+impl RouteKind {
+    /// The Kubernetes kind: "HTTPRoute" or "GRPCRoute".
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RouteKind::Http => "HTTPRoute",
+            RouteKind::Grpc => "GRPCRoute",
+        }
+    }
+}
+
+/// A namespaced object: a Gateway, a route or a Secret.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectKey {
     pub namespace: String,
@@ -74,6 +94,9 @@ pub struct ServerInfo {
     pub ports: BTreeSet<u16>,
     /// `global_certificates = true`: a TLS listener serving the stored certificates by SNI.
     pub tls: bool,
+    /// `enabled_h2 = true`: HTTP/2 by ALPN on a TLS server, h2c with prior knowledge on a
+    /// plain one. GRPCRoutes need it.
+    pub h2: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -100,6 +123,7 @@ pub struct TranslateInput<'a> {
     pub classes: &'a [Arc<GatewayClass>],
     pub gateways: &'a [Arc<Gateway>],
     pub routes: &'a [Arc<HttpRoute>],
+    pub grpc_routes: &'a [Arc<GrpcRoute>],
     pub grants: &'a [Arc<ReferenceGrant>],
     /// Every namespace (for `allowedRoutes.namespaces.selector`).
     pub namespaces: &'a BTreeMap<String, Arc<Namespace>>,
@@ -127,6 +151,7 @@ pub struct Referenced {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocationEntry {
     pub owner: RouteKey,
+    pub owner_kind: RouteKind,
     /// The Pingap server whose `locations` list it is in.
     pub server: String,
     /// One host (exact or `*.` wildcard); `None` matches every host.
@@ -167,6 +192,9 @@ pub struct ExternalUpstream {
     pub addr: String,
     /// Pingap `health_check`, validated.
     pub health_check: Option<String>,
+    /// HTTP/2 with prior knowledge (`alpn = "H2"`): a GRPCRoute or `kubernetes.io/h2c`
+    /// backend.
+    pub h2c: bool,
 }
 
 /// A certificate from a `kubernetes.io/tls` Secret named by an HTTPS listener.
@@ -193,6 +221,9 @@ pub struct DesiredStatus {
     /// Routes with at least one parent of ours: only the `parents` entries with our
     /// `controllerName` are set; entries of other controllers are left as they are.
     pub routes: BTreeMap<RouteKey, HttpRouteStatus>,
+    /// GRPCRoutes, the same way. A GRPCRoute status has the shape of an HTTPRoute status;
+    /// the status writer converts it.
+    pub grpc_routes: BTreeMap<RouteKey, HttpRouteStatus>,
 }
 
 /// Everything the handled Gateways and routes want stored.
@@ -302,6 +333,7 @@ pub trait GatewaySource: Send + Sync + 'static {
     fn classes(&self) -> Vec<Arc<GatewayClass>>;
     fn gateways(&self) -> Vec<Arc<Gateway>>;
     fn routes(&self) -> Vec<Arc<HttpRoute>>;
+    fn grpc_routes(&self) -> Vec<Arc<GrpcRoute>>;
     fn grants(&self) -> Vec<Arc<ReferenceGrant>>;
     fn namespaces(&self) -> BTreeMap<String, Arc<Namespace>>;
     /// Every watch listed once.
@@ -341,6 +373,12 @@ pub trait StatusPublisher: Send + Sync + 'static {
         route: &HttpRoute,
         status: &HttpRouteStatus,
     ) -> impl Future<Output = anyhow::Result<bool>> + Send;
+    /// The same for a GRPCRoute (`status` in the HTTPRoute shape).
+    fn publish_grpc_route(
+        &self,
+        route: &GrpcRoute,
+        status: &HttpRouteStatus,
+    ) -> impl Future<Output = anyhow::Result<bool>> + Send;
 }
 
 /// Shared handle: an `Arc` of a source is a source.
@@ -353,6 +391,9 @@ impl<T: GatewaySource> GatewaySource for Arc<T> {
     }
     fn routes(&self) -> Vec<Arc<HttpRoute>> {
         (**self).routes()
+    }
+    fn grpc_routes(&self) -> Vec<Arc<GrpcRoute>> {
+        (**self).grpc_routes()
     }
     fn grants(&self) -> Vec<Arc<ReferenceGrant>> {
         (**self).grants()

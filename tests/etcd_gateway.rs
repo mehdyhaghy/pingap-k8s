@@ -63,6 +63,7 @@ fn s(v: &[&str]) -> Vec<String> {
 fn location(owner: &str, path: &str, upstream: &str) -> LocationEntry {
     LocationEntry {
         owner: RouteKey::new("shop", owner),
+        owner_kind: Default::default(),
         server: "http".into(),
         host: Some("shop.example.com".into()),
         path: path.into(),
@@ -170,6 +171,7 @@ async fn apply_creates_and_removes_entries() {
             },
             addr: "legacy.example.com:80".into(),
             health_check: None,
+            h2c: false,
         },
     );
     want.certificates.insert(

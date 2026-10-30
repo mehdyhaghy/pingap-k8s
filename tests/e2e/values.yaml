@@ -84,8 +84,10 @@ pingap:
       locations = ["grpc"]
 
       # Gateway API listeners: the controller lists its generated locations here.
+      # gw-http also speaks h2c (enabled_h2), so its listeners take GRPCRoutes.
       [servers.gw-http]
       addr = "[::]:8082"
+      enabled_h2 = true
 
       [servers.gw-https]
       addr = "[::]:8443"

@@ -15,7 +15,7 @@ use toml_edit::{Array, DocumentMut, Item, Table, TableLike, Value};
 
 use crate::gateway::model::{
     CertificateEntry, ExternalUpstream, LocationEntry, PluginEntry, REMARK_PREFIX, RouteKey,
-    SecretKey, ServerInfo, is_owned,
+    RouteKind, SecretKey, ServerInfo, is_owned,
 };
 use crate::types::ServiceKey;
 
@@ -42,6 +42,19 @@ pub enum RenderError {
 pub fn route_remark(key: &RouteKey) -> String {
     format!("{REMARK_PREFIX} httproute {key}")
 }
+
+/// `remark` of the locations of a route of any kind: [`route_remark`] for an HTTPRoute,
+/// "pingap-k8s grpcroute <ns>/<name>" for a GRPCRoute.
+pub fn kind_route_remark(kind: RouteKind, key: &RouteKey) -> String {
+    match kind {
+        RouteKind::Http => route_remark(key),
+        RouteKind::Grpc => format!("{REMARK_PREFIX} grpcroute {key}"),
+    }
+}
+
+/// Pingap `alpn` of an upstream that speaks HTTP/2 with prior knowledge: without `sni`
+/// (no TLS) Pingap connects in h2c.
+pub const H2C_ALPN: &str = "H2";
 
 /// `remark` of the generated plugins: "pingap-k8s plugin" (shared by every route that
 /// needs the same plugin, so it names no owner).
@@ -113,7 +126,7 @@ pub fn render_location(name: &str, location: &LocationEntry) -> String {
     }
     entry.insert(
         "remark",
-        toml_edit::value(route_remark(&location.owner).as_str()),
+        toml_edit::value(kind_route_remark(location.owner_kind, &location.owner).as_str()),
     );
     document("locations", name, entry)
 }
@@ -134,8 +147,8 @@ pub fn render_plugin(name: &str, plugin: &PluginEntry) -> String {
 }
 
 /// What the translation needs to know of a stored server: the ports of its `addr` list
-/// (`"0.0.0.0:80,[::]:80"`) and whether it serves TLS (`global_certificates`). `None` when
-/// the entry does not parse or has no usable address.
+/// (`"0.0.0.0:80,[::]:80"`), whether it serves TLS (`global_certificates`) and HTTP/2
+/// (`enabled_h2`). `None` when the entry does not parse or has no usable address.
 pub fn server_info(toml: &str, name: &str) -> Option<ServerInfo> {
     let table = entry_table(toml, "servers", name).ok()??;
     let addr = table.get("addr")?.as_str()?;
@@ -148,14 +161,17 @@ pub fn server_info(toml: &str, name: &str) -> Option<ServerInfo> {
     if ports.is_empty() {
         return None;
     }
-    let tls = table
-        .get("global_certificates")
-        .and_then(toml::Value::as_bool)
-        .unwrap_or(false);
+    let flag = |key: &str| {
+        table
+            .get(key)
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
+    };
     Some(ServerInfo {
         name: name.to_string(),
         ports,
-        tls,
+        tls: flag("global_certificates"),
+        h2: flag("enabled_h2"),
     })
 }
 
@@ -184,9 +200,10 @@ pub fn render_certificate(name: &str, certificate: &CertificateEntry) -> String 
 }
 
 /// `[upstreams.<name>]` for an `ExternalName` backend: `addrs = ["host:port"]` with
-/// `discovery = "dns"` and `update_frequency`. An IP literal is written as a static
-/// address, and only when it passes the same filter as the pod addresses of phase 1 (no
-/// loopback, link-local, broadcast, multicast or unspecified address).
+/// `discovery = "dns"` and `update_frequency`, and `alpn = "H2"` for an h2c backend. An
+/// IP literal is written as a static address, and only when it passes the same filter as
+/// the pod addresses of phase 1 (no loopback, link-local, broadcast, multicast or
+/// unspecified address).
 pub fn render_external_upstream(
     name: &str,
     upstream: &ExternalUpstream,
@@ -236,6 +253,9 @@ pub fn render_external_upstream(
     }
     if let Some(health_check) = &upstream.health_check {
         entry.insert("health_check", toml_edit::value(health_check.as_str()));
+    }
+    if upstream.h2c {
+        entry.insert("alpn", toml_edit::value(H2C_ALPN));
     }
     entry.insert(
         "remark",
@@ -522,6 +542,7 @@ mod tests {
         discovery: Option<String>,
         update_frequency: Option<String>,
         health_check: Option<String>,
+        alpn: Option<String>,
         remark: Option<String>,
     }
 
@@ -534,6 +555,7 @@ mod tests {
     fn location() -> LocationEntry {
         LocationEntry {
             owner: owner(),
+            owner_kind: RouteKind::Http,
             server: "http".into(),
             host: Some("shop.example.com".into()),
             path: "~^/api(/|$)".into(),
@@ -578,6 +600,7 @@ mod tests {
     fn bare_location_leaves_out_host_path_upstream_and_options() {
         let entry = LocationEntry {
             owner: owner(),
+            owner_kind: RouteKind::Http,
             server: "http".into(),
             host: None,
             path: String::new(),
@@ -660,6 +683,7 @@ mod tests {
             },
             addr: addr.into(),
             health_check: None,
+            h2c: false,
         }
     }
 
@@ -689,6 +713,33 @@ mod tests {
             conf.health_check.as_deref(),
             Some("tcp://db?check_frequency=5s")
         );
+        assert_eq!(conf.alpn, None);
+
+        let mut h2c = external("grpc.example.com:9000");
+        h2c.h2c = true;
+        let out = render_external_upstream("k8s-x", &h2c, "5s").unwrap();
+        let conf = parse::<UpstreamConf>(&out, "upstreams")
+            .remove("k8s-x")
+            .unwrap();
+        assert_eq!(conf.alpn.as_deref(), Some("H2"));
+    }
+
+    #[test]
+    fn grpc_location_remark_names_the_grpcroute() {
+        let mut entry = location();
+        entry.owner_kind = RouteKind::Grpc;
+        entry.path = "=/pkg.Svc/Get".into();
+        let out = render_location("k8s-shop-web-2", &entry);
+        let conf = parse::<LocationConf>(&out, "locations")
+            .remove("k8s-shop-web-2")
+            .unwrap();
+        assert_eq!(conf.path.as_deref(), Some("=/pkg.Svc/Get"));
+        assert_eq!(
+            conf.remark.as_deref(),
+            Some("pingap-k8s grpcroute shop/web")
+        );
+        // Not taken for an HTTPRoute location.
+        assert_eq!(location_owner(&out, "k8s-shop-web-2"), None);
     }
 
     #[test]
@@ -885,12 +936,21 @@ global_certificates = true
                 name: "http".into(),
                 ports: BTreeSet::from([80]),
                 tls: true,
+                h2: false,
             })
         );
         let doc = "[servers.web]\naddr = \"0.0.0.0:8080,[::]:8080, 127.0.0.1:9000\"\n";
         assert_eq!(
             server_info(doc, "web").map(|s| (s.ports, s.tls)),
             Some((BTreeSet::from([8080, 9000]), false))
+        );
+        assert_eq!(
+            server_info(
+                "[servers.web]\naddr = \"0.0.0.0:80\"\nenabled_h2 = true\n",
+                "web"
+            )
+            .map(|s| (s.tls, s.h2)),
+            Some((false, true))
         );
         assert_eq!(server_info("[servers.web]\n", "web"), None);
         assert_eq!(server_info("[servers.web]\naddr = \"x\"\n", "web"), None);

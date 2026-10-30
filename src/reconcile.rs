@@ -766,6 +766,9 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
             })
             .collect();
         let resolved = resolve::resolve(&inputs, &st.config.options);
+        // HTTP/2 cleartext backends: generated upstreams say so, configured ones get it
+        // from the `appProtocol` of their Service ports.
+        let h2c = st.config.h2c || resolve::h2c_backends(&inputs);
 
         self.metrics
             .set_endpoints(name, resolved.ready, resolved.draining);
@@ -857,9 +860,10 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
         let writer = Arc::clone(&self.writer);
         let upstream = name.to_string();
         let health_check = st.config.health_check.clone();
+        let alpn = h2c.then_some(crate::gateway::render::H2C_ALPN);
         let handle = self.inflight.spawn(async move {
             let result = writer
-                .write_upstream(&upstream, &desired, health_check.as_deref())
+                .write_upstream(&upstream, &desired, health_check.as_deref(), alpn)
                 .await;
             (upstream, desired, result)
         });
@@ -1127,9 +1131,22 @@ mod tests {
         /// When set, each write is stored at once but its result is held
         /// back until the gate is notified (a write "in flight").
         gate: Mutex<Option<Arc<Notify>>>,
+        /// The `alpn` of every `write_upstream` call.
+        alpns: Mutex<Vec<(String, Option<String>)>>,
     }
 
     impl AddrsWriter for FakeWriter {
+        fn write_upstream(
+            &self,
+            upstream: &str,
+            addrs: &[String],
+            _health_check: Option<&str>,
+            alpn: Option<&str>,
+        ) -> impl Future<Output = anyhow::Result<WriteOutcome>> + Send {
+            lock(&self.alpns).push((upstream.to_string(), alpn.map(String::from)));
+            self.write_addrs(upstream, addrs)
+        }
+
         fn write_addrs(
             &self,
             upstream: &str,
@@ -1208,6 +1225,7 @@ mod tests {
                 spread_weights: false,
             },
             health_check: None,
+            h2c: false,
         }
     }
 
@@ -1832,6 +1850,36 @@ mod tests {
             svc.spec.as_mut().unwrap().ports.as_mut().unwrap()[0].name = Some(port_name.into());
             snap.service = Some(Arc::new(svc));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn h2c_service_ports_and_generated_h2c_upstreams_get_alpn() {
+        let h = Harness::start(&[("web", &["web"]), ("grpc", &["grpc"])], true, 64, |s| {
+            s.set("web", &["10.0.0.1"], &[]);
+            s.set("grpc", &["10.0.0.2"], &[]);
+            let mut snaps = lock(&s.snaps);
+            let snap = snaps.get_mut(&key("grpc")).unwrap();
+            let mut svc = (**snap.service.as_ref().unwrap()).clone();
+            svc.spec.as_mut().unwrap().ports.as_mut().unwrap()[0].app_protocol =
+                Some("kubernetes.io/h2c".into());
+            snap.service = Some(Arc::new(svc));
+        });
+        sleep(10).await;
+        let alpns: BTreeMap<String, Option<String>> =
+            lock(&h.writer.alpns).iter().cloned().collect();
+        assert_eq!(alpns["web"], None);
+        assert_eq!(alpns["grpc"].as_deref(), Some("H2"));
+
+        // A generated upstream that says h2c gets it whatever the appProtocol.
+        let mut generated = upstream(&["web"]);
+        generated.h2c = true;
+        h.handle
+            .set_upstreams(BTreeMap::from([("k8s-web-h2c".to_string(), generated)]));
+        sleep(1000).await;
+        let alpns: BTreeMap<String, Option<String>> =
+            lock(&h.writer.alpns).iter().cloned().collect();
+        assert_eq!(alpns["k8s-web-h2c"].as_deref(), Some("H2"));
+        h.stop().await;
     }
 
     #[tokio::test(start_paused = true)]

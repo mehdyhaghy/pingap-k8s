@@ -111,14 +111,17 @@ pub trait AddrsWriter: Send + Sync + 'static {
     ) -> impl Future<Output = anyhow::Result<WriteOutcome>> + Send;
 
     /// [`AddrsWriter::write_addrs`]; an entry it creates also gets `health_check`
-    /// (already validated). An existing entry's `health_check` is left alone.
+    /// (already validated). An existing entry's `health_check` is left alone. `alpn`
+    /// (Pingap's `"H2"` for h2c backends) is written into an entry that is created or has
+    /// no `alpn`; an `alpn` already stored is left alone.
     fn write_upstream(
         &self,
         upstream: &str,
         addrs: &[String],
         health_check: Option<&str>,
+        alpn: Option<&str>,
     ) -> impl Future<Output = anyhow::Result<WriteOutcome>> + Send {
-        let _ = health_check;
+        let _ = (health_check, alpn);
         self.write_addrs(upstream, addrs)
     }
 }

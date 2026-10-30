@@ -1,4 +1,5 @@
-//! Gateway provider: the `status` subresources of GatewayClasses, Gateways and HTTPRoutes.
+//! Gateway provider: the `status` subresources of GatewayClasses, Gateways, HTTPRoutes and
+//! GRPCRoutes (whose status has the shape of an HTTPRoute status and is merged as one).
 //!
 //! The desired statuses come from the translation with a placeholder
 //! `lastTransitionTime`. Before comparing, every desired condition takes the stored time
@@ -34,7 +35,9 @@ use super::api::gatewayclasses::{GatewayClass, GatewayClassStatus};
 use super::api::gateways::{
     Gateway, GatewayStatus, GatewayStatusAddresses, GatewayStatusListeners,
 };
+use super::api::grpcroutes::GrpcRoute;
 use super::api::httproutes::{HttpRoute, HttpRouteStatus, HttpRouteStatusParents};
+use super::grpc;
 use super::model::GATEWAY_GROUP;
 
 /// Field manager of the status patches.
@@ -504,6 +507,43 @@ impl super::model::StatusPublisher for KubeStatus {
         )
         .await
     }
+
+    async fn publish_grpc_route(
+        &self,
+        route: &GrpcRoute,
+        status: &HttpRouteStatus,
+    ) -> anyhow::Result<bool> {
+        let namespace = route
+            .metadata
+            .namespace
+            .as_deref()
+            .context("GRPCRoute without a namespace")?;
+        let what = format!("GRPCRoute {namespace}/{}", route.name_any());
+        let rbac = format!("patch on grpcroutes/status in namespace {namespace}");
+        let now = now();
+        let controller = self.controller_name.as_str();
+        write_status(
+            Api::namespaced(self.client.clone(), namespace),
+            route,
+            &what,
+            &rbac,
+            |obj: &GrpcRoute| grpc_route_patch(obj, status, controller, &now),
+        )
+        .await
+    }
+}
+
+/// The `status` patch body of a GRPCRoute, or `None` when its stored status is already
+/// right.
+fn grpc_route_patch(
+    route: &GrpcRoute,
+    status: &HttpRouteStatus,
+    controller: &str,
+    now: &Time,
+) -> Option<Value> {
+    let stored = route.status.as_ref().map(grpc::http_status);
+    let merged = splice_route_parents(stored.as_ref(), status, controller, now);
+    (!route_status_equal(stored.as_ref(), Some(&merged))).then(|| route_patch_body(&merged))
 }
 
 #[cfg(test)]
@@ -782,5 +822,55 @@ mod tests {
         };
         let err = publisher.publish_route(&route, &other).await.unwrap_err();
         assert!(format!("{err:#}").contains("httproutes/status"), "{err:#}");
+    }
+
+    #[test]
+    fn grpc_route_parents_of_other_controllers_are_kept() {
+        let mut route = GrpcRoute::new("g", Default::default());
+        route.status = Some(grpc::grpc_status(&HttpRouteStatus {
+            parents: vec![
+                parent("x.io/other", "gw", vec![cond("Accepted", "True", 50)]),
+                parent(OURS, "gw", vec![cond("Accepted", "True", 100)]),
+            ],
+        }));
+        // Unchanged: no patch.
+        let same = HttpRouteStatus {
+            parents: vec![parent(OURS, "gw", vec![cond("Accepted", "True", 0)])],
+        };
+        assert_eq!(grpc_route_patch(&route, &same, OURS, &at(500)), None);
+        // Changed: ours replaced (new transition time), the other controller's kept.
+        let other = HttpRouteStatus {
+            parents: vec![parent(OURS, "gw", vec![cond("Accepted", "False", 0)])],
+        };
+        let body = grpc_route_patch(&route, &other, OURS, &at(500)).unwrap();
+        let parents = body["parents"].as_array().unwrap();
+        assert_eq!(parents.len(), 2);
+        assert_eq!(parents[0]["controllerName"], "x.io/other");
+        assert_eq!(parents[1]["controllerName"], OURS);
+        assert_eq!(parents[1]["conditions"][0]["status"], "False");
+        assert_eq!(parents[1]["parentRef"]["kind"], "Gateway");
+        // And it parses as a GRPCRoute status.
+        let parsed: crate::gateway::api::grpcroutes::GrpcRouteStatus =
+            serde_json::from_value(body).unwrap();
+        assert_eq!(parsed.parents.len(), 2);
+        // No stored status at all.
+        let fresh = GrpcRoute::new("g", Default::default());
+        assert!(grpc_route_patch(&fresh, &other, OURS, &at(500)).is_some());
+    }
+
+    #[tokio::test]
+    async fn grpc_route_publish_names_its_permission() {
+        let config = kube::Config::new("http://127.0.0.1:1".parse().unwrap());
+        let publisher = KubeStatus::new(Client::try_from(config).unwrap(), OURS.into());
+        let mut route = GrpcRoute::new("g", Default::default());
+        route.metadata.namespace = Some("prod".into());
+        let status = HttpRouteStatus {
+            parents: vec![parent(OURS, "gw", vec![cond("Accepted", "True", 0)])],
+        };
+        let err = publisher
+            .publish_grpc_route(&route, &status)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("grpcroutes/status"), "{err:#}");
     }
 }

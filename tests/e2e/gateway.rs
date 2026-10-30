@@ -846,10 +846,14 @@ async fn e2e_20_gateway_status() {
             ] {
                 assert!(listener_cond_is(&gw, name, t, s, r), "listener {name}: {t}={s}/{r}");
             }
-            assert_eq!(
-                listener(&gw, name).unwrap()["supportedKinds"],
+            // gw-http sets enabled_h2 (tests/e2e/values.yaml), so its listeners also
+            // take GRPCRoutes; gw-https does not.
+            let kinds = if name == "http" {
+                json!([{ "group": GROUP, "kind": "HTTPRoute" }, { "group": GROUP, "kind": "GRPCRoute" }])
+            } else {
                 json!([{ "group": GROUP, "kind": "HTTPRoute" }])
-            );
+            };
+            assert_eq!(listener(&gw, name).unwrap()["supportedKinds"], kinds);
         }
         for name in ["bad-port", "bad-tls"] {
             assert!(

@@ -53,7 +53,9 @@ pingap:
     enabled: true
     # One server per listener port of the conformance Gateways: 80, 8080 and 8090
     # plain HTTP, 443 HTTPS with the certificates the controller stores. The
-    # controller lists its generated locations on them.
+    # controller lists its generated locations on them. The plain servers also
+    # speak HTTP/2 with prior knowledge (enabled_h2: h2c), which GRPCRoutes
+    # (profile GATEWAY-HTTP and GATEWAY-GRPC) and HTTPRouteBackendProtocolH2C need.
     config: |
       [basic]
       grace_period = "30s"
@@ -61,6 +63,7 @@ pingap:
 
       [servers.gw-80]
       addr = "[::]:80"
+      enabled_h2 = true
 
       [servers.gw-443]
       addr = "[::]:443"
@@ -68,6 +71,8 @@ pingap:
 
       [servers.gw-8080]
       addr = "[::]:8080"
+      enabled_h2 = true
 
       [servers.gw-8090]
       addr = "[::]:8090"
+      enabled_h2 = true

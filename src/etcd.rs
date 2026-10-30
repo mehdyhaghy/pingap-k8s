@@ -567,12 +567,20 @@ pub const SERVICE_UPDATE_FREQUENCY: &str = "5s";
 
 /// The entry written when an owned upstream key does not exist:
 /// `[upstreams.<name>]` with `addrs`, plus `update_frequency` when an address is a
-/// hostname ([`SERVICE_UPDATE_FREQUENCY`]) and `health_check` when given.
-pub fn minimal_upstream(upstream: &str, addrs: &[String], health_check: Option<&str>) -> String {
+/// hostname ([`SERVICE_UPDATE_FREQUENCY`]), and `health_check` and `alpn` when given.
+pub fn minimal_upstream(
+    upstream: &str,
+    addrs: &[String],
+    health_check: Option<&str>,
+    alpn: Option<&str>,
+) -> String {
     let mut entry = Table::new();
     entry.insert("addrs", toml_edit::value(new_array(addrs)));
     if let Some(health_check) = health_check {
         entry.insert("health_check", toml_edit::value(health_check));
+    }
+    if let Some(alpn) = alpn {
+        entry.insert("alpn", toml_edit::value(alpn));
     }
     if addrs.iter().any(|a| is_hostname(a)) {
         entry.insert(
@@ -586,6 +594,29 @@ pub fn minimal_upstream(upstream: &str, addrs: &[String], health_check: Option<&
     let mut doc = DocumentMut::new();
     doc.insert("upstreams", Item::Table(upstreams));
     doc.to_string()
+}
+
+/// Adds `alpn` to `upstreams.<name>` when the entry has none and returns the new
+/// document; `None` when an `alpn` is already set (whatever its value: a hand-set
+/// protocol is kept). Every other byte is kept. A missing table or malformed TOML is an
+/// error.
+pub fn add_missing_alpn(
+    toml: &str,
+    upstream: &str,
+    alpn: &str,
+) -> Result<Option<String>, EtcdError> {
+    let mut doc = parse_doc(toml)?;
+    let table = doc
+        .get_mut("upstreams")
+        .and_then(Item::as_table_like_mut)
+        .and_then(|t| t.get_mut(upstream))
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| EtcdError::MissingTable(upstream.to_string()))?;
+    if table.contains_key("alpn") {
+        return Ok(None);
+    }
+    table.insert("alpn", toml_edit::value(alpn));
+    Ok(Some(doc.to_string()))
 }
 
 /// Whether the host of an `addrs` entry (`host:port [weight]`, `[v6]:port [weight]`)
@@ -726,6 +757,7 @@ impl EtcdWriter {
         upstream: &str,
         addrs: &[String],
         health_check: Option<&str>,
+        alpn: Option<&str>,
     ) -> anyhow::Result<WriteOutcome> {
         check_name(upstream)?;
         if addrs.is_empty() {
@@ -745,7 +777,14 @@ impl EtcdWriter {
                 Some(current) => {
                     let text = std::str::from_utf8(current.value())
                         .map_err(|_| EtcdError::NotUtf8(key.clone()))?;
-                    let Some(updated) = replace_addrs(text, upstream, addrs)? else {
+                    let replaced = replace_addrs(text, upstream, addrs)?;
+                    let with_alpn = match alpn {
+                        Some(alpn) => {
+                            add_missing_alpn(replaced.as_deref().unwrap_or(text), upstream, alpn)?
+                        }
+                        None => None,
+                    };
+                    let Some(updated) = with_alpn.or(replaced) else {
                         return Ok(WriteOutcome::Unchanged);
                     };
                     let txn = Txn::new()
@@ -762,7 +801,7 @@ impl EtcdWriter {
                         .when([Compare::create_revision(key.as_str(), CompareOp::Equal, 0)])
                         .and_then([TxnOp::put(
                             key.as_str(),
-                            minimal_upstream(upstream, addrs, health_check),
+                            minimal_upstream(upstream, addrs, health_check, alpn),
                             None,
                         )]);
                     (txn, true)
@@ -877,7 +916,7 @@ impl AddrsWriter for EtcdWriter {
         upstream: &str,
         addrs: &[String],
     ) -> impl Future<Output = anyhow::Result<WriteOutcome>> + Send {
-        self.write_addrs_inner(upstream, addrs, None)
+        self.write_addrs_inner(upstream, addrs, None, None)
     }
 
     fn write_upstream(
@@ -885,8 +924,9 @@ impl AddrsWriter for EtcdWriter {
         upstream: &str,
         addrs: &[String],
         health_check: Option<&str>,
+        alpn: Option<&str>,
     ) -> impl Future<Output = anyhow::Result<WriteOutcome>> + Send {
-        self.write_addrs_inner(upstream, addrs, health_check)
+        self.write_addrs_inner(upstream, addrs, health_check, alpn)
     }
 }
 
@@ -1355,7 +1395,7 @@ connection_timeout = "10s"
 
     #[test]
     fn minimal_upstream_shape() {
-        let out = minimal_upstream("api-1", &s(&["10.0.0.1:80", "[::1]:80 2"]), None);
+        let out = minimal_upstream("api-1", &s(&["10.0.0.1:80", "[::1]:80 2"]), None, None);
         assert_eq!(
             out,
             "[upstreams.api-1]\naddrs = [\"10.0.0.1:80\", \"[::1]:80 2\"]\n"
@@ -1376,7 +1416,12 @@ connection_timeout = "10s"
 
     #[test]
     fn minimal_service_upstream_refreshes_dns_often() {
-        let out = minimal_upstream("legacy", &s(&["legacy.prod.svc.cluster.local:80 2"]), None);
+        let out = minimal_upstream(
+            "legacy",
+            &s(&["legacy.prod.svc.cluster.local:80 2"]),
+            None,
+            None,
+        );
         let value: toml::Table = toml::from_str(&out).unwrap();
         assert_eq!(
             value["upstreams"]["legacy"]["update_frequency"].as_str(),
@@ -1391,7 +1436,7 @@ connection_timeout = "10s"
     #[test]
     fn minimal_upstream_with_health_check() {
         let hc = "http://api/healthz?connection_timeout=1s&check_frequency=5s";
-        let out = minimal_upstream("k8s-api", &s(&["10.0.0.1:80"]), Some(hc));
+        let out = minimal_upstream("k8s-api", &s(&["10.0.0.1:80"]), Some(hc), None);
         let value: toml::Table = toml::from_str(&out).unwrap();
         assert_eq!(
             value["upstreams"]["k8s-api"]["health_check"].as_str(),
@@ -1406,6 +1451,31 @@ connection_timeout = "10s"
             value["upstreams"]["k8s-api"]["health_check"].as_str(),
             Some(hc)
         );
+    }
+
+    #[test]
+    fn h2c_upstreams_get_alpn() {
+        let out = minimal_upstream("k8s-grpc", &s(&["10.0.0.1:9000"]), None, Some("H2"));
+        let value: toml::Table = toml::from_str(&out).unwrap();
+        assert_eq!(value["upstreams"]["k8s-grpc"]["alpn"].as_str(), Some("H2"));
+        // Already there: unchanged.
+        assert_eq!(add_missing_alpn(&out, "k8s-grpc", "H2").unwrap(), None);
+        // A hand-set alpn is kept.
+        let hand = "[upstreams.api]\naddrs = [\"10.0.0.1:80\"]\nalpn = \"H2H1\" # mine\n";
+        assert_eq!(add_missing_alpn(hand, "api", "H2").unwrap(), None);
+        // Missing: added, everything else kept.
+        let added = add_missing_alpn(STORED, "api", "H2").unwrap().unwrap();
+        assert!(added.starts_with(STORED.trim_end()), "{added}");
+        let value: toml::Table = toml::from_str(&added).unwrap();
+        assert_eq!(value["upstreams"]["api"]["alpn"].as_str(), Some("H2"));
+        assert_eq!(
+            read_addrs(&added, "api").unwrap(),
+            Some(s(&["10.0.0.9:80"]))
+        );
+        assert!(matches!(
+            add_missing_alpn("[upstreams.other]\n", "api", "H2"),
+            Err(EtcdError::MissingTable(_))
+        ));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! Gateway provider: the cluster-wide watches of GatewayClasses, Gateways, HTTPRoutes,
-//! ReferenceGrants and Namespaces.
+//! GRPCRoutes, ReferenceGrants and Namespaces.
 //!
 //! Each kind has one watcher feeding a [`reflector::Store`](kube::runtime::reflector::Store).
 //! Every object is kept, whatever its class: the controller decides what it handles, so a
@@ -37,6 +37,7 @@ use tracing::{debug, error, info, warn};
 
 use super::api::gatewayclasses::GatewayClass;
 use super::api::gateways::Gateway;
+use super::api::grpcroutes::GrpcRoute;
 use super::api::httproutes::HttpRoute;
 use super::api::referencegrants::ReferenceGrant;
 use super::model::GatewaySource;
@@ -62,15 +63,17 @@ pub enum WatchedKind {
     GatewayClass,
     Gateway,
     HttpRoute,
+    GrpcRoute,
     ReferenceGrant,
     Namespace,
 }
 
 impl WatchedKind {
-    pub const ALL: [WatchedKind; 5] = [
+    pub const ALL: [WatchedKind; 6] = [
         WatchedKind::GatewayClass,
         WatchedKind::Gateway,
         WatchedKind::HttpRoute,
+        WatchedKind::GrpcRoute,
         WatchedKind::ReferenceGrant,
         WatchedKind::Namespace,
     ];
@@ -81,6 +84,7 @@ impl WatchedKind {
             WatchedKind::GatewayClass => "GatewayClasses",
             WatchedKind::Gateway => "Gateways",
             WatchedKind::HttpRoute => "HTTPRoutes",
+            WatchedKind::GrpcRoute => "GRPCRoutes",
             WatchedKind::ReferenceGrant => "ReferenceGrants",
             WatchedKind::Namespace => "Namespaces",
         }
@@ -92,6 +96,7 @@ impl WatchedKind {
             WatchedKind::GatewayClass => Some("gatewayclasses.gateway.networking.k8s.io"),
             WatchedKind::Gateway => Some("gateways.gateway.networking.k8s.io"),
             WatchedKind::HttpRoute => Some("httproutes.gateway.networking.k8s.io"),
+            WatchedKind::GrpcRoute => Some("grpcroutes.gateway.networking.k8s.io"),
             WatchedKind::ReferenceGrant => Some("referencegrants.gateway.networking.k8s.io"),
             WatchedKind::Namespace => None,
         }
@@ -104,6 +109,7 @@ pub fn rbac_hint(kind: WatchedKind) -> &'static str {
         WatchedKind::GatewayClass => "get/list/watch on gatewayclasses.gateway.networking.k8s.io",
         WatchedKind::Gateway => "get/list/watch on gateways.gateway.networking.k8s.io",
         WatchedKind::HttpRoute => "get/list/watch on httproutes.gateway.networking.k8s.io",
+        WatchedKind::GrpcRoute => "get/list/watch on grpcroutes.gateway.networking.k8s.io",
         WatchedKind::ReferenceGrant => {
             "get/list/watch on referencegrants.gateway.networking.k8s.io"
         }
@@ -431,13 +437,14 @@ struct Inner {
     classes: ResourceWatch<GatewayClass>,
     gateways: ResourceWatch<Gateway>,
     routes: ResourceWatch<HttpRoute>,
+    grpc_routes: ResourceWatch<GrpcRoute>,
     grants: ResourceWatch<ReferenceGrant>,
     namespaces: ResourceWatch<Namespace>,
 }
 
 impl Inner {
     /// (kind, synced, up, missing) of every watch.
-    fn flags(&self) -> [(WatchedKind, bool, bool, bool); 5] {
+    fn flags(&self) -> [(WatchedKind, bool, bool, bool); 6] {
         fn f<K>(kind: WatchedKind, w: &ResourceWatch<K>) -> (WatchedKind, bool, bool, bool)
         where
             K: Resource + ResourceExt + Clone + DeserializeOwned + Debug + Send + Sync,
@@ -449,6 +456,7 @@ impl Inner {
             f(WatchedKind::GatewayClass, &self.classes),
             f(WatchedKind::Gateway, &self.gateways),
             f(WatchedKind::HttpRoute, &self.routes),
+            f(WatchedKind::GrpcRoute, &self.grpc_routes),
             f(WatchedKind::ReferenceGrant, &self.grants),
             f(WatchedKind::Namespace, &self.namespaces),
         ]
@@ -488,13 +496,14 @@ pub struct GatewayWatch {
 }
 
 impl GatewayWatch {
-    /// Starts the five watches. Must be called inside a Tokio runtime.
+    /// Starts the six watches. Must be called inside a Tokio runtime.
     pub fn new(client: Client) -> Self {
         let (changes, _) = broadcast::channel(CHANGE_CHANNEL_CAPACITY);
         let inner = Inner {
             classes: start_cluster(&client, WatchedKind::GatewayClass, strip_metadata, &changes),
             gateways: start_cluster(&client, WatchedKind::Gateway, strip_metadata, &changes),
             routes: start_cluster(&client, WatchedKind::HttpRoute, strip_metadata, &changes),
+            grpc_routes: start_cluster(&client, WatchedKind::GrpcRoute, strip_metadata, &changes),
             grants: start_cluster(
                 &client,
                 WatchedKind::ReferenceGrant,
@@ -504,7 +513,10 @@ impl GatewayWatch {
             namespaces: start_cluster(&client, WatchedKind::Namespace, strip_namespace, &changes),
             changes,
         };
-        info!("watching GatewayClasses, Gateways, HTTPRoutes, ReferenceGrants and Namespaces");
+        info!(
+            "watching GatewayClasses, Gateways, HTTPRoutes, GRPCRoutes, ReferenceGrants and \
+             Namespaces"
+        );
         GatewayWatch {
             inner: Arc::new(inner),
         }
@@ -562,6 +574,10 @@ impl GatewaySource for GatewayWatch {
 
     fn routes(&self) -> Vec<Arc<HttpRoute>> {
         self.inner.routes.store().state()
+    }
+
+    fn grpc_routes(&self) -> Vec<Arc<GrpcRoute>> {
+        self.inner.grpc_routes.store().state()
     }
 
     fn grants(&self) -> Vec<Arc<ReferenceGrant>> {
@@ -740,11 +756,12 @@ mod tests {
         assert!(watch.classes().is_empty());
         assert!(watch.gateways().is_empty());
         assert!(watch.routes().is_empty());
+        assert!(watch.grpc_routes().is_empty());
         assert!(watch.grants().is_empty());
         assert!(watch.namespaces().is_empty());
         assert!(watch.missing_crds().is_empty());
         let states = watch.watch_states();
-        assert_eq!(states.len(), 5);
+        assert_eq!(states.len(), 6);
         assert!(states.iter().all(|s| !s.synced && !s.up && !s.crd_missing));
     }
 }

@@ -261,6 +261,10 @@ pub struct UpstreamConfig {
     /// Pingap `health_check` written when the controller creates the entry (generated
     /// Gateway upstreams only; the name changes with it, so it is never updated in place).
     pub health_check: Option<String>,
+    /// Speak HTTP/2 with prior knowledge (h2c) to the backends: Pingap `alpn = "H2"`
+    /// (generated Gateway upstreams of GRPCRoutes and `kubernetes.io/h2c` backends). A
+    /// configured upstream gets it from the `appProtocol` of its Service ports instead.
+    pub h2c: bool,
 }
 
 // ---- raw (serde) layer ----
@@ -497,6 +501,7 @@ fn build_upstream(
         services,
         options,
         health_check: None,
+        h2c: false,
     })
 }
 

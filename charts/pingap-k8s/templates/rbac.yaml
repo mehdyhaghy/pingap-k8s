@@ -7,8 +7,8 @@ controller Pod).
 With gateway.enabled: in each gateway.namespaces namespace, read secrets
 (limited to gateway.secretNames when set); and the only ClusterRole: read the
 Gateway API resources and namespaces, patch the status of GatewayClasses,
-Gateways and HTTPRoutes. GatewayClasses are cluster-scoped and routes attach
-across namespaces, so this part can not be namespaced.
+Gateways, HTTPRoutes and GRPCRoutes. GatewayClasses are cluster-scoped and
+routes attach across namespaces, so this part can not be namespaced.
 */ -}}
 {{- if .Values.rbac.create }}
 {{- $fullname := include "pingap-k8s.fullname" . }}
@@ -101,10 +101,10 @@ metadata:
     {{- include "pingap-k8s.labels" . | nindent 4 }}
 rules:
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["gatewayclasses", "gateways", "httproutes", "referencegrants"]
+    resources: ["gatewayclasses", "gateways", "httproutes", "grpcroutes", "referencegrants"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["gatewayclasses/status", "gateways/status", "httproutes/status"]
+    resources: ["gatewayclasses/status", "gateways/status", "httproutes/status", "grpcroutes/status"]
     verbs: ["patch"]
   - apiGroups: [""]
     resources: ["namespaces"]

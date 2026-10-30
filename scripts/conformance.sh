@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Runs the official Gateway API conformance suite (profile GATEWAY-HTTP) against
-# the Gateway API provider, on its own kind cluster:
+# Runs the official Gateway API conformance suite (profiles GATEWAY-HTTP and
+# GATEWAY-GRPC) against the Gateway API provider, on its own kind cluster:
 #   - kind cluster $CONF_CLUSTER (default pk8s-conf, never the e2e cluster);
 #   - the controller image built from the Dockerfile and loaded into kind;
 #   - the Gateway API Standard CRDs (same release and digest as scripts/e2e-up.sh);
 #   - the Helm chart (release pingap-k8s, namespace pingap-k8s) with the bundled
 #     etcd and the quickstart Pingap seeded with servers on ports 80, 443
-#     (global_certificates), 8080 and 8090 (tests/conformance/values.yaml), plus
-#     the ClusterIP Service pingap-k8s-gateway with those ports: the address the
-#     controller writes to the Gateways' status.addresses;
+#     (global_certificates), 8080 and 8090 (tests/conformance/values.yaml; the
+#     plain ones with enabled_h2, for gRPC and h2c), plus the ClusterIP Service
+#     pingap-k8s-gateway with those ports: the address the controller writes to
+#     the Gateways' status.addresses;
 #   - the suite (sigs.k8s.io/gateway-api/conformance at $GATEWAY_API_VERSION),
 #     compiled for the node's platform and run in a pod with cluster-admin
 #     rights: the host can not reach pod or ClusterIP addresses on every kind
@@ -27,6 +28,9 @@
 #   CONF_SKIP_BUILD=1  do not build the controller image (it must exist locally)
 #   CONF_REUSE=1       keep an existing cluster: only reload the image, upgrade the
 #                      chart, restart the controller and run the suite again
+#   CONF_PROFILES      comma-separated conformance profiles (--conformance-profiles,
+#                      default GATEWAY-HTTP,GATEWAY-GRPC; GATEWAY-HTTP alone for the
+#                      HTTP run only)
 #   CONF_RUN_TEST      run this one test only (--run-test), e.g. HTTPRouteSimpleSameNamespace
 #   CONF_SKIP_TESTS    comma-separated tests to skip (--skip-tests)
 #   CONF_DELETE=1      delete the cluster at the end
@@ -42,6 +46,7 @@ CLUSTER="${CONF_CLUSTER:-pk8s-conf}"
 IMAGE="${CONF_IMAGE:-pingap-k8s:conformance}"
 TIMEOUT="${CONF_TIMEOUT:-300s}"
 TEST_TIMEOUT="${CONF_TEST_TIMEOUT:-120m}"
+PROFILES="${CONF_PROFILES:-GATEWAY-HTTP,GATEWAY-GRPC}"
 OUT="$ROOT/target/conformance"
 KUBECONFIG_FILE="$OUT/kubeconfig"
 
@@ -146,7 +151,8 @@ log "installing the Gateway API $GATEWAY_API_VERSION CRDs"
 kubectl apply --server-side -f "$gateway_crds" >/dev/null
 kubectl wait --for=condition=Established --timeout=60s \
   crd/gatewayclasses.gateway.networking.k8s.io crd/gateways.gateway.networking.k8s.io \
-  crd/httproutes.gateway.networking.k8s.io crd/referencegrants.gateway.networking.k8s.io
+  crd/httproutes.gateway.networking.k8s.io crd/grpcroutes.gateway.networking.k8s.io \
+  crd/referencegrants.gateway.networking.k8s.io
 
 # --- chart --------------------------------------------------------------------
 for ns in "$NS" "${CONF_NAMESPACES[@]}"; do
@@ -203,7 +209,7 @@ kubectl create clusterrolebinding gateway-conformance-runner --clusterrole=clust
 suite_args=(
   -test.v -test.timeout="$TEST_TIMEOUT" -test.run '^TestConformance$'
   --gateway-class="$GATEWAY_CLASS"
-  --conformance-profiles=GATEWAY-HTTP
+  --conformance-profiles="$PROFILES"
   --report-output=/results/report.yaml
   --organization=pingap-k8s
   --project=pingap-k8s
@@ -241,7 +247,7 @@ spec:
     - { name: results, emptyDir: {} }
 EOF
 kubectl -n "$RUNNER_NS" wait --for=condition=Ready pod/conformance --timeout "$TIMEOUT" >/dev/null
-log "running the suite${CONF_RUN_TEST:+ (test $CONF_RUN_TEST)}; output in $OUT/conformance.log"
+log "running the suite ($PROFILES${CONF_RUN_TEST:+, test $CONF_RUN_TEST}); output in $OUT/conformance.log"
 kubectl -n "$RUNNER_NS" logs -f pod/conformance >"$OUT/conformance.log" 2>&1 &
 logs_pid=$!
 until kubectl -n "$RUNNER_NS" exec conformance -- test -f /results/exit 2>/dev/null; do

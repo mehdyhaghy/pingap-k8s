@@ -239,6 +239,7 @@ struct Objects {
     classes: Vec<Arc<crate::gateway::api::gatewayclasses::GatewayClass>>,
     gateways: Vec<Arc<crate::gateway::api::gateways::Gateway>>,
     routes: Vec<Arc<crate::gateway::api::httproutes::HttpRoute>>,
+    grpc_routes: Vec<Arc<crate::gateway::api::grpcroutes::GrpcRoute>>,
     grants: Vec<Arc<crate::gateway::api::referencegrants::ReferenceGrant>>,
     namespaces: BTreeMap<String, Arc<k8s_openapi::api::core::v1::Namespace>>,
 }
@@ -463,6 +464,7 @@ where
             classes: g.classes(),
             gateways: g.gateways(),
             routes: g.routes(),
+            grpc_routes: g.grpc_routes(),
             grants: g.grants(),
             namespaces: g.namespaces(),
         }
@@ -482,6 +484,7 @@ where
             classes: &objects.classes,
             gateways: &objects.gateways,
             routes: &objects.routes,
+            grpc_routes: &objects.grpc_routes,
             grants: &objects.grants,
             namespaces: &objects.namespaces,
             services: &no_services,
@@ -528,6 +531,7 @@ where
                 classes: &objects.classes,
                 gateways: &objects.gateways,
                 routes: &objects.routes,
+                grpc_routes: &objects.grpc_routes,
                 grants: &objects.grants,
                 namespaces: &objects.namespaces,
                 services: &services,
@@ -683,6 +687,19 @@ where
                 }
             }
         }
+        for route in &objects.grpc_routes {
+            let key = object_key(&route.metadata);
+            let Some(want) = desired.status.grpc_routes.get(&key) else {
+                continue;
+            };
+            match status.publish_grpc_route(route, want).await {
+                Ok(true) => debug!(grpcroute = %key, "GRPCRoute status updated"),
+                Ok(false) => {}
+                Err(err) => {
+                    warn!(grpcroute = %key, "updating the GRPCRoute status failed: {err:#}")
+                }
+            }
+        }
     }
 }
 
@@ -771,6 +788,7 @@ mod tests {
 
     use crate::gateway::api::gatewayclasses::{GatewayClass, GatewayClassSpec, GatewayClassStatus};
     use crate::gateway::api::gateways::{Gateway, GatewayStatus};
+    use crate::gateway::api::grpcroutes::GrpcRoute;
     use crate::gateway::api::httproutes::{HttpRoute, HttpRouteStatus};
     use crate::gateway::api::referencegrants::ReferenceGrant;
     use crate::gateway::model::{Deferred, Expect, Op, SecretKey, Step, StoredEntry};
@@ -821,6 +839,9 @@ mod tests {
             Vec::new()
         }
         fn routes(&self) -> Vec<Arc<HttpRoute>> {
+            Vec::new()
+        }
+        fn grpc_routes(&self) -> Vec<Arc<GrpcRoute>> {
             Vec::new()
         }
         fn grants(&self) -> Vec<Arc<ReferenceGrant>> {
@@ -953,6 +974,13 @@ mod tests {
         ) -> anyhow::Result<bool> {
             Ok(false)
         }
+        async fn publish_grpc_route(
+            &self,
+            _route: &GrpcRoute,
+            _status: &HttpRouteStatus,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
     }
 
     #[derive(Default)]
@@ -1029,6 +1057,7 @@ mod tests {
             }],
             options: crate::config::Defaults::default().upstream_options(),
             health_check: None,
+            h2c: false,
         }
     }
 
