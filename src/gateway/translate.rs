@@ -44,8 +44,10 @@
 //! `request_headers` / `response_headers` plugins (a Host header set or added goes to
 //! the location's `proxy_set_headers`, as the plugin refuses Host); RequestRedirect ->
 //! the `redirect` plugin; URLRewrite -> the location's `rewrite` and a Host in
-//! `proxy_set_headers`. Header values that start with `$` or `:` are refused, because
-//! Pingap replaces them with variables (`$NAME` with environment variables of the Pingap
+//! `proxy_set_headers`; CORS -> the `cors` plugin; RequestMirror -> one `mirror` plugin
+//! each. Those two and a rule's `retry` and `timeouts` are in [`extended`] (a route
+//! with `retry.backoff` is not accepted). Header values that start with `$` or `:` are
+//! refused, because Pingap replaces them with variables (`$NAME` with environment variables of the Pingap
 //! process). A redirect keeps the query, except one that needs a whole URL as target
 //! (from HTTPS to HTTP, or to a port other than the one Pingap would pick for the
 //! target host), where Pingap leaves the query out. A whole URL to the host of the
@@ -85,10 +87,11 @@ use super::api::httproutes::{
     HttpRouteStatusParentsParentRef,
 };
 use super::api::referencegrants::ReferenceGrant;
+use super::extended;
 use super::model::{
     BackendKind, CertificateEntry, Desired, ExternalUpstream, GATEWAY_GROUP, GatewayKey,
-    LocationEntry, ObjectKey, PluginEntry, Referenced, RouteKey, SecretKey, ServerInfo,
-    TranslateInput,
+    LocationEntry, LocationOptions, ObjectKey, PluginEntry, Referenced, RouteKey, SecretKey,
+    ServerInfo, TranslateInput,
 };
 use super::names;
 use super::tls;
@@ -105,27 +108,34 @@ pub const KIND_SECRET: &str = "Secret";
 
 /// The features of the Gateway API conformance suite this provider implements, sorted
 /// as `status.supportedFeatures` must be.
-pub const SUPPORTED_FEATURES: [&str; 15] = [
+pub const SUPPORTED_FEATURES: [&str; 21] = [
     "Gateway",
     "HTTPRoute",
     "HTTPRoute303RedirectStatusCode",
     "HTTPRoute307RedirectStatusCode",
     "HTTPRoute308RedirectStatusCode",
+    "HTTPRouteBackendTimeout",
     "HTTPRouteHostRewrite",
     "HTTPRouteNamedRouteRule",
     "HTTPRouteParentRefPort",
     "HTTPRoutePathRedirect",
     "HTTPRoutePathRewrite",
+    "HTTPRoutePercentageMirror",
     "HTTPRoutePortRedirect",
     "HTTPRouteQueryParamMatching",
+    "HTTPRouteRequestMirror",
+    "HTTPRouteRequestMultipleMirrors",
+    "HTTPRouteRequestTimeout",
     "HTTPRouteResponseHeaderModification",
+    "HTTPRouteRetryConnectionError",
     "HTTPRouteSchemeRedirect",
     "ReferenceGrant",
 ];
 
 /// Service `appProtocol` values the generated (HTTP/1.1, plain text) upstreams can
 /// speak; anything else is `UnsupportedProtocol`.
-const APP_PROTOCOLS: [&str; 4] = ["http", "kubernetes.io/http", "ws", "kubernetes.io/ws"];
+pub(super) const APP_PROTOCOLS: [&str; 4] =
+    ["http", "kubernetes.io/http", "ws", "kubernetes.io/ws"];
 
 /// A lowercase DNS name, optionally with a leading `*.` label: labels of 1 to 63
 /// `[a-z0-9-]` not starting or ending with `-`, at most 253 characters.
@@ -192,6 +202,20 @@ pub fn referenced(input: &TranslateInput<'_>) -> Referenced {
         }
         for rule in route.spec.rules.iter().flatten() {
             for b in rule.backend_refs.iter().flatten() {
+                if b.group.as_deref().unwrap_or("").is_empty()
+                    && b.kind.as_deref().unwrap_or(KIND_SERVICE) == KIND_SERVICE
+                {
+                    out.services.insert(ServiceKey {
+                        namespace: b.namespace.clone().unwrap_or_else(|| namespace.clone()),
+                        name: b.name.clone(),
+                    });
+                }
+            }
+            // RequestMirror backends.
+            for f in rule.filters.iter().flatten() {
+                let Some(b) = f.request_mirror.as_ref().map(|m| &m.backend_ref) else {
+                    continue;
+                };
                 if b.group.as_deref().unwrap_or("").is_empty()
                     && b.kind.as_deref().unwrap_or(KIND_SERVICE) == KIND_SERVICE
                 {
@@ -306,11 +330,19 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
             .filter_map(|(i, r)| r.as_ref().err().map(|e| format!("rule {i}: {e}")))
             .collect();
         let all_dropped = !compiled.is_empty() && dropped.len() == compiled.len();
+        let rejected = extended::route_rejection(route);
 
         let mut status_parents = Vec::new();
         for (parent_ref, outcome) in &parents {
             let accepted = match outcome {
                 Err((reason, message)) => cond("Accepted", false, reason, message, generation),
+                Ok(_) if rejected.is_some() => cond(
+                    "Accepted",
+                    false,
+                    "UnsupportedValue",
+                    rejected.as_deref().unwrap_or_default(),
+                    generation,
+                ),
                 Ok(_) if all_dropped => cond(
                     "Accepted",
                     false,
@@ -343,7 +375,7 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
                 ),
             };
             let mut conditions = vec![accepted, resolved];
-            if !dropped.is_empty() && !all_dropped && outcome.is_ok() {
+            if !dropped.is_empty() && !all_dropped && rejected.is_none() && outcome.is_ok() {
                 conditions.push(cond(
                     "PartiallyInvalid",
                     true,
@@ -364,7 +396,7 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
                 parents: status_parents,
             },
         );
-        if all_dropped {
+        if all_dropped || rejected.is_some() {
             continue;
         }
 
@@ -1237,6 +1269,8 @@ struct Rule {
     upstream: Option<(String, UpstreamKind)>,
     invalid_percent: u8,
     backend_issues: Vec<(&'static str, String)>,
+    /// Retries and timeouts.
+    options: LocationOptions,
 }
 
 fn compile_rule(
@@ -1312,11 +1346,37 @@ fn compile_rule(
         });
     }
 
+    let options = extended::location_options(rule)?;
     let mut plugins = Vec::new();
     let mut host_header = None;
     let mut rewrite = None;
     let mut redirect = None;
+    let mut mirror_issues = Vec::new();
     for filter in rule.filters.iter().flatten() {
+        match filter.r#type {
+            HttpRouteRulesFiltersType::Cors => {
+                let Some(cors) = filter.cors.as_ref() else {
+                    return Err("cors is missing".into());
+                };
+                plugins.extend(extended::cors_plugin(cors)?);
+                continue;
+            }
+            HttpRouteRulesFiltersType::RequestMirror => {
+                let Some(mirror) = filter.request_mirror.as_ref() else {
+                    return Err("requestMirror is missing".into());
+                };
+                let percent = extended::mirror_percent(mirror)?;
+                match extended::mirror_target(input, route, mirror) {
+                    Ok(target) if percent > 0 => {
+                        plugins.push(extended::mirror_plugin(&target, percent));
+                    }
+                    Ok(_) => {}
+                    Err(issue) => mirror_issues.push(issue),
+                }
+                continue;
+            }
+            _ => {}
+        }
         apply_filter(
             filter,
             &mut plugins,
@@ -1342,7 +1402,8 @@ fn compile_rule(
         return Err("filters on backendRefs are not supported".into());
     }
 
-    let backends = resolve_backends(input, route, rule);
+    let mut backends = resolve_backends(input, route, rule);
+    backends.issues.extend(mirror_issues);
     Ok(Rule {
         index,
         matches,
@@ -1353,6 +1414,7 @@ fn compile_rule(
         upstream: backends.upstream,
         invalid_percent: backends.invalid_percent,
         backend_issues: backends.issues,
+        options,
     })
 }
 
@@ -1396,7 +1458,7 @@ fn pingap_path(
 }
 
 /// An HTTP token (RFC 9110): a header name.
-fn check_token(name: &str, what: &str) -> Result<(), String> {
+pub(super) fn check_token(name: &str, what: &str) -> Result<(), String> {
     let ok = !name.is_empty()
         && name
             .bytes()
@@ -1580,13 +1642,11 @@ fn apply_filter(
                 });
             }
         }
-        HttpRouteRulesFiltersType::RequestMirror => {
-            return Err("RequestMirror filters are not supported".into());
-        }
+        // Need the snapshot: compile_rule handles them.
+        HttpRouteRulesFiltersType::RequestMirror | HttpRouteRulesFiltersType::Cors => {}
         HttpRouteRulesFiltersType::ExtensionRef => {
             return Err("ExtensionRef filters are not supported".into());
         }
-        HttpRouteRulesFiltersType::Cors => return Err("CORS filters are not supported".into()),
     }
     Ok(())
 }
@@ -1646,7 +1706,7 @@ fn header_plugin(
 }
 
 /// A generated plugin, named after its content.
-fn plugin(category: &str, fields: toml::Table) -> (String, PluginEntry) {
+pub(super) fn plugin(category: &str, fields: toml::Table) -> (String, PluginEntry) {
     let content = toml::to_string(&fields).unwrap_or_default();
     (
         names::plugin_name(category, &content),
@@ -1880,7 +1940,10 @@ fn resolve_backends(
     out
 }
 
-fn service_port(service: &Service, port: i32) -> Option<&k8s_openapi::api::core::v1::ServicePort> {
+pub(super) fn service_port(
+    service: &Service,
+    port: i32,
+) -> Option<&k8s_openapi::api::core::v1::ServicePort> {
     service
         .spec
         .as_ref()?
@@ -1892,7 +1955,7 @@ fn service_port(service: &Service, port: i32) -> Option<&k8s_openapi::api::core:
 
 /// Whether a ReferenceGrant in `to_namespace` lets `from_kind` objects of
 /// `from_namespace` refer to the core `to_kind` object `to_name`.
-fn granted(
+pub(super) fn granted(
     grants: &[Arc<ReferenceGrant>],
     from_namespace: &str,
     from_kind: &str,
@@ -1997,6 +2060,7 @@ fn build_location(
                 .map(|h| format!("host:{h}"))
                 .collect(),
             plugins: plugins.iter().map(|(n, _)| n.clone()).collect(),
+            options: rule.options.clone(),
         },
         name,
         plugins,
@@ -3525,8 +3589,8 @@ mod tests {
             json!([{"type": "RequestHeaderModifier", "requestHeaderModifier": {"set": [{"name": "X", "value": "$HOME"}]}}]),
             json!([{"type": "ResponseHeaderModifier", "responseHeaderModifier": {"add": [{"name": "X", "value": ":path"}]}}]),
             json!([{"type": "RequestHeaderModifier", "requestHeaderModifier": {"remove": ["Host"]}}]),
-            json!([{"type": "RequestMirror", "requestMirror": {"backendRef": {"name": "web", "port": 80}}}]),
-            json!([{"type": "CORS", "cors": {"allowOrigins": ["*"]}}]),
+            json!([{"type": "RequestMirror", "requestMirror": {"backendRef": {"name": "web", "port": 80}, "percent": 101}}]),
+            json!([{"type": "CORS", "cors": {"allowOrigins": ["*"], "allowHeaders": ["*"], "allowCredentials": true}}]),
             json!([{"type": "ExtensionRef", "extensionRef": {"group": "x", "kind": "y", "name": "z"}}]),
             json!([{"type": "URLRewrite", "urlRewrite": {"path": {"type": "ReplacePrefixMatch", "replacePrefixMatch": "/x"}}}]),
         ] {
@@ -3751,6 +3815,249 @@ mod tests {
     }
 
     // ---- whole-output properties ----
+
+    // ---- retries, timeouts, CORS and mirrors ----
+
+    #[test]
+    fn retries_and_timeouts_become_location_options() {
+        let d = World::new()
+            .gw(basic_gateway())
+            .rt(route(
+                "ns",
+                "r",
+                0,
+                json!({"rules": [
+                    {"matches": [{"path": {"value": "/t"}}], "backendRefs": [backend("web", 80)],
+                     "timeouts": {"request": "10s", "backendRequest": "500ms"},
+                     "retry": {"attempts": 4}},
+                    {"matches": [{"path": {"value": "/off"}}], "backendRefs": [backend("web", 80)],
+                     "timeouts": {"request": "0s"}},
+                    {"matches": [{"path": {"value": "/plain"}}], "backendRefs": [backend("web", 80)]},
+                ]}),
+            ))
+            .run();
+        let by_path: BTreeMap<&str, &LocationEntry> = locations(&d, "http")
+            .into_iter()
+            .map(|l| (l.path.as_str(), l))
+            .collect();
+        let t = &by_path["~^/t(/|$)"].options;
+        assert_eq!(t.max_retries, Some(4));
+        assert_eq!(t.max_retry_window, Some(10_000));
+        assert_eq!(
+            (t.connection_timeout, t.read_timeout, t.write_timeout),
+            (Some(500), Some(500), Some(500))
+        );
+        let off = &by_path["~^/off(/|$)"].options;
+        assert_eq!(off.read_timeout, Some(extended::LONGEST_TIMEOUT_MS));
+        assert_eq!(off.max_retries, None);
+        assert_eq!(by_path["~^/plain(/|$)"].options, LocationOptions::default());
+        assert_eq!(
+            route_cond(&d, &rkey("ns", "r"), "Accepted"),
+            tf("True", "Accepted")
+        );
+    }
+
+    #[test]
+    fn retry_codes_drop_the_rule_and_backoff_rejects_the_route() {
+        let d = World::new()
+            .gw(basic_gateway())
+            .rt(route(
+                "ns",
+                "codes",
+                0,
+                json!({"rules": [
+                    {"matches": [{"path": {"value": "/a"}}], "backendRefs": [backend("web", 80)],
+                     "retry": {"attempts": 2, "codes": [503]}},
+                    {"matches": [{"path": {"value": "/b"}}], "backendRefs": [backend("web", 80)]},
+                ]}),
+            ))
+            .rt(route(
+                "ns",
+                "backoff",
+                1,
+                json!({"hostnames": ["backoff.example.com"], "rules": [
+                    {"backendRefs": [backend("web", 80)], "retry": {"attempts": 2, "backoff": "100ms"}},
+                    {"matches": [{"path": {"value": "/ok"}}], "backendRefs": [backend("web", 80)]},
+                ]}),
+            ))
+            .run();
+        let codes = rkey("ns", "codes");
+        assert_eq!(route_cond(&d, &codes, "Accepted"), tf("True", "Accepted"));
+        assert_eq!(
+            route_cond(&d, &codes, "PartiallyInvalid"),
+            tf("True", "UnsupportedValue")
+        );
+        let backoff = rkey("ns", "backoff");
+        assert_eq!(
+            route_cond(&d, &backoff, "Accepted"),
+            tf("False", "UnsupportedValue")
+        );
+        let message =
+            &condition(&d.status.routes[&backoff].parents[0].conditions, "Accepted").message;
+        assert!(message.contains("retry.backoff"), "{message}");
+        let owners: BTreeSet<&RouteKey> = d.locations.values().map(|l| &l.owner).collect();
+        assert_eq!(owners, BTreeSet::from([&codes]));
+        assert_eq!(d.locations.len(), 1);
+    }
+
+    #[test]
+    fn cors_filter_becomes_the_cors_plugin() {
+        let d = one_rule(
+            json!([{"type": "CORS", "cors": {
+                "allowOrigins": ["https://www.foo.com"], "allowMethods": ["GET"],
+                "allowCredentials": true, "maxAge": 60}}]),
+            json!([]),
+        )
+        .run();
+        let l = locations(&d, "http")[0];
+        let plugins = plugins_of(&d, l);
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].category, "cors");
+        assert_eq!(plugins[0].fields["allow_methods"].as_str(), Some("GET"));
+        assert_eq!(plugins[0].fields["max_age"].as_str(), Some("60s"));
+        assert!(l.upstream.is_some());
+    }
+
+    /// A route in `ns` with one rule: `filters` and the backend `web`.
+    fn mirror_world(filters: Value) -> World {
+        let mut w = one_rule(filters, json!([]));
+        w.service(service("other", "shadow", &[8080]));
+        w.service(
+            serde_json::from_value(json!({"metadata": {"namespace": "ns", "name": "headless"},
+            "spec": {"clusterIP": "None", "ports": [
+                {"port": 80, "targetPort": 3000}, {"port": 81, "targetPort": "http"}]}}))
+            .unwrap(),
+        );
+        w
+    }
+
+    fn mirror(name: &str, port: i32) -> Value {
+        json!({"type": "RequestMirror", "requestMirror": {"backendRef": {"name": name, "port": port}}})
+    }
+
+    #[test]
+    fn mirrors_become_mirror_plugins() {
+        let d = mirror_world(json!([
+            {"type": "RequestHeaderModifier", "requestHeaderModifier": {"set": [{"name": "X-Set", "value": "1"}]}},
+            mirror("v2", 80),
+            {"type": "RequestMirror", "requestMirror": {"backendRef": {"name": "api", "port": 80}, "percent": 20}},
+            {"type": "RequestMirror", "requestMirror": {"backendRef": {"name": "headless", "port": 80},
+                "fraction": {"numerator": 1, "denominator": 3}}},
+            {"type": "RequestMirror", "requestMirror": {"backendRef": {"name": "web", "port": 80}, "percent": 0}},
+        ]))
+        .run();
+        let l = locations(&d, "http")[0];
+        let plugins = plugins_of(&d, l);
+        let categories: Vec<&str> = plugins.iter().map(|p| p.category.as_str()).collect();
+        // In filter order; a 0% mirror is left out.
+        assert_eq!(
+            categories,
+            vec!["request_headers", "mirror", "mirror", "mirror"]
+        );
+        let target = |i: usize| plugins[i].fields["target"].as_str().unwrap();
+        let percent = |i: usize| {
+            plugins[i]
+                .fields
+                .get("percentage")
+                .and_then(|v| v.as_integer())
+        };
+        assert_eq!(target(1), "http://v2.ns.svc.cluster.local:80");
+        assert_eq!(percent(1), None);
+        assert_eq!(target(2), "http://api.ns.svc.cluster.local:80");
+        assert_eq!(percent(2), Some(20));
+        // Headless: the pods, on the target port.
+        assert_eq!(target(3), "http://headless.ns.svc.cluster.local:3000");
+        assert_eq!(percent(3), Some(33));
+        assert!(l.upstream.is_some());
+        let r = rkey("ns", "r");
+        assert_eq!(
+            route_cond(&d, &r, "ResolvedRefs"),
+            tf("True", "ResolvedRefs")
+        );
+        assert!(d.referenced.services.contains(&ServiceKey {
+            namespace: "ns".into(),
+            name: "headless".into()
+        }));
+    }
+
+    #[test]
+    fn invalid_mirror_backends_are_left_out_and_reported() {
+        let cases = [
+            (mirror("gone", 80), "BackendNotFound"),
+            (mirror("v2", 81), "BackendNotFound"),
+            (mirror("headless", 81), "BackendNotFound"),
+            (
+                json!({"type": "RequestMirror", "requestMirror": {"backendRef": {"name": "shadow", "namespace": "other", "port": 8080}}}),
+                "RefNotPermitted",
+            ),
+            (
+                json!({"type": "RequestMirror", "requestMirror": {"backendRef": {"group": "example.com", "kind": "Bucket", "name": "b"}}}),
+                "InvalidKind",
+            ),
+        ];
+        for (filter, reason) in cases {
+            let d = mirror_world(json!([filter.clone()])).run();
+            let r = rkey("ns", "r");
+            assert_eq!(
+                route_cond(&d, &r, "Accepted"),
+                tf("True", "Accepted"),
+                "{filter}"
+            );
+            assert_eq!(
+                route_cond(&d, &r, "ResolvedRefs"),
+                tf("False", reason),
+                "{filter}"
+            );
+            let l = locations(&d, "http")[0];
+            assert!(plugins_of(&d, l).is_empty(), "{filter}");
+            assert!(l.upstream.is_some(), "{filter}");
+        }
+
+        // A ReferenceGrant lets the route mirror to another namespace.
+        let mut w = mirror_world(json!([{"type": "RequestMirror", "requestMirror": {
+            "backendRef": {"name": "shadow", "namespace": "other", "port": 8080}}}]));
+        w.grants.push(Arc::new(grant(
+            "other",
+            KIND_HTTP_ROUTE,
+            "ns",
+            KIND_SERVICE,
+            Some("shadow"),
+        )));
+        let d = w.run();
+        let l = locations(&d, "http")[0];
+        let plugins = plugins_of(&d, l);
+        assert_eq!(
+            plugins[0].fields["target"].as_str(),
+            Some("http://shadow.other.svc.cluster.local:8080")
+        );
+        assert_eq!(
+            route_cond(&d, &rkey("ns", "r"), "ResolvedRefs"),
+            tf("True", "ResolvedRefs")
+        );
+    }
+
+    #[test]
+    fn external_name_mirror_backends() {
+        let filters = json!([mirror("legacy", 8080)]);
+        let mut w = mirror_world(filters.clone());
+        w.service(
+            serde_json::from_value(json!({"metadata": {"namespace": "ns", "name": "legacy"},
+            "spec": {"type": "ExternalName", "externalName": "Shadow.Example.com."}}))
+            .unwrap(),
+        );
+        let d = w.run();
+        assert_eq!(
+            route_cond(&d, &rkey("ns", "r"), "ResolvedRefs"),
+            tf("False", "InvalidKind")
+        );
+        w.options.external_name = true;
+        let d = w.run();
+        let l = locations(&d, "http")[0];
+        assert_eq!(
+            plugins_of(&d, l)[0].fields["target"].as_str(),
+            Some("http://shadow.example.com:8080")
+        );
+    }
 
     fn busy_world() -> World {
         let mut w = World::new()

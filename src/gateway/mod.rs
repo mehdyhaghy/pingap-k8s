@@ -4,8 +4,8 @@
 //!
 //! - [`api`]: the generated Gateway API types.
 //! - [`model`]: the types shared by the parts below.
-//! - [`names`], [`translate`], [`tls`]: pure translation of Gateways, routes, Services
-//!   and Secrets into the desired entries and statuses.
+//! - [`names`], [`translate`], [`extended`], [`tls`]: pure translation of Gateways,
+//!   routes, Services and Secrets into the desired entries and statuses.
 //! - [`render`], [`plan`], [`writer`]: TOML of the entries, the ordered etcd steps that
 //!   keep every intermediate state valid for Pingap, and the etcd I/O.
 //! - [`watch`], [`secrets`], [`status`]: the Kubernetes side.
@@ -13,6 +13,7 @@
 
 pub mod api;
 pub mod controller;
+pub mod extended;
 pub mod model;
 pub mod names;
 pub mod plan;
