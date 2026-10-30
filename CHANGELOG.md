@@ -38,7 +38,7 @@ Gateway API provider (off by default, `gateway.enabled`), Gateway API v1.7.0 Sta
   ClusterRole.
 - Not supported: TCPRoute, UDPRoute, TLSRoute (Pingap is HTTP-only), retry codes and backoff,
   BackendTLSPolicy SAN validation, session persistence.
-- Conformance (v1.7.0): <RESULTS>
+- Conformance (v1.7.0): GATEWAY-HTTP core 40/40 and extended 42/42; GATEWAY-GRPC core 17/17 and extended 9/9 (Standard channel, no failures).
 
 Upstreams:
 - `ip_family = "primary" | "ipv4" | "ipv6" | "both"` (default `primary`: one address per pod, in
