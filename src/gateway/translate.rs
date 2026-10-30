@@ -159,7 +159,7 @@ pub const KIND_SECRET: &str = "Secret";
 
 /// The features of the Gateway API conformance suite this provider implements, sorted
 /// as `status.supportedFeatures` must be.
-pub const SUPPORTED_FEATURES: [&str; 29] = [
+pub const SUPPORTED_FEATURES: [&str; 30] = [
     "BackendTLSPolicy",
     "GRPCRoute",
     "GRPCRouteNamedRouteRule",
@@ -172,17 +172,18 @@ pub const SUPPORTED_FEATURES: [&str; 29] = [
     "HTTPRoute307RedirectStatusCode",
     "HTTPRoute308RedirectStatusCode",
     "HTTPRouteBackendProtocolH2C",
+    "HTTPRouteBackendProtocolWebSocket",
     "HTTPRouteBackendTimeout",
     "HTTPRouteHostRewrite",
     "HTTPRouteNamedRouteRule",
     "HTTPRouteParentRefPort",
     "HTTPRoutePathRedirect",
     "HTTPRoutePathRewrite",
-    "HTTPRoutePercentageMirror",
     "HTTPRoutePortRedirect",
     "HTTPRouteQueryParamMatching",
     "HTTPRouteRequestMirror",
     "HTTPRouteRequestMultipleMirrors",
+    "HTTPRouteRequestPercentageMirror",
     "HTTPRouteRequestTimeout",
     "HTTPRouteResponseHeaderModification",
     "HTTPRouteRetryConnectionError",
