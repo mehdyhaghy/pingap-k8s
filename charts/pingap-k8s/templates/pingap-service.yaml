@@ -21,6 +21,13 @@ spec:
   {{- if and (has $svc.type (list "LoadBalancer" "NodePort")) $svc.externalTrafficPolicy }}
   externalTrafficPolicy: {{ $svc.externalTrafficPolicy }}
   {{- end }}
+  {{- with $svc.ipFamilyPolicy }}
+  ipFamilyPolicy: {{ . }}
+  {{- end }}
+  {{- with $svc.ipFamilies }}
+  ipFamilies:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   selector:
     {{- include "pingap-k8s.pingap.selectorLabels" . | nindent 4 }}
   ports:
