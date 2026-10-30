@@ -7,8 +7,10 @@
 #   - the Helm chart (release pingap-k8s, namespace pingap-k8s) with the bundled
 #     etcd and the quickstart Pingap seeded with servers on ports 80, 443
 #     (global_certificates), 8080 and 8090 (tests/conformance/values.yaml), plus
-#     the ClusterIP Service pingap-k8s-gateway with those ports: the address the
-#     controller writes to the Gateways' status.addresses;
+#     the ClusterIP Service pingap-k8s-gateway with those ports: the shared
+#     address the controller writes to the Gateways' status.addresses. The four
+#     server groups of the values (one per base Gateway) bring their own servers
+#     and Services (pingap-k8s-pingap-gw-g1 to -g4);
 #   - the suite (sigs.k8s.io/gateway-api/conformance at $GATEWAY_API_VERSION),
 #     compiled for the node's platform and run in a pod with cluster-admin
 #     rights: the host can not reach pod or ClusterIP addresses on every kind
@@ -26,7 +28,9 @@
 #   CONF_IMAGE         controller image tag to build and load (default pingap-k8s:conformance)
 #   CONF_SKIP_BUILD=1  do not build the controller image (it must exist locally)
 #   CONF_REUSE=1       keep an existing cluster: only reload the image, upgrade the
-#                      chart, restart the controller and run the suite again
+#                      chart, restart etcd (no persistence: the Pingap seed,
+#                      server groups included, is written again), Pingap and the
+#                      controller, and run the suite again
 #   CONF_RUN_TEST      run this one test only (--run-test), e.g. HTTPRouteSimpleSameNamespace
 #   CONF_SKIP_TESTS    comma-separated tests to skip (--skip-tests)
 #   CONF_DELETE=1      delete the cluster at the end
@@ -146,6 +150,7 @@ log "installing the Gateway API $GATEWAY_API_VERSION CRDs"
 kubectl apply --server-side -f "$gateway_crds" >/dev/null
 kubectl wait --for=condition=Established --timeout=60s \
   crd/gatewayclasses.gateway.networking.k8s.io crd/gateways.gateway.networking.k8s.io \
+  crd/listenersets.gateway.networking.k8s.io \
   crd/httproutes.gateway.networking.k8s.io crd/referencegrants.gateway.networking.k8s.io
 
 # --- chart --------------------------------------------------------------------
@@ -180,7 +185,11 @@ spec:
 EOF
 
 if [[ "${CONF_REUSE:-0}" == "1" ]]; then
-  # Same tag, new image: restart to pick it up.
+  # A fresh etcd (no persistence) so Pingap seeds the servers of the current
+  # values again; same controller tag, new image: restart to pick it up.
+  kubectl -n "$NS" rollout restart "statefulset/$RELEASE-etcd" >/dev/null
+  kubectl -n "$NS" rollout status "statefulset/$RELEASE-etcd" --timeout "$TIMEOUT"
+  kubectl -n "$NS" rollout restart "deployment/$RELEASE-pingap" >/dev/null
   kubectl -n "$NS" rollout restart "deployment/$RELEASE" >/dev/null
 fi
 
@@ -210,6 +219,10 @@ suite_args=(
   --url=https://github.com/mehdyhaghy/pingap-k8s
   --version="v$VERSION"
   --contact=https://github.com/mehdyhaghy/pingap-k8s/issues
+  # GatewayStaticAddresses: a Gateway asking for the shared address gets it; any
+  # other address is not usable.
+  --usable-address="$RELEASE-gateway.$NS.svc"
+  --unusable-address=unusable.pingap-k8s.invalid
 )
 if [[ -n "${CONF_RUN_TEST:-}" ]]; then
   suite_args+=(--run-test="$CONF_RUN_TEST")
