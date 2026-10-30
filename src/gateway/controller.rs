@@ -243,6 +243,7 @@ struct Objects {
     classes: Vec<Arc<crate::gateway::api::gatewayclasses::GatewayClass>>,
     gateways: Vec<Arc<crate::gateway::api::gateways::Gateway>>,
     routes: Vec<Arc<crate::gateway::api::httproutes::HttpRoute>>,
+    grpc_routes: Vec<Arc<crate::gateway::api::grpcroutes::GrpcRoute>>,
     listener_sets: Vec<Arc<crate::gateway::api::listenersets::ListenerSet>>,
     grants: Vec<Arc<crate::gateway::api::referencegrants::ReferenceGrant>>,
     policies: Vec<Arc<crate::gateway::api::backendtlspolicies::BackendTlsPolicy>>,
@@ -469,6 +470,7 @@ where
             classes: g.classes(),
             gateways: g.gateways(),
             routes: g.routes(),
+            grpc_routes: g.grpc_routes(),
             listener_sets: g.listener_sets(),
             grants: g.grants(),
             policies: g.backend_tls_policies(),
@@ -491,6 +493,7 @@ where
             classes: &objects.classes,
             gateways: &objects.gateways,
             routes: &objects.routes,
+            grpc_routes: &objects.grpc_routes,
             listener_sets: &objects.listener_sets,
             grants: &objects.grants,
             namespaces: &objects.namespaces,
@@ -544,6 +547,7 @@ where
                 classes: &objects.classes,
                 gateways: &objects.gateways,
                 routes: &objects.routes,
+                grpc_routes: &objects.grpc_routes,
                 listener_sets: &objects.listener_sets,
                 grants: &objects.grants,
                 namespaces: &objects.namespaces,
@@ -715,6 +719,19 @@ where
                 }
             }
         }
+        for route in &objects.grpc_routes {
+            let key = object_key(&route.metadata);
+            let Some(want) = desired.status.grpc_routes.get(&key) else {
+                continue;
+            };
+            match status.publish_grpc_route(route, want).await {
+                Ok(true) => debug!(grpcroute = %key, "GRPCRoute status updated"),
+                Ok(false) => {}
+                Err(err) => {
+                    warn!(grpcroute = %key, "updating the GRPCRoute status failed: {err:#}")
+                }
+            }
+        }
         for policy in &objects.policies {
             let key = object_key(&policy.metadata);
             let Some(want) = desired.status.policies.get(&key) else {
@@ -819,6 +836,7 @@ mod tests {
 
     use crate::gateway::api::gatewayclasses::{GatewayClass, GatewayClassSpec, GatewayClassStatus};
     use crate::gateway::api::gateways::{Gateway, GatewayStatus};
+    use crate::gateway::api::grpcroutes::GrpcRoute;
     use crate::gateway::api::httproutes::{HttpRoute, HttpRouteStatus};
     use crate::gateway::api::listenersets::{ListenerSet, ListenerSetStatus};
     use crate::gateway::api::referencegrants::ReferenceGrant;
@@ -870,6 +888,9 @@ mod tests {
             Vec::new()
         }
         fn routes(&self) -> Vec<Arc<HttpRoute>> {
+            Vec::new()
+        }
+        fn grpc_routes(&self) -> Vec<Arc<GrpcRoute>> {
             Vec::new()
         }
         fn listener_sets(&self) -> Vec<Arc<ListenerSet>> {
@@ -1022,6 +1043,13 @@ mod tests {
         ) -> anyhow::Result<bool> {
             Ok(false)
         }
+        async fn publish_grpc_route(
+            &self,
+            _route: &GrpcRoute,
+            _status: &HttpRouteStatus,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
         async fn publish_backend_tls_policy(
             &self,
             _policy: &BackendTlsPolicy,
@@ -1106,6 +1134,7 @@ mod tests {
             }],
             options: crate::config::Defaults::default().upstream_options(),
             health_check: None,
+            h2c: false,
             tls: None,
         }
     }

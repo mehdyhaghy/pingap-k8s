@@ -108,6 +108,7 @@ fn upstreams(target: UpstreamTarget) -> BTreeMap<String, UpstreamConfig> {
             }],
             options,
             health_check: None,
+            h2c: false,
             tls: None,
         },
     );

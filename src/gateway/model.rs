@@ -12,6 +12,7 @@ use crate::config::{GatewayGroup, UpstreamConfig};
 use crate::gateway::api::backendtlspolicies::{BackendTlsPolicy, BackendTlsPolicyStatus};
 use crate::gateway::api::gatewayclasses::{GatewayClass, GatewayClassStatus};
 use crate::gateway::api::gateways::{Gateway, GatewayStatus};
+use crate::gateway::api::grpcroutes::GrpcRoute;
 use crate::gateway::api::httproutes::{HttpRoute, HttpRouteStatus};
 use crate::gateway::api::listenersets::{ListenerSet, ListenerSetStatus};
 use crate::gateway::api::referencegrants::ReferenceGrant;
@@ -30,7 +31,26 @@ pub fn is_owned(name: &str) -> bool {
     name.starts_with(OWNED_PREFIX)
 }
 
-/// A namespaced object: a Gateway, a ListenerSet, an HTTPRoute or a Secret.
+/// The kind of a route. Every route is translated through the HTTPRoute model; a
+/// GRPCRoute is converted to it first ([`crate::gateway::grpc`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RouteKind {
+    #[default]
+    Http,
+    Grpc,
+}
+
+impl RouteKind {
+    /// The Kubernetes kind: "HTTPRoute" or "GRPCRoute".
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RouteKind::Http => "HTTPRoute",
+            RouteKind::Grpc => "GRPCRoute",
+        }
+    }
+}
+
+/// A namespaced object: a Gateway, a ListenerSet, a route or a Secret.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectKey {
     pub namespace: String,
@@ -79,6 +99,9 @@ pub struct ServerInfo {
     pub ports: BTreeSet<u16>,
     /// `global_certificates = true`: a TLS listener serving the stored certificates by SNI.
     pub tls: bool,
+    /// `enabled_h2 = true`: HTTP/2 by ALPN on a TLS server, h2c with prior knowledge on a
+    /// plain one. GRPCRoutes need it.
+    pub h2: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -109,6 +132,7 @@ pub struct TranslateInput<'a> {
     pub classes: &'a [Arc<GatewayClass>],
     pub gateways: &'a [Arc<Gateway>],
     pub routes: &'a [Arc<HttpRoute>],
+    pub grpc_routes: &'a [Arc<GrpcRoute>],
     pub listener_sets: &'a [Arc<ListenerSet>],
     pub grants: &'a [Arc<ReferenceGrant>],
     /// Every namespace (for `allowedRoutes.namespaces.selector`).
@@ -144,6 +168,7 @@ pub struct Referenced {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocationEntry {
     pub owner: RouteKey,
+    pub owner_kind: RouteKind,
     /// The Pingap server whose `locations` list it is in.
     pub server: String,
     /// One host (exact or `*.` wildcard); `None` matches every host.
@@ -203,6 +228,9 @@ pub struct ExternalUpstream {
     pub addr: String,
     /// Pingap `health_check`, validated.
     pub health_check: Option<String>,
+    /// HTTP/2 (`alpn = "H2"`; h2c without `tls`): a GRPCRoute or `kubernetes.io/h2c`
+    /// backend.
+    pub h2c: bool,
     /// TLS to the backend (BackendTLSPolicy).
     pub tls: Option<UpstreamTls>,
 }
@@ -233,6 +261,9 @@ pub struct DesiredStatus {
     /// Routes with at least one parent of ours: only the `parents` entries with our
     /// `controllerName` are set; entries of other controllers are left as they are.
     pub routes: BTreeMap<RouteKey, HttpRouteStatus>,
+    /// GRPCRoutes, the same way. A GRPCRoute status has the shape of an HTTPRoute status;
+    /// the status writer converts it.
+    pub grpc_routes: BTreeMap<RouteKey, HttpRouteStatus>,
     /// BackendTLSPolicies that apply to backends of our routes, or that hold entries of
     /// ours: only the `ancestors` entries with our `controllerName` are set (none: ours
     /// are removed); entries of other controllers are left as they are.
@@ -346,6 +377,7 @@ pub trait GatewaySource: Send + Sync + 'static {
     fn classes(&self) -> Vec<Arc<GatewayClass>>;
     fn gateways(&self) -> Vec<Arc<Gateway>>;
     fn routes(&self) -> Vec<Arc<HttpRoute>>;
+    fn grpc_routes(&self) -> Vec<Arc<GrpcRoute>>;
     fn listener_sets(&self) -> Vec<Arc<ListenerSet>>;
     fn grants(&self) -> Vec<Arc<ReferenceGrant>>;
     fn backend_tls_policies(&self) -> Vec<Arc<BackendTlsPolicy>>;
@@ -397,6 +429,12 @@ pub trait StatusPublisher: Send + Sync + 'static {
         route: &HttpRoute,
         status: &HttpRouteStatus,
     ) -> impl Future<Output = anyhow::Result<bool>> + Send;
+    /// The same for a GRPCRoute (`status` in the HTTPRoute shape).
+    fn publish_grpc_route(
+        &self,
+        route: &GrpcRoute,
+        status: &HttpRouteStatus,
+    ) -> impl Future<Output = anyhow::Result<bool>> + Send;
     /// `status.ancestors` entries of other controllers are kept.
     fn publish_backend_tls_policy(
         &self,
@@ -415,6 +453,9 @@ impl<T: GatewaySource> GatewaySource for Arc<T> {
     }
     fn routes(&self) -> Vec<Arc<HttpRoute>> {
         (**self).routes()
+    }
+    fn grpc_routes(&self) -> Vec<Arc<GrpcRoute>> {
+        (**self).grpc_routes()
     }
     fn listener_sets(&self) -> Vec<Arc<ListenerSet>> {
         (**self).listener_sets()

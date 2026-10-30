@@ -1,12 +1,12 @@
 //! Gateway API provider: Gateways of the GatewayClasses with our `controllerName`, their
-//! ListenerSets and the HTTPRoutes attached to them, become Pingap locations,
+//! ListenerSets and the HTTPRoutes and GRPCRoutes attached to them, become Pingap locations,
 //! certificates, plugins and upstreams in the same etcd prefix.
 //!
 //! - [`api`]: the generated Gateway API types.
 //! - [`model`]: the types shared by the parts below.
-//! - [`names`], [`translate`], [`extended`], [`backendtls`], [`tls`]: pure translation of
-//!   Gateways, routes, BackendTLSPolicies, Services, Secrets and ConfigMaps into the
-//!   desired entries and statuses.
+//! - [`names`], [`grpc`], [`translate`], [`extended`], [`backendtls`], [`tls`]: pure
+//!   translation of Gateways, routes, BackendTLSPolicies, Services, Secrets and
+//!   ConfigMaps into the desired entries and statuses.
 //! - [`render`], [`plan`], [`writer`]: TOML of the entries, the ordered etcd steps that
 //!   keep every intermediate state valid for Pingap, and the etcd I/O.
 //! - [`watch`], [`secrets`], [`status`]: the Kubernetes side.
@@ -16,6 +16,7 @@ pub mod api;
 pub mod backendtls;
 pub mod controller;
 pub mod extended;
+pub mod grpc;
 pub mod model;
 pub mod names;
 pub mod plan;

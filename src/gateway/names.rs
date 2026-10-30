@@ -1,4 +1,4 @@
-//! Names of the Pingap entries generated for Gateways and HTTPRoutes.
+//! Names of the Pingap entries generated for Gateways, HTTPRoutes and GRPCRoutes.
 //!
 //! Every name is `k8s-` + readable parts (`[a-z0-9-]`, `.` and anything else become `-`,
 //! each part capped in length) + a stable 8-hex FNV-1a hash over the full, unambiguous
@@ -8,7 +8,7 @@
 
 use crate::types::{PortRef, ServiceRef, UpstreamTls};
 
-use super::model::{BackendKind, OWNED_PREFIX, RouteKey, SecretKey};
+use super::model::{BackendKind, OWNED_PREFIX, RouteKey, RouteKind, SecretKey};
 
 /// Longest readable part kept in a name. Kubernetes names go up to 253 characters; the
 /// hash keeps truncated names unique.
@@ -115,11 +115,44 @@ pub fn tls_upstream_name(name: &str, tls: &UpstreamTls) -> String {
     out
 }
 
-/// The location of one route match on one Pingap server and host:
+/// The HTTP/2 cleartext variant of a generated upstream name (from [`upstream_name`] or
+/// [`split_upstream_name`]): `k8s-<readable>-h2c-<h8>`, hashed over the HTTP/1.1 name, so
+/// a Service used both ways gets two entries, each with its own `alpn`.
+pub fn h2c_upstream_name(name: &str) -> String {
+    let readable = name
+        .strip_prefix(OWNED_PREFIX)
+        .and_then(|rest| rest.rsplit_once('-'))
+        .map_or("x", |(readable, _)| readable);
+    format!("{OWNED_PREFIX}{readable}-h2c-{}", fnv1a(&["h2c", name]))
+}
+
+/// The location of one HTTPRoute match on one Pingap server and host:
 /// `k8s-<ns>-<route>-<h8>`. The hash covers the server, the host and the match as Pingap
 /// sees it (path, header and query conditions), not the rule's position, so reordering
 /// rules keeps names.
 pub fn location_name(
+    route: &RouteKey,
+    server: &str,
+    host: Option<&str>,
+    path: &str,
+    match_headers: &[String],
+    match_query: &[String],
+) -> String {
+    route_location_name(
+        RouteKind::Http,
+        route,
+        server,
+        host,
+        path,
+        match_headers,
+        match_query,
+    )
+}
+
+/// [`location_name`] for a route of any kind: the kind is part of the hash for
+/// GRPCRoutes, so an HTTPRoute and a GRPCRoute with the same name never share a location.
+pub fn route_location_name(
+    kind: RouteKind,
     route: &RouteKey,
     server: &str,
     host: Option<&str>,
@@ -134,7 +167,10 @@ pub fn location_name(
     let headers = match_headers.len().to_string();
     let query = match_query.len().to_string();
     let mut identity = vec![
-        "location",
+        match kind {
+            RouteKind::Http => "location",
+            RouteKind::Grpc => "grpc-location",
+        },
         &route.namespace,
         &route.name,
         server,
@@ -376,6 +412,36 @@ mod tests {
             loc(&route("ns", "a.b"), None, ""),
             loc(&route("ns", "a-b"), None, "")
         );
+    }
+
+    #[test]
+    fn h2c_upstream_and_grpc_location_names() {
+        let port = PortRef::Number(8080);
+        let h1 = upstream_name("ns", "grpc", &port, BackendKind::Pods, None);
+        let h2 = h2c_upstream_name(&h1);
+        assert!(h2.starts_with("k8s-ns-grpc-8080-h2c-"), "{h2}");
+        assert_eq!(h2.len(), "k8s-ns-grpc-8080-h2c-".len() + 8);
+        assert!(valid(&h2), "{h2}");
+        assert_ne!(h1, h2);
+        assert_eq!(h2, h2c_upstream_name(&h1));
+        let svc = upstream_name("ns", "grpc", &port, BackendKind::Service, None);
+        assert_ne!(h2c_upstream_name(&svc), h2);
+        let split = split_upstream_name(
+            &[sref("ns", "a", 80, 1), sref("ns", "b", 80, 1)],
+            BackendKind::Pods,
+            None,
+        );
+        assert!(
+            h2c_upstream_name(&split).starts_with("k8s-ns-a-split-h2c-"),
+            "{split}"
+        );
+
+        let key = route("ns", "r");
+        let http = route_location_name(RouteKind::Http, &key, "http", None, "=/a/b", &[], &[]);
+        assert_eq!(http, location_name(&key, "http", None, "=/a/b", &[], &[]));
+        let grpc = route_location_name(RouteKind::Grpc, &key, "http", None, "=/a/b", &[], &[]);
+        assert_ne!(http, grpc);
+        assert!(grpc.starts_with("k8s-ns-r-"), "{grpc}");
     }
 
     #[test]

@@ -1,5 +1,20 @@
-//! Gateways, ListenerSets and HTTPRoutes into the Pingap entries they want and the
-//! statuses they get (pure, no I/O).
+//! Gateways, ListenerSets, HTTPRoutes and GRPCRoutes into the Pingap entries they want
+//! and the statuses they get (pure, no I/O).
+//!
+//! **GRPCRoutes** are converted to HTTPRoutes first ([`grpc`]: a method match is a path
+//! match on `/<service>/<method>`) and translated like them, ordered together by age.
+//! Their backends become HTTP/2 upstreams (`alpn = "H2"`: h2c, or ALPN h2 with a
+//! BackendTLSPolicy; with their own names, so a Service used by both kinds gets two
+//! entries). Their invalid backends get 503 (`UNAVAILABLE` for gRPC clients) where
+//! HTTPRoutes get 500. A listener takes GRPCRoutes when every Pingap server it is
+//! programmed on sets `enabled_h2` (HTTP/2 by ALPN on TLS, h2c with prior knowledge on
+//! plain text); otherwise GRPCRoute is left out of its `supportedKinds` (and is an
+//! invalid route kind when listed in `allowedRoutes.kinds`).
+//! An HTTPRoute and a GRPCRoute attached to the same listener with intersecting
+//! hostnames are never mixed: the older one is accepted there, the newer one gets
+//! `Accepted: False` (`NotAllowedByListeners`), as `GRPCRouteSpec.hostnames` allows.
+//! HTTPRoute backends whose Service port has the `appProtocol` `kubernetes.io/h2c` (or
+//! `grpc`) also get an h2c upstream.
 //!
 //! **Servers.** Pingap servers cannot be created without a restart, so a listener is
 //! programmed on the stored servers of its Gateway's server group whose ports contain
@@ -121,10 +136,11 @@ use super::api::listenersets::{
 use super::api::referencegrants::ReferenceGrant;
 use super::backendtls::{BackendTlsPolicies, PortTls, Target, referenced_config_maps};
 use super::extended;
+use super::grpc;
 use super::model::{
     BackendKind, CertificateEntry, Desired, ExternalUpstream, GATEWAY_GROUP, GatewayKey,
     ListenerSetKey, LocationEntry, LocationOptions, ObjectKey, PluginEntry, Referenced, RouteKey,
-    SecretKey, ServerInfo, TranslateInput, TranslateOptions,
+    RouteKind, SecretKey, ServerInfo, TranslateInput, TranslateOptions,
 };
 use super::names;
 use super::tls;
@@ -137,13 +153,17 @@ pub const WEIGHT_FLOOR: u16 = 2048;
 pub const KIND_GATEWAY: &str = "Gateway";
 pub const KIND_LISTENER_SET: &str = "ListenerSet";
 pub const KIND_HTTP_ROUTE: &str = "HTTPRoute";
+pub const KIND_GRPC_ROUTE: &str = "GRPCRoute";
 pub const KIND_SERVICE: &str = "Service";
 pub const KIND_SECRET: &str = "Secret";
 
 /// The features of the Gateway API conformance suite this provider implements, sorted
 /// as `status.supportedFeatures` must be.
-pub const SUPPORTED_FEATURES: [&str; 25] = [
+pub const SUPPORTED_FEATURES: [&str; 29] = [
     "BackendTLSPolicy",
+    "GRPCRoute",
+    "GRPCRouteNamedRouteRule",
+    "GRPCRouteRequestHeaderModifier",
     "Gateway",
     "GatewayBackendClientCertificate",
     "GatewayStaticAddresses",
@@ -151,6 +171,7 @@ pub const SUPPORTED_FEATURES: [&str; 25] = [
     "HTTPRoute303RedirectStatusCode",
     "HTTPRoute307RedirectStatusCode",
     "HTTPRoute308RedirectStatusCode",
+    "HTTPRouteBackendProtocolH2C",
     "HTTPRouteBackendTimeout",
     "HTTPRouteHostRewrite",
     "HTTPRouteNamedRouteRule",
@@ -264,7 +285,12 @@ pub fn referenced(input: &TranslateInput<'_>) -> Referenced {
             add_secrets(&mut out.secrets, &namespace, &gateway_listener(listener));
         }
     }
-    for route in input.routes.iter() {
+    let converted: Vec<HttpRoute> = input
+        .grpc_routes
+        .iter()
+        .map(|r| grpc::to_http_route(r).route)
+        .collect();
+    for route in input.routes.iter().map(Arc::as_ref).chain(&converted) {
         let namespace = route.metadata.namespace.clone().unwrap_or_default();
         let ours = parent_refs(route)
             .iter()
@@ -452,8 +478,23 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
     }
 
     // ---- Routes ----
-    let mut routes: Vec<&Arc<HttpRoute>> = input.routes.iter().collect();
-    routes.sort_by_cached_key(|r| age_key(&r.metadata));
+    // HTTPRoutes and GRPCRoutes (converted) in one list, oldest first.
+    let converted: Vec<grpc::Converted> = input
+        .grpc_routes
+        .iter()
+        .map(|r| grpc::to_http_route(r))
+        .collect();
+    let mut routes: Vec<(RouteKind, &HttpRoute, &[Option<String>])> = input
+        .routes
+        .iter()
+        .map(|r| (RouteKind::Http, r.as_ref(), &[][..]))
+        .chain(
+            converted
+                .iter()
+                .map(|c| (RouteKind::Grpc, &c.route, c.rule_errors.as_slice())),
+        )
+        .collect();
+    routes.sort_by_cached_key(|(kind, r, _)| (age_key(&r.metadata), *kind));
 
     // Upstream name -> what it is, for every location that has one.
     let mut upstreams: BTreeMap<String, UpstreamKind> = BTreeMap::new();
@@ -461,9 +502,10 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
     let mut policy_uses: BTreeMap<Target, BTreeSet<GatewayKey>> = BTreeMap::new();
     // Server -> location candidates, before weights.
     let mut candidates: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
-    for (age, route) in routes.iter().enumerate() {
+    for (age, &(kind, route, rule_errors)) in routes.iter().enumerate() {
         let key = object_key(&route.metadata);
         let generation = route.metadata.generation;
+        let hostnames = route_hostnames(route);
         let mut parents: Vec<(HttpRouteStatusParentsParentRef, Attached)> = Vec::new();
         for parent in parent_refs(route) {
             let outcome = match parent_target(parent, &key.namespace) {
@@ -471,7 +513,14 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
                     let Some(&gi) = gateway_index.get(&gw_key) else {
                         continue;
                     };
-                    attach(input, route, parent, &gateway_listeners[gi], &listeners)
+                    attach(
+                        input,
+                        route,
+                        kind,
+                        parent,
+                        &gateway_listeners[gi],
+                        &listeners,
+                    )
                 }
                 Some(ParentTarget::ListenerSet(set_key)) => {
                     let Some(&si) = set_index.get(&set_key) else {
@@ -479,7 +528,7 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
                     };
                     match &set_states[si] {
                         SetState::Evaluated { indices, valid } if *valid > 0 => {
-                            attach(input, route, parent, indices, &listeners)
+                            attach(input, route, kind, parent, indices, &listeners)
                         }
                         _ => Err((
                             "NotAllowedByListeners",
@@ -489,6 +538,7 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
                 }
                 None => continue,
             };
+            let outcome = exclude_other_kind(outcome, kind, &hostnames, &listeners);
             parents.push((status_parent_ref(parent), outcome));
         }
         if parents.is_empty() {
@@ -501,7 +551,10 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
             .iter()
             .flatten()
             .enumerate()
-            .map(|(i, rule)| compile_rule(input, &policies, &key, i, rule))
+            .map(|(i, rule)| match rule_errors.get(i).cloned().flatten() {
+                Some(error) => Err(error),
+                None => compile_rule(input, &policies, kind, &key, i, rule),
+            })
             .collect();
         let mut issues: Vec<(&'static str, String)> = Vec::new();
         for rule in compiled.iter().flatten() {
@@ -510,7 +563,7 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
         // A rule that is dropped still has its backends reported.
         for (i, rule) in route.spec.rules.iter().flatten().enumerate() {
             if compiled[i].is_err() {
-                issues.extend(resolve_backends(input, &policies, &key, rule).issues);
+                issues.extend(resolve_backends(input, &policies, kind, &key, rule).issues);
             }
         }
         let dropped: Vec<String> = compiled
@@ -579,7 +632,11 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
                 parent_ref: parent_ref.clone(),
             });
         }
-        desired.status.routes.insert(
+        let statuses = match kind {
+            RouteKind::Http => &mut desired.status.routes,
+            RouteKind::Grpc => &mut desired.status.grpc_routes,
+        };
+        statuses.insert(
             key.clone(),
             HttpRouteStatus {
                 parents: status_parents,
@@ -589,11 +646,13 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
             continue;
         }
 
-        let hostnames = route_hostnames(route);
         for (_, outcome) in &parents {
             let Ok(attachments) = outcome else { continue };
             for attachment in attachments {
-                listeners[attachment.listener].attached.insert(key.clone());
+                let listener = &mut listeners[attachment.listener];
+                let hosts = intersect_hostnames(listener.hostname.as_deref(), &hostnames);
+                listener.attached.insert((kind, key.clone()));
+                listener.served.push((kind, key.clone(), hosts.clone()));
                 let listener = &listeners[attachment.listener];
                 for rule in compiled.iter().flatten() {
                     for target in &rule.tls_targets {
@@ -610,7 +669,6 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
                     .get(&listener.owner.gateway)
                     .and_then(|c| c.as_ref().ok())
                     .and_then(Option::as_ref);
-                let hosts = intersect_hostnames(listener.hostname.as_deref(), &hostnames);
                 for rule in compiled.iter().flatten() {
                     let upstream = rule
                         .upstream
@@ -620,6 +678,7 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
                         for host in &hosts {
                             for m in &rule.matches {
                                 let mut candidate = build_location(
+                                    kind,
                                     &key,
                                     age,
                                     rule,
@@ -1223,7 +1282,9 @@ struct Listener<'a> {
     resolved: Result<(), (&'static str, String)>,
     /// The usable certificates: Secret, `tls.crt`, `tls.key`.
     certs: Vec<(SecretKey, String, String)>,
-    attached: BTreeSet<RouteKey>,
+    attached: BTreeSet<(RouteKind, RouteKey)>,
+    /// The accepted routes attached so far (oldest first) and their hosts here.
+    served: Vec<(RouteKind, RouteKey, Vec<Option<String>>)>,
 }
 
 impl Listener<'_> {
@@ -1247,6 +1308,11 @@ impl Listener<'_> {
     /// conflicted.
     fn claims_port(&self) -> bool {
         self.supported_protocol && self.accepted.is_ok() && self.conflicted.is_none()
+    }
+
+    /// Routes of `kind` may attach to it.
+    fn allows(&self, kind: RouteKind) -> bool {
+        self.supported_kinds.iter().any(|k| k.kind == kind.as_str())
     }
 }
 
@@ -1280,6 +1346,7 @@ fn evaluate_listener<'a>(
         resolved: Ok(()),
         certs: Vec::new(),
         attached: BTreeSet::new(),
+        served: Vec::new(),
     };
     if !supported_protocol {
         listener.accepted = Err((
@@ -1304,27 +1371,62 @@ fn evaluate_listener<'a>(
         return listener;
     }
 
-    // Route kinds.
+    // Route kinds. GRPCRoutes need HTTP/2 from the client: every server the listener
+    // is programmed on must set `enabled_h2`.
+    let port = u16::try_from(spec.port)
+        .ok()
+        .map(|p| place.and_then(|pl| pl.ports?.get(&p).copied()).unwrap_or(p));
+    let matching: Vec<&ServerInfo> = place
+        .map(|pl| pl.servers.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .copied()
+        .filter(|s| port.is_some_and(|p| s.ports.contains(&p)) && s.tls == tls)
+        .collect();
+    let without_h2: Vec<&str> = matching
+        .iter()
+        .filter(|s| !s.h2)
+        .map(|s| s.name.as_str())
+        .collect();
     let kinds = spec.allowed_routes.as_ref().and_then(|a| a.kinds.as_ref());
     match kinds.filter(|k| !k.is_empty()) {
-        None => listener.supported_kinds.push(http_route_kind()),
+        None => {
+            listener.supported_kinds.push(route_kind(KIND_HTTP_ROUTE));
+            if without_h2.is_empty() {
+                listener.supported_kinds.push(route_kind(KIND_GRPC_ROUTE));
+            }
+        }
         Some(kinds) => {
             let mut invalid = Vec::new();
+            let mut no_h2 = false;
             for kind in kinds {
                 let group = kind.group.as_deref().unwrap_or(GATEWAY_GROUP);
-                if group == GATEWAY_GROUP && kind.kind == KIND_HTTP_ROUTE {
-                    if listener.supported_kinds.is_empty() {
-                        listener.supported_kinds.push(http_route_kind());
-                    }
-                } else {
+                let known = group == GATEWAY_GROUP
+                    && (kind.kind == KIND_HTTP_ROUTE || kind.kind == KIND_GRPC_ROUTE);
+                if !known {
                     invalid.push(format!("{group}/{}", kind.kind));
+                } else if kind.kind == KIND_GRPC_ROUTE && !without_h2.is_empty() {
+                    no_h2 = true;
+                } else if !listener.supported_kinds.iter().any(|k| k.kind == kind.kind) {
+                    listener.supported_kinds.push(route_kind(&kind.kind));
                 }
             }
+            let mut problems = Vec::new();
             if !invalid.is_empty() {
-                listener.resolved = Err((
-                    "InvalidRouteKinds",
-                    format!("route kinds {} are not supported", invalid.join(", ")),
+                problems.push(format!(
+                    "route kinds {} are not supported",
+                    invalid.join(", ")
                 ));
+            }
+            if no_h2 {
+                problems.push(format!(
+                    "GRPCRoutes need HTTP/2, which the Pingap server(s) {} do not enable \
+                     (enabled_h2)",
+                    without_h2.join(", ")
+                ));
+            }
+            if !problems.is_empty() {
+                listener.resolved = Err(("InvalidRouteKinds", problems.join("; ")));
             }
         }
     }
@@ -1336,16 +1438,7 @@ fn evaluate_listener<'a>(
         return listener;
     }
 
-    let port = u16::try_from(spec.port)
-        .ok()
-        .map(|p| place.and_then(|pl| pl.ports?.get(&p).copied()).unwrap_or(p));
-    listener.servers = place
-        .map(|pl| pl.servers.as_slice())
-        .unwrap_or_default()
-        .iter()
-        .filter(|s| port.is_some_and(|p| s.ports.contains(&p)) && s.tls == tls)
-        .map(|s| s.name.clone())
-        .collect();
+    listener.servers = matching.iter().map(|s| s.name.clone()).collect();
     if place.is_some() && listener.servers.is_empty() {
         listener.accepted = Err((
             "PortUnavailable",
@@ -1450,10 +1543,10 @@ fn evaluate_listener<'a>(
     listener
 }
 
-fn http_route_kind() -> GatewayStatusListenersSupportedKinds {
+fn route_kind(kind: &str) -> GatewayStatusListenersSupportedKinds {
     GatewayStatusListenersSupportedKinds {
         group: Some(GATEWAY_GROUP.into()),
-        kind: KIND_HTTP_ROUTE.into(),
+        kind: kind.into(),
     }
 }
 
@@ -1901,6 +1994,7 @@ fn status_parent_ref(parent: &HttpRouteParentRefs) -> HttpRouteStatusParentsPare
 fn attach(
     input: &TranslateInput<'_>,
     route: &HttpRoute,
+    kind: RouteKind,
     parent: &HttpRouteParentRefs,
     indices: &[usize],
     listeners: &[Listener<'_>],
@@ -1924,7 +2018,9 @@ fn attach(
     let allowed: Vec<usize> = selected
         .into_iter()
         .filter(|&i| {
-            listeners[i].attachable() && namespace_allowed(input, &listeners[i], &namespace)
+            listeners[i].attachable()
+                && listeners[i].allows(kind)
+                && namespace_allowed(input, &listeners[i], &namespace)
         })
         .collect();
     if allowed.is_empty() {
@@ -1946,6 +2042,65 @@ fn attach(
         ));
     }
     Ok(attached)
+}
+
+/// Drops the attachments to listeners that already serve an accepted route of the other
+/// kind on an intersecting hostname. `GRPCRouteSpec.hostnames` lets an implementation
+/// reject one of an HTTPRoute and a GRPCRoute that share a listener and a hostname, and
+/// then it must keep the older one (then the first by `namespace/name`); routes are
+/// translated in that order, so the routes already served win. Requests of the two
+/// kinds are never mixed on one host of a listener.
+fn exclude_other_kind(
+    outcome: Attached,
+    kind: RouteKind,
+    hostnames: &[String],
+    listeners: &[Listener<'_>],
+) -> Attached {
+    let attachments = outcome?;
+    let mut conflict = None;
+    let kept: Vec<Attachment> = attachments
+        .into_iter()
+        .filter(|a| {
+            let listener = &listeners[a.listener];
+            let hosts = intersect_hostnames(listener.hostname.as_deref(), hostnames);
+            let other = listener
+                .served
+                .iter()
+                .find(|(k, _, served)| *k != kind && hosts_overlap(&hosts, served));
+            match other {
+                None => true,
+                Some((k, key, _)) => {
+                    conflict.get_or_insert_with(|| {
+                        format!(
+                            "listener {} already serves {} {key} on an intersecting hostname",
+                            listener.spec.name,
+                            k.as_str()
+                        )
+                    });
+                    false
+                }
+            }
+        })
+        .collect();
+    match conflict {
+        Some(message) if kept.is_empty() => Err(("NotAllowedByListeners", message)),
+        _ => Ok(kept),
+    }
+}
+
+/// Whether two host lists (`None` is every host) have a host in common.
+fn hosts_overlap(a: &[Option<String>], b: &[Option<String>]) -> bool {
+    let covers = |wildcard: &str, host: &str| {
+        wildcard
+            .strip_prefix('*')
+            .is_some_and(|suffix| host.len() > suffix.len() && host.ends_with(suffix))
+    };
+    a.iter().any(|x| {
+        b.iter().any(|y| match (x, y) {
+            (None, _) | (_, None) => true,
+            (Some(x), Some(y)) => x == y || covers(x, y) || covers(y, x),
+        })
+    })
 }
 
 fn namespace_allowed(input: &TranslateInput<'_>, listener: &Listener<'_>, namespace: &str) -> bool {
@@ -2137,6 +2292,7 @@ struct Rule {
 fn compile_rule(
     input: &TranslateInput<'_>,
     policies: &BackendTlsPolicies<'_>,
+    kind: RouteKind,
     route: &RouteKey,
     index: usize,
     rule: &HttpRouteRules,
@@ -2264,7 +2420,7 @@ fn compile_rule(
         return Err("filters on backendRefs are not supported".into());
     }
 
-    let mut backends = resolve_backends(input, policies, route, rule);
+    let mut backends = resolve_backends(input, policies, kind, route, rule);
     backends.issues.extend(mirror_issues);
     Ok(Rule {
         index,
@@ -2582,6 +2738,13 @@ pub(super) fn plugin(category: &str, fields: toml::Table) -> (String, PluginEntr
 
 /// The `mock` plugin that answers 500 for `percent` percent of the requests.
 fn mock_500(percent: u8) -> (String, PluginEntry) {
+    mock_status(percent, 500)
+}
+
+/// The `mock` plugin that answers `status` for `percent` percent of the requests. For
+/// GRPCRoutes it is 503, which gRPC clients report as `UNAVAILABLE`, the status
+/// `GRPCRouteRule.backendRefs` asks for invalid backends.
+fn mock_status(percent: u8, status: i64) -> (String, PluginEntry) {
     let mut fields = toml::Table::new();
     if percent < 100 {
         fields.insert(
@@ -2589,7 +2752,7 @@ fn mock_500(percent: u8) -> (String, PluginEntry) {
             toml::Value::Integer(i64::from(percent)),
         );
     }
-    fields.insert("status".into(), toml::Value::Integer(500));
+    fields.insert("status".into(), toml::Value::Integer(status));
     plugin("mock", fields)
 }
 
@@ -2616,18 +2779,33 @@ fn backend_tls(
 
 /// Resolves the backendRefs of a rule into an upstream, the share of the requests that
 /// get a 500 and the problems for `ResolvedRefs`.
+///
+/// The upstream speaks HTTP/1.1, or HTTP/2 with prior knowledge (h2c, Pingap `alpn =
+/// "H2"`) for a GRPCRoute (whatever the `appProtocol`, unless it names HTTP/1.1) and for
+/// HTTPRoute backends whose Service port has an `appProtocol` of
+/// [`H2C_APP_PROTOCOLS`](crate::resolve::H2C_APP_PROTOCOLS).
+/// One upstream has one protocol: an HTTPRoute backend that does not speak the protocol
+/// of the first valid backend of the rule is invalid (`UnsupportedProtocol`).
 fn resolve_backends(
     input: &TranslateInput<'_>,
     policies: &BackendTlsPolicies<'_>,
+    route_kind: RouteKind,
     route: &RouteKey,
     rule: &HttpRouteRules,
 ) -> Backends {
     let options = input.options;
     let mut out = Backends::default();
     let refs = rule.backend_refs.as_deref().unwrap_or_default();
-    // (Service key, port number, weight, external host, TLS).
+    // (Service key, port number, weight, external host, (TLS, HTTP/2)).
     #[allow(clippy::type_complexity)]
-    let mut valid: Vec<(ServiceKey, i32, u32, Option<String>, Option<UpstreamTls>)> = Vec::new();
+    let mut valid: Vec<(
+        ServiceKey,
+        i32,
+        u32,
+        Option<String>,
+        (Option<UpstreamTls>, bool),
+    )> = Vec::new();
+    let grpc = route_kind == RouteKind::Grpc;
     let mut total: u64 = 0;
     let mut invalid: u64 = 0;
     for b in refs {
@@ -2661,7 +2839,7 @@ fn resolve_backends(
                 && !granted(
                     input.grants,
                     &route.namespace,
-                    KIND_HTTP_ROUTE,
+                    route_kind.as_str(),
                     &namespace,
                     KIND_SERVICE,
                     &b.name,
@@ -2714,7 +2892,13 @@ fn resolve_backends(
                 });
                 let tls =
                     backend_tls(policies, &key, &named, &mut out.tls_targets).map_err(|_| None)?;
-                valid.push((key.clone(), port, weight, Some(host.to_string()), tls));
+                valid.push((
+                    key.clone(),
+                    port,
+                    weight,
+                    Some(host.to_string()),
+                    (tls, grpc),
+                ));
                 return Ok(());
             }
             let Some(service_port) = service_port(service, port) else {
@@ -2724,9 +2908,11 @@ fn resolve_backends(
                 )));
             };
             let tls = backend_tls(policies, &key, service_port, &mut out.tls_targets);
+            let mut h2 = grpc;
             if let Some(protocol) = service_port.app_protocol.as_deref() {
                 let lower = protocol.to_ascii_lowercase();
                 let tls_protocol = TLS_APP_PROTOCOLS.contains(&lower.as_str());
+                let h2c_protocol = crate::resolve::is_h2c_app_protocol(&lower);
                 if tls_protocol && matches!(tls, Ok(None)) {
                     return Err(Some((
                         "UnsupportedProtocol",
@@ -2735,7 +2921,16 @@ fn resolve_backends(
                         ),
                     )));
                 }
-                if !tls_protocol && !APP_PROTOCOLS.contains(&lower.as_str()) {
+                if grpc && APP_PROTOCOLS.contains(&lower.as_str()) {
+                    return Err(Some((
+                        "UnsupportedProtocol",
+                        format!(
+                            "appProtocol {protocol} of Service {key} port {port} is not \
+                             supported for a GRPCRoute, which needs HTTP/2"
+                        ),
+                    )));
+                }
+                if !tls_protocol && !h2c_protocol && !APP_PROTOCOLS.contains(&lower.as_str()) {
                     return Err(Some((
                         "UnsupportedProtocol",
                         format!(
@@ -2743,9 +2938,10 @@ fn resolve_backends(
                         ),
                     )));
                 }
+                h2 = h2 || h2c_protocol;
             }
             let tls = tls.map_err(|_| None)?;
-            valid.push((key.clone(), port, weight, None, tls));
+            valid.push((key.clone(), port, weight, None, (tls, h2)));
             Ok(())
         })();
         if let Err(problem) = checked {
@@ -2768,9 +2964,9 @@ fn resolve_backends(
         }
         valid.retain(|v| v.3.is_none());
     }
-    // The backends of a rule share one upstream, so one TLS setting: the one with the most
-    // weight (the first on a tie) is kept.
-    let mut settings: Vec<(&Option<UpstreamTls>, u64)> = Vec::new();
+    // The backends of a rule share one upstream, so one protocol (HTTP/1.1 or HTTP/2) and
+    // one TLS setting: the pair with the most weight (the first on a tie) is kept.
+    let mut settings: Vec<(&(Option<UpstreamTls>, bool), u64)> = Vec::new();
     for v in &valid {
         match settings.iter_mut().find(|(tls, _)| *tls == &v.4) {
             Some((_, w)) => *w += u64::from(v.2),
@@ -2788,8 +2984,9 @@ fn resolve_backends(
             out.issues.push((
                 "UnsupportedProtocol",
                 format!(
-                    "Service {} port {} needs other TLS settings (BackendTLSPolicy) than the \
-                     other backends of the rule, which share one upstream",
+                    "Service {} port {} needs another protocol (HTTP/1.1 or HTTP/2) or other \
+                     TLS settings (BackendTLSPolicy) than the other backends of the rule, \
+                     which share one upstream",
                     v.0, v.1
                 ),
             ));
@@ -2813,15 +3010,22 @@ fn resolve_backends(
         UpstreamTarget::Service { .. } => BackendKind::Service,
     };
     let health_check = options.health_check.as_deref();
-    let tls = valid[0].4.clone();
+    let (tls, h2c) = valid[0].4.clone();
+    let protocol_name = |name: String| {
+        if h2c {
+            names::h2c_upstream_name(&name)
+        } else {
+            name
+        }
+    };
     if let [(key, port, _, Some(host), _)] = valid.as_slice() {
-        let name = names::upstream_name(
+        let name = protocol_name(names::upstream_name(
             &key.namespace,
             &key.name,
             &PortRef::Number(*port),
             BackendKind::External,
             health_check,
-        );
+        ));
         let addr = if host.parse::<Ipv6Addr>().is_ok() {
             format!("[{host}]:{port}")
         } else {
@@ -2833,6 +3037,7 @@ fn resolve_backends(
                 service: key.clone(),
                 addr,
                 health_check: health_check.map(String::from),
+                h2c,
                 tls,
             }),
         ));
@@ -2871,11 +3076,12 @@ fn resolve_backends(
         )
     };
     out.upstream = Some((
-        name,
+        protocol_name(name),
         UpstreamKind::Generated(UpstreamConfig {
             services,
             options: upstream_options,
             health_check: health_check.map(String::from),
+            h2c,
             tls,
         }),
     ));
@@ -2935,6 +3141,10 @@ struct Candidate {
 struct Order {
     exact_host_len: std::cmp::Reverse<usize>,
     host_len: std::cmp::Reverse<usize>,
+    /// A GRPCRoute match without method match: after every method match (zero characters
+    /// of service and method), where an HTTPRoute `PathPrefix /` goes before regular
+    /// expressions.
+    any_method: bool,
     path_kind: std::cmp::Reverse<PathKind>,
     path_len: std::cmp::Reverse<usize>,
     headers: std::cmp::Reverse<usize>,
@@ -2945,7 +3155,9 @@ struct Order {
     match_index: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_location(
+    kind: RouteKind,
     route: &RouteKey,
     age: usize,
     rule: &Rule,
@@ -2954,14 +3166,25 @@ fn build_location(
     host: Option<&str>,
     listener: &Listener<'_>,
 ) -> Candidate {
-    let name = names::location_name(route, server, host, &m.pingap_path, &m.headers, &m.query);
+    let name = names::route_location_name(
+        kind,
+        route,
+        server,
+        host,
+        &m.pingap_path,
+        &m.headers,
+        &m.query,
+    );
     let mut plugins = rule.plugins.clone();
     let mut upstream = None;
     if let Some(redirect) = &rule.redirect {
         plugins.push(redirect_plugin(redirect, listener, host, m));
     } else {
         if rule.invalid_percent > 0 {
-            plugins.push(mock_500(rule.invalid_percent));
+            plugins.push(match kind {
+                RouteKind::Http => mock_500(rule.invalid_percent),
+                RouteKind::Grpc => mock_status(rule.invalid_percent, 503),
+            });
         }
         if rule.invalid_percent < 100 {
             upstream = rule.upstream.as_ref().map(|(n, _)| n.clone());
@@ -2988,6 +3211,7 @@ fn build_location(
     Candidate {
         entry: LocationEntry {
             owner: route.clone(),
+            owner_kind: kind,
             server: server.to_string(),
             host: host.map(String::from),
             path: m.pingap_path.clone(),
@@ -3009,6 +3233,7 @@ fn build_location(
         order: Order {
             exact_host_len: std::cmp::Reverse(exact_host_len),
             host_len: std::cmp::Reverse(host_len),
+            any_method: kind == RouteKind::Grpc && m.pingap_path.is_empty(),
             path_kind: std::cmp::Reverse(m.kind),
             path_len: std::cmp::Reverse(path_len),
             headers: std::cmp::Reverse(m.headers.len()),
@@ -3177,6 +3402,8 @@ mod tests {
     use super::*;
     use crate::config::GatewayGroup;
     use crate::gateway::api::gateways::GatewayListenersAllowedRoutesNamespacesSelector;
+    use crate::gateway::api::grpcroutes::GrpcRoute;
+    use crate::gateway::model::TranslateOptions;
     use crate::gateway::tls::tests::{cert_pem, key_pem, tls_secret};
     use crate::types::UpstreamOptions;
 
@@ -3209,6 +3436,7 @@ mod tests {
             name: name.into(),
             ports: ports.iter().copied().collect(),
             tls,
+            h2: false,
         }
     }
 
@@ -3317,6 +3545,7 @@ mod tests {
         classes: Vec<Arc<GatewayClass>>,
         gateways: Vec<Arc<Gateway>>,
         routes: Vec<Arc<HttpRoute>>,
+        grpc_routes: Vec<Arc<GrpcRoute>>,
         listener_sets: Vec<Arc<ListenerSet>>,
         grants: Vec<Arc<ReferenceGrant>>,
         namespaces: BTreeMap<String, Arc<Namespace>>,
@@ -3340,6 +3569,7 @@ mod tests {
                 ],
                 gateways: Vec::new(),
                 routes: Vec::new(),
+                grpc_routes: Vec::new(),
                 listener_sets: Vec::new(),
                 grants: Vec::new(),
                 namespaces: BTreeMap::new(),
@@ -3401,6 +3631,7 @@ mod tests {
                 classes: &self.classes,
                 gateways: &self.gateways,
                 routes: &self.routes,
+                grpc_routes: &self.grpc_routes,
                 listener_sets: &self.listener_sets,
                 grants: &self.grants,
                 namespaces: &self.namespaces,
@@ -3421,6 +3652,7 @@ mod tests {
                 classes: self.classes.clone(),
                 gateways: self.gateways.clone(),
                 routes: self.routes.clone(),
+                grpc_routes: self.grpc_routes.clone(),
                 listener_sets: self.listener_sets.clone(),
                 grants: self.grants.clone(),
                 namespaces: self.namespaces.clone(),
@@ -3620,7 +3852,7 @@ mod tests {
         assert_eq!(ls.attached_routes, 1);
         assert_eq!(
             ls.supported_kinds.as_ref().unwrap(),
-            &vec![http_route_kind()]
+            &vec![route_kind(KIND_HTTP_ROUTE)]
         );
         assert_eq!(
             listener_cond(&d, "gw", "http", "Accepted"),
@@ -4066,7 +4298,7 @@ mod tests {
         ]})));
         w.service(
             serde_json::from_value(json!({"metadata": {"namespace": "ns", "name": "h2"},
-            "spec": {"ports": [{"port": 80, "appProtocol": "kubernetes.io/h2c"}]}}))
+            "spec": {"ports": [{"port": 80, "appProtocol": "kubernetes.io/wss"}]}}))
             .unwrap(),
         );
         let d = w.run();
@@ -4115,7 +4347,7 @@ mod tests {
         )
         .message;
         assert!(
-            message.contains("ns/gone") && message.contains("Bucket") && message.contains("h2c"),
+            message.contains("ns/gone") && message.contains("Bucket") && message.contains("wss"),
             "{message}"
         );
         // Invalid backends do not affect acceptance.
@@ -5153,6 +5385,81 @@ mod tests {
                 tf("True", "ResolvedRefs")
             );
         }
+    }
+
+    #[test]
+    fn backend_tls_policy_applies_to_grpc_backends() {
+        // A GRPCRoute (grpc.example.com) and an HTTPRoute (www.example.com) to the same
+        // policy-targeted Service: two TLS upstreams, the gRPC one HTTP/2.
+        let mut w = World::h2()
+            .gw(basic_gateway())
+            .grt(grpc_route(
+                "ns",
+                "g",
+                0,
+                json!({"hostnames": ["grpc.example.com"],
+                       "rules": [{"backendRefs": [backend("secure", 443)]}]}),
+            ))
+            .rt(route(
+                "ns",
+                "r",
+                1,
+                json!({"hostnames": ["www.example.com"],
+                       "rules": [{"backendRefs": [backend("secure", 443)]}]}),
+            ));
+        w.service(tls_service("secure", None));
+        w.policies.push(Arc::new(btls_policy(
+            "p",
+            0,
+            "secure",
+            Some("btls"),
+            "secure.example.com",
+        )));
+        w.ca_config_map(Some(cert_pem()));
+        let d = w.run();
+        let tls = UpstreamTls {
+            sni: "secure.example.com".into(),
+            ca: Some(cert_pem().to_string()),
+            client_cert: None,
+        };
+        let base = names::upstream_name(
+            "ns",
+            "secure",
+            &PortRef::Number(443),
+            BackendKind::Pods,
+            None,
+        );
+        let by_kind: BTreeMap<RouteKind, String> = locations(&d, "http")
+            .iter()
+            .map(|l| (l.owner_kind, l.upstream.clone().unwrap()))
+            .collect();
+        let grpc = &by_kind[&RouteKind::Grpc];
+        assert_eq!(
+            grpc,
+            &names::tls_upstream_name(&names::h2c_upstream_name(&base), &tls)
+        );
+        assert_eq!(d.upstreams[grpc].tls, Some(tls.clone()));
+        assert!(d.upstreams[grpc].h2c);
+        let http = &by_kind[&RouteKind::Http];
+        assert_eq!(http, &names::tls_upstream_name(&base, &tls));
+        assert!(!d.upstreams[http].h2c);
+        assert_ne!(grpc, http);
+        assert_eq!(
+            grpc_cond(&d, &rkey("ns", "g"), "ResolvedRefs"),
+            tf("True", "ResolvedRefs")
+        );
+        assert_eq!(policy_cond(&d, "p", "Accepted"), tf("True", "Accepted"));
+
+        // Reached through a GRPCRoute only: the Gateway is still an ancestor.
+        w.routes.clear();
+        let d = w.run();
+        let ancestors = &d.status.policies[&ObjectKey::new("ns", "p")].ancestors;
+        assert_eq!(ancestors.len(), 1);
+        assert_eq!(ancestors[0].ancestor_ref.name, "gw");
+        assert_eq!(
+            policy_cond(&d, "p", "ResolvedRefs"),
+            tf("True", "ResolvedRefs")
+        );
     }
 
     #[test]
@@ -6363,5 +6670,564 @@ mod tests {
             namespace: "ns".into(),
             name: "secure".into()
         }));
+    }
+
+    // ---- GRPCRoutes ----
+
+    /// A GRPCRoute in `ns` with parentRef `gw` (same namespace) and `spec` merged in.
+    fn grpc_route(ns: &str, name: &str, age: i64, spec: Value) -> GrpcRoute {
+        let mut full = json!({"parentRefs": [{"name": "gw"}]});
+        for (k, v) in spec.as_object().unwrap() {
+            full[k] = v.clone();
+        }
+        serde_json::from_value(json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "GRPCRoute",
+            "metadata": {
+                "namespace": ns, "name": name, "generation": 6,
+                "creationTimestamp": ts(age),
+            },
+            "spec": full,
+        }))
+        .unwrap()
+    }
+
+    fn grpc_cond(d: &Desired, route: &RouteKey, type_: &str) -> (String, String) {
+        let c = condition(&d.status.grpc_routes[route].parents[0].conditions, type_);
+        (c.status.clone(), c.reason.clone())
+    }
+
+    fn grpc_message(d: &Desired, route: &RouteKey, type_: &str) -> String {
+        condition(&d.status.grpc_routes[route].parents[0].conditions, type_)
+            .message
+            .clone()
+    }
+
+    fn app_service(ns: &str, name: &str, port: i32, protocol: Option<&str>) -> Service {
+        let mut p = json!({"port": port});
+        if let Some(protocol) = protocol {
+            p["appProtocol"] = json!(protocol);
+        }
+        serde_json::from_value(json!({
+            "metadata": {"namespace": ns, "name": name},
+            "spec": {"ports": [p]},
+        }))
+        .unwrap()
+    }
+
+    impl World {
+        fn grt(mut self, r: GrpcRoute) -> Self {
+            self.grpc_routes.push(Arc::new(r));
+            self
+        }
+        /// Servers `http` (80, 8080) and `https` (443), both with `enabled_h2`, and the
+        /// Service `ns/grpc:9000` without `appProtocol`.
+        fn h2() -> Self {
+            let mut w = World::new();
+            for s in &mut w.servers {
+                s.h2 = true;
+            }
+            w.service(app_service("ns", "grpc", 9000, None));
+            w
+        }
+    }
+
+    fn grpc_kinds() -> Vec<GatewayStatusListenersSupportedKinds> {
+        vec![route_kind(KIND_HTTP_ROUTE), route_kind(KIND_GRPC_ROUTE)]
+    }
+
+    #[test]
+    fn grpc_route_becomes_h2c_locations() {
+        let w = World::h2().gw(basic_gateway()).grt(grpc_route(
+            "ns",
+            "g",
+            0,
+            json!({"rules": [{
+                "matches": [{"method": {"service": "pkg.Svc", "method": "Get"}}],
+                "backendRefs": [backend("grpc", 9000)],
+            }]}),
+        ));
+        let d = w.run();
+        let key = rkey("ns", "g");
+        assert_eq!(grpc_cond(&d, &key, "Accepted"), tf("True", "Accepted"));
+        assert_eq!(
+            grpc_cond(&d, &key, "ResolvedRefs"),
+            tf("True", "ResolvedRefs")
+        );
+        let parent = &d.status.grpc_routes[&key].parents[0];
+        assert_eq!(parent.controller_name, CONTROLLER);
+        assert_eq!(
+            condition(&parent.conditions, "Accepted").observed_generation,
+            Some(6)
+        );
+        assert!(d.status.routes.is_empty());
+
+        let locs = locations(&d, "http");
+        assert_eq!(locs.len(), 1);
+        let l = locs[0];
+        assert_eq!(l.path, "=/pkg.Svc/Get");
+        assert_eq!(l.owner, key);
+        assert_eq!(l.owner_kind, RouteKind::Grpc);
+        let upstream = l.upstream.clone().unwrap();
+        let h1 = names::upstream_name(
+            "ns",
+            "grpc",
+            &PortRef::Number(9000),
+            BackendKind::Pods,
+            None,
+        );
+        assert_eq!(upstream, names::h2c_upstream_name(&h1));
+        assert!(d.upstreams[&upstream].h2c);
+        assert_eq!(
+            d.server_locations["http"],
+            vec![names::route_location_name(
+                RouteKind::Grpc,
+                &key,
+                "http",
+                None,
+                "=/pkg.Svc/Get",
+                &[],
+                &[]
+            )]
+        );
+
+        let ls = listener_status(&d, "gw", "http");
+        assert_eq!(ls.attached_routes, 1);
+        assert_eq!(ls.supported_kinds.as_ref().unwrap(), &grpc_kinds());
+        let referenced = referenced(&w.input());
+        assert!(referenced.services.contains(&ServiceKey {
+            namespace: "ns".into(),
+            name: "grpc".into()
+        }));
+    }
+
+    #[test]
+    fn grpc_routes_need_enabled_h2() {
+        // Default kinds: no GRPCRoute on servers without enabled_h2.
+        let mut w = World::new().gw(basic_gateway()).grt(grpc_route(
+            "ns",
+            "g",
+            0,
+            json!({"rules": [{"backendRefs": [backend("web", 80)]}]}),
+        ));
+        let d = w.run();
+        assert_eq!(
+            listener_status(&d, "gw", "http")
+                .supported_kinds
+                .as_ref()
+                .unwrap(),
+            &vec![route_kind(KIND_HTTP_ROUTE)]
+        );
+        assert_eq!(
+            grpc_cond(&d, &rkey("ns", "g"), "Accepted"),
+            tf("False", "NotAllowedByListeners")
+        );
+        assert!(d.locations.is_empty());
+
+        // Asked for: an invalid route kind, named with the server.
+        let mut l = http_listener("http", 80, None);
+        l["allowedRoutes"] = json!({"kinds": [{"kind": "GRPCRoute"}]});
+        w.gateways = vec![Arc::new(gateway("ns", "gw", 0, json!([l])))];
+        let d = w.run();
+        assert_eq!(
+            listener_cond(&d, "gw", "http", "ResolvedRefs"),
+            tf("False", "InvalidRouteKinds")
+        );
+        let ls = listener_status(&d, "gw", "http");
+        assert!(ls.supported_kinds.as_ref().unwrap().is_empty());
+        let message = &condition(&ls.conditions, "ResolvedRefs").message;
+        assert!(
+            message.contains("enabled_h2") && message.contains("http"),
+            "{message}"
+        );
+        assert_eq!(
+            listener_cond(&d, "gw", "http", "Programmed"),
+            tf("False", "Invalid")
+        );
+
+        // With enabled_h2, kinds [GRPCRoute] admit GRPCRoutes only.
+        for s in &mut w.servers {
+            s.h2 = true;
+        }
+        w.routes.push(Arc::new(route(
+            "ns",
+            "r",
+            1,
+            json!({"hostnames": ["a.example.com"]}),
+        )));
+        let d = w.run();
+        let ls = listener_status(&d, "gw", "http");
+        assert_eq!(
+            ls.supported_kinds.as_ref().unwrap(),
+            &vec![route_kind(KIND_GRPC_ROUTE)]
+        );
+        assert_eq!(
+            grpc_cond(&d, &rkey("ns", "g"), "Accepted"),
+            tf("True", "Accepted")
+        );
+        assert_eq!(
+            route_cond(&d, &rkey("ns", "r"), "Accepted"),
+            tf("False", "NotAllowedByListeners")
+        );
+        assert_eq!(ls.attached_routes, 1);
+    }
+
+    #[test]
+    fn grpc_precedence_follows_service_then_method_then_headers() {
+        let w = World::h2().gw(basic_gateway()).grt(grpc_route(
+            "ns",
+            "g",
+            0,
+            json!({"rules": [
+                {"matches": [{"headers": [{"name": "version", "value": "two"}]}],
+                 "backendRefs": [backend("grpc", 9000)]},
+                {"matches": [{"method": {"method": "Get"}}], "backendRefs": [backend("grpc", 9000)]},
+                {"matches": [{"method": {"service": "pkg.Svc"}}], "backendRefs": [backend("grpc", 9000)]},
+                {"matches": [{"method": {"service": "pkg.Svc", "method": "Get"}}],
+                 "backendRefs": [backend("grpc", 9000)]},
+                {"matches": [{"method": {"service": "pkg.Svc", "method": "Get"},
+                              "headers": [{"name": "version", "value": "two"}]}],
+                 "backendRefs": [backend("grpc", 9000)]},
+                {"matches": [{"method": {"type": "RegularExpression", "service": "pkg\\..+"}}],
+                 "backendRefs": [backend("grpc", 9000)]},
+            ]}),
+        ));
+        let d = w.run();
+        let paths: Vec<(String, usize)> = locations(&d, "http")
+            .iter()
+            .map(|l| (l.path.clone(), l.match_headers.len()))
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                ("=/pkg.Svc/Get".to_string(), 1),
+                ("=/pkg.Svc/Get".to_string(), 0),
+                ("~^/pkg\\.Svc(/|$)".to_string(), 0),
+                ("~^(?:/(?:pkg\\..+)/[^/]+)$".to_string(), 0),
+                ("~^(?:/[^/]+/Get)$".to_string(), 0),
+                (String::new(), 1),
+            ]
+        );
+        // One upstream for every rule.
+        assert_eq!(d.upstreams.len(), 1);
+    }
+
+    #[test]
+    fn grpc_header_modifiers_and_dropped_rules() {
+        let w = World::h2().gw(basic_gateway()).grt(grpc_route(
+            "ns",
+            "g",
+            0,
+            json!({"rules": [
+                {"matches": [{"method": {"service": "pkg.Svc", "method": "Get"}}],
+                 "filters": [
+                    {"type": "RequestHeaderModifier", "requestHeaderModifier": {
+                        "set": [{"name": "x-set", "value": "1"}], "add": [{"name": "x-add", "value": "2"}],
+                        "remove": ["x-rm"]}},
+                    {"type": "ResponseHeaderModifier", "responseHeaderModifier": {
+                        "set": [{"name": "x-resp", "value": "3"}]}},
+                 ],
+                 "backendRefs": [backend("grpc", 9000)]},
+                {"matches": [{"method": {"service": "pkg.Svc", "method": "Mirror"}}],
+                 "filters": [{"type": "RequestMirror", "requestMirror": {"backendRef": backend("grpc", 9000)}}],
+                 "backendRefs": [backend("grpc", 9000)]},
+                {"matches": [{"headers": [{"type": "RegularExpression", "name": "v", "value": "t.*"}]}],
+                 "backendRefs": [backend("gone", 9000)]},
+            ]}),
+        ));
+        let d = w.run();
+        let key = rkey("ns", "g");
+        assert_eq!(grpc_cond(&d, &key, "Accepted"), tf("True", "Accepted"));
+        assert_eq!(
+            grpc_cond(&d, &key, "PartiallyInvalid"),
+            tf("True", "UnsupportedValue")
+        );
+        let message = grpc_message(&d, &key, "PartiallyInvalid");
+        assert!(
+            message.contains("rule 1: RequestMirror")
+                && message.contains("rule 2: regular expression"),
+            "{message}"
+        );
+        // The backends of a dropped rule are still reported.
+        assert_eq!(
+            grpc_cond(&d, &key, "ResolvedRefs"),
+            tf("False", "BackendNotFound")
+        );
+        let locs = locations(&d, "http");
+        assert_eq!(locs.len(), 1);
+        let categories: Vec<&str> = plugins_of(&d, locs[0])
+            .iter()
+            .map(|p| p.category.as_str())
+            .collect();
+        assert_eq!(categories, vec!["request_headers", "response_headers"]);
+        let request = plugins_of(&d, locs[0])[0];
+        assert_eq!(strings(&request.fields["set_headers"]), vec!["x-set:1"]);
+        assert_eq!(strings(&request.fields["add_headers"]), vec!["x-add:2"]);
+        assert_eq!(strings(&request.fields["remove_headers"]), vec!["x-rm"]);
+    }
+
+    #[test]
+    fn grpc_backend_protocols() {
+        let mut w = World::h2().gw(basic_gateway()).grt(grpc_route(
+            "ns",
+            "g",
+            0,
+            json!({"rules": [
+                {"matches": [{"method": {"service": "a.A"}}], "backendRefs": [backend("h1", 80)]},
+                {"matches": [{"method": {"service": "b.B"}}], "backendRefs": [backend("h2c", 80)]},
+                {"matches": [{"method": {"service": "c.C"}}], "backendRefs": [backend("tagged", 80)]},
+                {"matches": [{"method": {"service": "d.D"}}], "backendRefs": [backend("wss", 80)]},
+            ]}),
+        ));
+        w.service(app_service("ns", "h1", 80, Some("kubernetes.io/http")));
+        w.service(app_service("ns", "h2c", 80, Some("kubernetes.io/h2c")));
+        w.service(app_service("ns", "tagged", 80, Some("grpc")));
+        w.service(app_service("ns", "wss", 80, Some("kubernetes.io/wss")));
+        let d = w.run();
+        let key = rkey("ns", "g");
+        assert_eq!(
+            grpc_cond(&d, &key, "ResolvedRefs"),
+            tf("False", "UnsupportedProtocol")
+        );
+        let message = grpc_message(&d, &key, "ResolvedRefs");
+        assert!(
+            message.contains("ns/h1")
+                && message.contains("needs HTTP/2")
+                && message.contains("ns/wss"),
+            "{message}"
+        );
+        let by_path: BTreeMap<&str, &LocationEntry> = locations(&d, "http")
+            .into_iter()
+            .map(|l| (l.path.as_str(), l))
+            .collect();
+        assert_eq!(by_path["~^/a\\.A(/|$)"].upstream, None);
+        assert_eq!(by_path["~^/d\\.D(/|$)"].upstream, None);
+        // Invalid gRPC backends answer 503 (UNAVAILABLE for gRPC clients), not 500.
+        let mock = plugins_of(&d, by_path["~^/a\\.A(/|$)"])[0];
+        assert_eq!(mock.category, "mock");
+        assert_eq!(mock.fields["status"].as_integer(), Some(503));
+        for p in ["~^/b\\.B(/|$)", "~^/c\\.C(/|$)"] {
+            let upstream = by_path[p].upstream.clone().unwrap();
+            assert!(upstream.contains("-h2c-"), "{upstream}");
+            assert!(d.upstreams[&upstream].h2c, "{upstream}");
+        }
+    }
+
+    #[test]
+    fn http_route_h2c_backends() {
+        let mut w = World::new().gw(basic_gateway()).rt(route("ns", "r", 0, json!({"rules": [
+            {"matches": [{"path": {"value": "/h2c"}}], "backendRefs": [backend("h2c", 80)]},
+            {"matches": [{"path": {"value": "/mixed"}}], "backendRefs": [
+                {"name": "h2c", "port": 80, "weight": 3}, {"name": "web", "port": 80, "weight": 1}]},
+            {"matches": [{"path": {"value": "/h1"}}], "backendRefs": [backend("web", 80)]},
+        ]})));
+        w.service(app_service("ns", "h2c", 80, Some("kubernetes.io/h2c")));
+        let d = w.run();
+        let by_path: BTreeMap<&str, &LocationEntry> = locations(&d, "http")
+            .into_iter()
+            .map(|l| (l.path.as_str(), l))
+            .collect();
+        let h2c = by_path["~^/h2c(/|$)"].upstream.clone().unwrap();
+        let h1 = names::upstream_name("ns", "h2c", &PortRef::Number(80), BackendKind::Pods, None);
+        assert_eq!(h2c, names::h2c_upstream_name(&h1));
+        assert!(d.upstreams[&h2c].h2c);
+        // Mixed: the protocol with the most weight wins, the other backend gets a 500 share.
+        let mixed = by_path["~^/mixed(/|$)"];
+        assert_eq!(mixed.upstream, Some(h2c.clone()));
+        let mock = plugins_of(&d, mixed)[0];
+        assert_eq!(mock.category, "mock");
+        assert_eq!(mock.fields["percentage"].as_integer(), Some(25));
+        let plain = by_path["~^/h1(/|$)"].upstream.clone().unwrap();
+        assert!(!d.upstreams[&plain].h2c);
+        assert!(!plain.contains("-h2c-"));
+        assert_eq!(
+            route_cond(&d, &rkey("ns", "r"), "ResolvedRefs"),
+            tf("False", "UnsupportedProtocol")
+        );
+        let message = &condition(
+            &d.status.routes[&rkey("ns", "r")].parents[0].conditions,
+            "ResolvedRefs",
+        )
+        .message;
+        assert!(message.contains("needs another protocol"), "{message}");
+    }
+
+    #[test]
+    fn grpc_and_http_routes_share_a_listener_on_distinct_hosts_only() {
+        let backends = json!({"rules": [{"backendRefs": [backend("grpc", 9000)]}]});
+        let both = |http_age: i64, grpc_age: i64, http_host: &str, grpc_host: &str| {
+            let mut spec = backends.clone();
+            spec["hostnames"] = json!([grpc_host]);
+            let mut http = json!({"rules": [{"backendRefs": [backend("web", 80)]}]});
+            http["hostnames"] = json!([http_host]);
+            World::h2()
+                .gw(gateway(
+                    "ns",
+                    "gw",
+                    0,
+                    json!([http_listener("http", 80, Some("*.example.com"))]),
+                ))
+                .rt(route("ns", "same", http_age, http))
+                .grt(grpc_route("ns", "same", grpc_age, spec))
+                .run()
+        };
+        let key = rkey("ns", "same");
+        // Older HTTPRoute wins an intersecting hostname.
+        let d = both(0, 1, "*.example.com", "api.example.com");
+        assert_eq!(route_cond(&d, &key, "Accepted"), tf("True", "Accepted"));
+        assert_eq!(
+            grpc_cond(&d, &key, "Accepted"),
+            tf("False", "NotAllowedByListeners")
+        );
+        assert!(grpc_message(&d, &key, "Accepted").contains("HTTPRoute ns/same"));
+        assert!(
+            locations(&d, "http")
+                .iter()
+                .all(|l| l.owner_kind == RouteKind::Http)
+        );
+        assert_eq!(listener_status(&d, "gw", "http").attached_routes, 1);
+        // Older GRPCRoute wins.
+        let d = both(1, 0, "*.example.com", "api.example.com");
+        assert_eq!(grpc_cond(&d, &key, "Accepted"), tf("True", "Accepted"));
+        assert_eq!(
+            route_cond(&d, &key, "Accepted"),
+            tf("False", "NotAllowedByListeners")
+        );
+        // Distinct hosts: both served, with their own location names.
+        let d = both(0, 1, "www.example.com", "api.example.com");
+        assert_eq!(route_cond(&d, &key, "Accepted"), tf("True", "Accepted"));
+        assert_eq!(grpc_cond(&d, &key, "Accepted"), tf("True", "Accepted"));
+        let locs = locations(&d, "http");
+        assert_eq!(locs.len(), 2);
+        let kinds: BTreeSet<RouteKind> = locs.iter().map(|l| l.owner_kind).collect();
+        assert_eq!(kinds.len(), 2);
+        assert_ne!(d.server_locations["http"][0], d.server_locations["http"][1]);
+        assert_eq!(listener_status(&d, "gw", "http").attached_routes, 2);
+    }
+
+    #[test]
+    fn grpc_cross_namespace_backends_need_a_grpcroute_grant() {
+        let mut w = World::h2().gw(basic_gateway()).grt(grpc_route(
+            "ns",
+            "g",
+            0,
+            json!({"rules": [{"backendRefs": [{"name": "grpc", "namespace": "other", "port": 9000}]}]}),
+        ));
+        w.service(app_service("other", "grpc", 9000, None));
+        // A grant for HTTPRoutes does not cover GRPCRoutes.
+        w.grants = vec![Arc::new(grant(
+            "other",
+            KIND_HTTP_ROUTE,
+            "ns",
+            KIND_SERVICE,
+            None,
+        ))];
+        let d = w.run();
+        assert_eq!(
+            grpc_cond(&d, &rkey("ns", "g"), "ResolvedRefs"),
+            tf("False", "RefNotPermitted")
+        );
+        w.grants = vec![Arc::new(grant(
+            "other",
+            KIND_GRPC_ROUTE,
+            "ns",
+            KIND_SERVICE,
+            Some("grpc"),
+        ))];
+        let d = w.run();
+        assert_eq!(
+            grpc_cond(&d, &rkey("ns", "g"), "ResolvedRefs"),
+            tf("True", "ResolvedRefs")
+        );
+        assert!(locations(&d, "http")[0].upstream.is_some());
+    }
+
+    #[test]
+    fn grpc_listener_hostnames_and_section_names() {
+        let listeners = json!([
+            http_listener("l1", 80, Some("bar.com")),
+            http_listener("l2", 80, Some("foo.bar.com")),
+            http_listener("l3", 80, Some("*.bar.com")),
+        ]);
+        let mut a = grpc_route(
+            "ns",
+            "a",
+            0,
+            json!({"rules": [{"backendRefs": [backend("grpc", 9000)]}]}),
+        );
+        a.spec.parent_refs = Some(vec![
+            serde_json::from_value(json!({"name": "gw", "sectionName": "l1"})).unwrap(),
+        ]);
+        let mut b = grpc_route(
+            "ns",
+            "b",
+            1,
+            json!({"hostnames": ["other.com"], "rules": []}),
+        );
+        b.spec.parent_refs = Some(vec![
+            serde_json::from_value(json!({"name": "gw", "sectionName": "l3"})).unwrap(),
+        ]);
+        let d = World::h2()
+            .gw(gateway("ns", "gw", 0, listeners))
+            .grt(a)
+            .grt(b)
+            .run();
+        assert_eq!(
+            grpc_cond(&d, &rkey("ns", "a"), "Accepted"),
+            tf("True", "Accepted")
+        );
+        let hosts: Vec<Option<String>> = locations(&d, "http")
+            .iter()
+            .map(|l| l.host.clone())
+            .collect();
+        assert_eq!(hosts, vec![Some("bar.com".to_string())]);
+        assert_eq!(
+            grpc_cond(&d, &rkey("ns", "b"), "Accepted"),
+            tf("False", "NoMatchingListenerHostname")
+        );
+    }
+
+    #[test]
+    fn grpc_routes_attach_to_listener_sets() {
+        let d = World::h2()
+            .gw(parent_gateway("Same"))
+            .ls(listener_set(
+                "ns",
+                "ls",
+                1,
+                json!({"name": "gw"}),
+                json!([http_listener("ls", 80, Some("ls.example.com"))]),
+            ))
+            .grt(grpc_route(
+                "ns",
+                "g",
+                0,
+                json!({"parentRefs": [ls_ref("ls")],
+                       "rules": [{"matches": [{"method": {"service": "pkg.Svc", "method": "Get"}}],
+                                  "backendRefs": [backend("grpc", 9000)]}]}),
+            ))
+            .run();
+        assert_eq!(
+            grpc_cond(&d, &rkey("ns", "g"), "Accepted"),
+            tf("True", "Accepted")
+        );
+        let parent = &d.status.grpc_routes[&rkey("ns", "g")].parents[0];
+        assert_eq!(parent.parent_ref.kind.as_deref(), Some("ListenerSet"));
+        assert_eq!(
+            hosts(&d, "http"),
+            vec![(
+                Some("ls.example.com".to_string()),
+                "=/pkg.Svc/Get".to_string()
+            )]
+        );
+        let l = ls_listener(&d, "ns", "ls", "ls");
+        assert_eq!(l.attached_routes, 1);
+        let kinds: Vec<&str> = l
+            .supported_kinds
+            .iter()
+            .flatten()
+            .map(|k| k.kind.as_str())
+            .collect();
+        assert_eq!(kinds, vec!["HTTPRoute", "GRPCRoute"]);
     }
 }

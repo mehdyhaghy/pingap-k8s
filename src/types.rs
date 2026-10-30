@@ -176,15 +176,18 @@ pub trait AddrsWriter: Send + Sync + 'static {
 
     /// [`AddrsWriter::write_addrs`]; an entry it creates also gets `health_check`
     /// (already validated) and the TLS fields of `tls`. An existing entry's fields other
-    /// than `addrs` are left alone.
+    /// than `addrs` are left alone, except `alpn` (Pingap's `"H2"` for HTTP/2 backends):
+    /// it is written into an entry that is created or has no `alpn`; an `alpn` already
+    /// stored is left alone.
     fn write_upstream(
         &self,
         upstream: &str,
         addrs: &[String],
         health_check: Option<&str>,
         tls: Option<&UpstreamTls>,
+        alpn: Option<&str>,
     ) -> impl Future<Output = anyhow::Result<WriteOutcome>> + Send {
-        let _ = (health_check, tls);
+        let _ = (health_check, tls, alpn);
         self.write_addrs(upstream, addrs)
     }
 }
