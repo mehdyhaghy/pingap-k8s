@@ -25,7 +25,9 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::types::{PortRef, ServiceKey, ServiceRef, UpstreamOptions, UpstreamTarget};
+use crate::types::{
+    IpFamily, PortRef, ServiceKey, ServiceRef, UpstreamOptions, UpstreamTarget, UpstreamTls,
+};
 
 /// Maximum length of a DNS label.
 const DNS_LABEL_MAX: usize = 63;
@@ -165,7 +167,8 @@ where
 
 /// `[gateway]`: Gateways of the GatewayClasses with `controller_name`, and the HTTPRoutes
 /// attached to them, become Pingap locations, certificates, plugins and upstreams.
-/// `enabled` needs a restart; everything else is applied on reload.
+/// `enabled`, `controller_name` and `max_txn_ops` need a restart; everything else is
+/// applied on reload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GatewaySettings {
     /// `spec.controllerName` of the GatewayClasses handled (`<domain>/<path>`).
@@ -253,7 +256,8 @@ pub struct Defaults {
     pub debounce: Duration,
     pub debounce_max: Duration,
     pub resync: Duration,
-    pub ipv4_only: bool,
+    pub ip_family: IpFamily,
+    pub external_name: bool,
     pub target: UpstreamTarget,
 }
 
@@ -265,7 +269,8 @@ impl Default for Defaults {
             debounce: Duration::from_millis(500),
             debounce_max: Duration::from_secs(2),
             resync: Duration::from_secs(300),
-            ipv4_only: false,
+            ip_family: IpFamily::Primary,
+            external_name: false,
             target: UpstreamTarget::Pods,
         }
     }
@@ -277,7 +282,8 @@ impl Defaults {
         UpstreamOptions {
             include_not_ready: self.include_not_ready,
             drain_terminating: self.drain_terminating,
-            ipv4_only: self.ipv4_only,
+            ip_family: self.ip_family,
+            external_name: self.external_name,
             debounce: self.debounce,
             debounce_max: self.debounce_max,
             target: self.target.clone(),
@@ -295,6 +301,9 @@ pub struct UpstreamConfig {
     /// Pingap `health_check` written when the controller creates the entry (generated
     /// Gateway upstreams only; the name changes with it, so it is never updated in place).
     pub health_check: Option<String>,
+    /// TLS to the backends, written when the controller creates the entry (generated
+    /// Gateway upstreams only; like `health_check`, never updated in place).
+    pub tls: Option<UpstreamTls>,
 }
 
 // ---- raw (serde) layer ----
@@ -325,7 +334,10 @@ struct RawDefaults {
     debounce_max: Option<Duration>,
     #[serde(default, with = "humantime_serde")]
     resync: Option<Duration>,
+    ip_family: Option<String>,
+    /// Deprecated alias: `true` is `ip_family = "ipv4"`, `false` is `"primary"`.
     ipv4_only: Option<bool>,
+    external_name: Option<bool>,
     target: Option<String>,
 }
 
@@ -339,7 +351,10 @@ struct RawUpstream {
     debounce: Option<Duration>,
     #[serde(default, with = "humantime_serde")]
     debounce_max: Option<Duration>,
+    ip_family: Option<String>,
+    /// Deprecated alias of `ip_family`, see [`RawDefaults`].
     ipv4_only: Option<bool>,
+    external_name: Option<bool>,
     target: Option<String>,
 }
 
@@ -348,6 +363,12 @@ impl Config {
     /// `kubernetes.default_namespace` is empty.
     pub fn from_toml_str(s: &str, pod_namespace: &str) -> Result<Config, ConfigError> {
         let raw: RawConfig = toml::from_str(s)?;
+        if raw.defaults.ipv4_only.is_some() || raw.upstreams.values().any(|u| u.ipv4_only.is_some())
+        {
+            tracing::warn!(
+                "ipv4_only is deprecated: use ip_family = \"ipv4\" (for true) or \"primary\" (for false)"
+            );
+        }
 
         if raw.etcd.url.trim().is_empty() {
             return Err(ConfigError::Invalid("etcd.url must not be empty".into()));
@@ -364,6 +385,9 @@ impl Config {
                 .map_err(|reason| ConfigError::Invalid(format!("defaults.target: {reason}")))?,
             None => built.target.clone(),
         };
+        let ip_family = merge_ip_family(raw.defaults.ip_family.as_deref(), raw.defaults.ipv4_only)
+            .map_err(|reason| ConfigError::Invalid(format!("defaults.{reason}")))?
+            .unwrap_or(built.ip_family);
         let defaults = Defaults {
             include_not_ready: raw
                 .defaults
@@ -376,7 +400,8 @@ impl Config {
             debounce: raw.defaults.debounce.unwrap_or(built.debounce),
             debounce_max: raw.defaults.debounce_max.unwrap_or(built.debounce_max),
             resync: raw.defaults.resync.unwrap_or(built.resync),
-            ipv4_only: raw.defaults.ipv4_only.unwrap_or(built.ipv4_only),
+            ip_family,
+            external_name: raw.defaults.external_name.unwrap_or(built.external_name),
             target,
         };
         if defaults.resync.is_zero() {
@@ -490,10 +515,14 @@ fn build_upstream(
         }
         None => defaults.target.clone(),
     };
+    let ip_family = merge_ip_family(raw.ip_family.as_deref(), raw.ipv4_only)
+        .map_err(upstream_err)?
+        .unwrap_or(defaults.ip_family);
     let options = UpstreamOptions {
         include_not_ready: raw.include_not_ready.unwrap_or(defaults.include_not_ready),
         drain_terminating: raw.drain_terminating.unwrap_or(defaults.drain_terminating),
-        ipv4_only: raw.ipv4_only.unwrap_or(defaults.ipv4_only),
+        ip_family,
+        external_name: raw.external_name.unwrap_or(defaults.external_name),
         debounce: raw.debounce.unwrap_or(defaults.debounce),
         debounce_max: raw.debounce_max.unwrap_or(defaults.debounce_max),
         target,
@@ -531,6 +560,7 @@ fn build_upstream(
         services,
         options,
         health_check: None,
+        tls: None,
     })
 }
 
@@ -681,6 +711,39 @@ fn validate_controller_name(name: &str) -> Result<(), String> {
 }
 
 /// `target = "pods" | "service"`.
+/// `ip_family` and its deprecated alias `ipv4_only` of one table; `None` when neither is
+/// set. Setting both is an error.
+fn merge_ip_family(
+    ip_family: Option<&str>,
+    ipv4_only: Option<bool>,
+) -> Result<Option<IpFamily>, String> {
+    match (ip_family, ipv4_only) {
+        (Some(_), Some(_)) => {
+            Err("ipv4_only: set either ip_family or the deprecated ipv4_only, not both".into())
+        }
+        (Some(value), None) => parse_ip_family(value)
+            .map(Some)
+            .map_err(|r| format!("ip_family: {r}")),
+        (None, Some(true)) => Ok(Some(IpFamily::Ipv4)),
+        (None, Some(false)) => Ok(Some(IpFamily::Primary)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn parse_ip_family(value: &str) -> Result<IpFamily, String> {
+    [
+        IpFamily::Primary,
+        IpFamily::Ipv4,
+        IpFamily::Ipv6,
+        IpFamily::Both,
+    ]
+    .into_iter()
+    .find(|f| f.as_str() == value)
+    .ok_or_else(|| {
+        format!("unknown value {value:?}; expected \"primary\", \"ipv4\", \"ipv6\" or \"both\"")
+    })
+}
+
 fn parse_target(value: &str, cluster_domain: &str) -> Result<UpstreamTarget, String> {
     match value {
         "pods" => Ok(UpstreamTarget::Pods),
@@ -1038,7 +1101,8 @@ drain_terminating = true
 debounce = "500ms"
 debounce_max = "2s"
 resync = "5m"
-ipv4_only = false
+ip_family = "primary"
+external_name = false
 
 [upstreams.api]
 services = ["api.prod:http"]
@@ -1080,7 +1144,8 @@ drain_terminating = true
         assert_eq!(c.defaults.resync, Duration::from_secs(300));
         assert!(c.defaults.drain_terminating);
         assert!(!c.defaults.include_not_ready);
-        assert!(!c.defaults.ipv4_only);
+        assert_eq!(c.defaults.ip_family, IpFamily::Primary);
+        assert!(!c.defaults.external_name);
         // Pod namespace is the fallback.
         assert_eq!(c.upstreams["api"].services[0].key.namespace, "podns");
     }
@@ -1137,7 +1202,8 @@ services = ["a:80"]
 services = ["b:80"]
 include_not_ready = false
 drain_terminating = false
-ipv4_only = true
+ip_family = "ipv4"
+external_name = true
 debounce = "1s"
 debounce_max = "1m"
 "#)
@@ -1148,7 +1214,8 @@ debounce_max = "1m"
             UpstreamOptions {
                 include_not_ready: true,
                 drain_terminating: true,
-                ipv4_only: false,
+                ip_family: IpFamily::Primary,
+                external_name: false,
                 debounce: Duration::from_millis(100),
                 debounce_max: Duration::from_secs(1),
                 target: UpstreamTarget::Pods,
@@ -1160,7 +1227,8 @@ debounce_max = "1m"
             UpstreamOptions {
                 include_not_ready: false,
                 drain_terminating: false,
-                ipv4_only: true,
+                ip_family: IpFamily::Ipv4,
+                external_name: true,
                 debounce: Duration::from_secs(1),
                 debounce_max: Duration::from_secs(60),
                 target: UpstreamTarget::Pods,
@@ -1395,6 +1463,60 @@ target = "service"
     fn wrong_types_rejected() {
         assert!(cfg("[upstreams.a]\nservices = \"a:80\"\n").is_err());
         assert!(cfg("[defaults]\nipv4_only = \"yes\"\n").is_err());
+        assert!(cfg("[defaults]\nexternal_name = \"yes\"\n").is_err());
+    }
+
+    #[test]
+    fn ip_family_values_and_deprecated_alias() {
+        let family = |defaults: &str, upstream: &str| {
+            cfg(&format!(
+                "[defaults]\n{defaults}\n[upstreams.a]\nservices = [\"a:80\"]\n{upstream}\n"
+            ))
+            .map(|c| (c.defaults.ip_family, c.upstreams["a"].options.ip_family))
+        };
+        let cases = [
+            ("", "", IpFamily::Primary, IpFamily::Primary),
+            ("ip_family = \"both\"", "", IpFamily::Both, IpFamily::Both),
+            ("ip_family = \"ipv6\"", "", IpFamily::Ipv6, IpFamily::Ipv6),
+            (
+                "",
+                "ip_family = \"ipv4\"",
+                IpFamily::Primary,
+                IpFamily::Ipv4,
+            ),
+            // The deprecated alias: true is ipv4, false is the default (primary).
+            ("ipv4_only = true", "", IpFamily::Ipv4, IpFamily::Ipv4),
+            (
+                "ipv4_only = true",
+                "ipv4_only = false",
+                IpFamily::Ipv4,
+                IpFamily::Primary,
+            ),
+            (
+                "ipv4_only = true",
+                "ip_family = \"both\"",
+                IpFamily::Ipv4,
+                IpFamily::Both,
+            ),
+        ];
+        for (defaults, upstream, want_defaults, want_upstream) in cases {
+            assert_eq!(
+                family(defaults, upstream).unwrap(),
+                (want_defaults, want_upstream),
+                "{defaults:?} / {upstream:?}"
+            );
+        }
+        let m = err("[defaults]\nip_family = \"dual\"\n");
+        assert!(m.contains("defaults.ip_family"), "{m}");
+        let m = err("[defaults]\nip_family = \"ipv4\"\nipv4_only = true\n");
+        assert!(m.contains("not both"), "{m}");
+        let m = family("", "ip_family = \"ipv4\"\nipv4_only = true")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            m.contains("upstream \"a\"") && m.contains("not both"),
+            "{m}"
+        );
     }
 
     #[test]

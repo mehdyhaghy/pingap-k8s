@@ -289,6 +289,18 @@ namespace of every config.upstreams[*].services entry
 {{- $nss | uniq | sortAlpha | toJson }}
 {{- end }}
 
+{{/*
+Checksum of the settings the controller reads at start only (everything else in
+its config is reloaded live), put on the pod template so a change restarts the pods.
+*/}}
+{{- define "pingap-k8s.restartChecksum" -}}
+{{- $restart := dict "events" (.Values.events.enabled | default false) "server" (.Values.config.server | default dict) -}}
+{{- if .Values.gateway.enabled -}}
+{{- $_ := set $restart "gateway" (dict "controllerName" .Values.gateway.controllerName "maxTxnOps" (.Values.gateway.maxTxnOps | default 64 | int)) -}}
+{{- end -}}
+{{- $restart | toJson | sha256sum | trunc 16 -}}
+{{- end }}
+
 {{/* ---------------- TOML rendering ---------------- */}}
 
 {{/* A TOML basic string. JSON escaping is valid TOML; the HTML escapes are undone for readability. */}}
@@ -371,6 +383,7 @@ addresses = {{ include "pingap-k8s.tomlValue" (.Values.gateway.addresses | defau
 {{- with .Values.gateway.healthCheck }}
 health_check = {{ include "pingap-k8s.tomlString" . }}
 {{- end }}
+max_txn_ops = {{ .Values.gateway.maxTxnOps | default 64 | int }}
 {{- range (include "pingap-k8s.gatewayGroups" . | fromJsonArray) }}
 
 [[gateway.groups]]

@@ -5,11 +5,12 @@ With events.enabled, create and patch on events.k8s.io events in those
 namespaces (Service Events) and in the release namespace (Events about the
 controller Pod).
 With gateway.enabled: in each gateway.namespaces namespace, read secrets
-(limited to gateway.secretNames when set); and the only ClusterRole: read the
-Gateway API resources and namespaces, patch the status of GatewayClasses,
-Gateways, ListenerSets and HTTPRoutes. GatewayClasses are cluster-scoped and
-routes and ListenerSets attach across namespaces, so this part can not be
-namespaced.
+(limited to gateway.secretNames when set) and configmaps (BackendTLSPolicy CA
+certificates; limited to gateway.configMapNames when set); and the only
+ClusterRole: read the Gateway API resources and namespaces, patch the status of
+GatewayClasses, Gateways, ListenerSets, HTTPRoutes and BackendTLSPolicies.
+GatewayClasses are cluster-scoped and routes and ListenerSets attach across
+namespaces, so this part cannot be namespaced.
 */ -}}
 {{- if .Values.rbac.create }}
 {{- $fullname := include "pingap-k8s.fullname" . }}
@@ -41,6 +42,12 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     {{- with $.Values.gateway.secretNames }}
+    resourceNames: {{ toJson . }}
+    {{- end }}
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    {{- with $.Values.gateway.configMapNames }}
     resourceNames: {{ toJson . }}
     {{- end }}
     verbs: ["get", "list", "watch"]
@@ -102,10 +109,10 @@ metadata:
     {{- include "pingap-k8s.labels" . | nindent 4 }}
 rules:
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["gatewayclasses", "gateways", "listenersets", "httproutes", "referencegrants"]
+    resources: ["gatewayclasses", "gateways", "listenersets", "httproutes", "referencegrants", "backendtlspolicies"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["gatewayclasses/status", "gateways/status", "listenersets/status", "httproutes/status"]
+    resources: ["gatewayclasses/status", "gateways/status", "listenersets/status", "httproutes/status", "backendtlspolicies/status"]
     verbs: ["patch"]
   - apiGroups: [""]
     resources: ["namespaces"]

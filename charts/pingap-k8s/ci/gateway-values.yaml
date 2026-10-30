@@ -1,10 +1,11 @@
 # CI render check for the Gateway API provider: a GatewayClass, the [gateway]
-# config table, the gateway ClusterRole, and secret rules in the Role of each
-# gateway namespace (restricted by name).
+# config table, the gateway ClusterRole, and secret and configmap rules in the
+# Role of each gateway namespace (restricted by name).
 gateway:
   enabled: true
   namespaces: ["web", "shop"]
   secretNames: ["web-tls", "shop-tls"]
+  configMapNames: ["backend-ca"]
   servers: ["http", "https"]
   externalName: true
   addresses: ["203.0.113.10", "2001:db8::10", "lb.example.com"]

@@ -857,9 +857,10 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
         let writer = Arc::clone(&self.writer);
         let upstream = name.to_string();
         let health_check = st.config.health_check.clone();
+        let tls = st.config.tls.clone();
         let handle = self.inflight.spawn(async move {
             let result = writer
-                .write_upstream(&upstream, &desired, health_check.as_deref())
+                .write_upstream(&upstream, &desired, health_check.as_deref(), tls.as_ref())
                 .await;
             (upstream, desired, result)
         });
@@ -1002,9 +1003,11 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
 /// The Service a resolve warning is about.
 fn warning_service(w: &ResolveWarning) -> &ServiceKey {
     match w {
-        ResolveWarning::ServiceMissing(key) => key,
+        ResolveWarning::ServiceMissing(key) | ResolveWarning::ExternalNameNotEnabled(key) => key,
         ResolveWarning::PortNotInService { service, .. }
-        | ResolveWarning::PortNotInSlices { service, .. } => service,
+        | ResolveWarning::PortNotInSlices { service, .. }
+        | ResolveWarning::ExternalNameInvalid { service, .. }
+        | ResolveWarning::TrafficPolicyIgnored { service, .. } => service,
     }
 }
 
@@ -1201,13 +1204,15 @@ mod tests {
             options: UpstreamOptions {
                 include_not_ready: false,
                 drain_terminating: true,
-                ipv4_only: false,
+                ip_family: crate::types::IpFamily::Primary,
+                external_name: false,
                 debounce: Duration::from_millis(500),
                 debounce_max: Duration::from_secs(2),
                 target: UpstreamTarget::Pods,
                 spread_weights: false,
             },
             health_check: None,
+            tls: None,
         }
     }
 

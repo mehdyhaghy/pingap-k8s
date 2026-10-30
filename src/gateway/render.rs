@@ -111,6 +111,20 @@ pub fn render_location(name: &str, location: &LocationEntry) -> String {
     if !location.plugins.is_empty() {
         entry.insert("plugins", toml_edit::value(strings(&location.plugins)));
     }
+    let options = &location.options;
+    if let Some(retries) = options.max_retries {
+        entry.insert("max_retries", toml_edit::value(i64::from(retries)));
+    }
+    for (key, millis) in [
+        ("max_retry_window", options.max_retry_window),
+        ("connection_timeout", options.connection_timeout),
+        ("read_timeout", options.read_timeout),
+        ("write_timeout", options.write_timeout),
+    ] {
+        if let Some(millis) = millis {
+            entry.insert(key, toml_edit::value(format!("{millis}ms")));
+        }
+    }
     entry.insert(
         "remark",
         toml_edit::value(route_remark(&location.owner).as_str()),
@@ -186,7 +200,8 @@ pub fn render_certificate(name: &str, certificate: &CertificateEntry) -> String 
 /// `[upstreams.<name>]` for an `ExternalName` backend: `addrs = ["host:port"]` with
 /// `discovery = "dns"` and `update_frequency`. An IP literal is written as a static
 /// address, and only when it passes the same filter as the pod addresses of phase 1 (no
-/// loopback, link-local, broadcast, multicast or unspecified address).
+/// loopback, link-local, broadcast, multicast or unspecified address). With TLS (a
+/// BackendTLSPolicy): `sni`, `verify_cert = true`, `ca`, `client_cert` and `client_key`.
 pub fn render_external_upstream(
     name: &str,
     upstream: &ExternalUpstream,
@@ -236,6 +251,17 @@ pub fn render_external_upstream(
     }
     if let Some(health_check) = &upstream.health_check {
         entry.insert("health_check", toml_edit::value(health_check.as_str()));
+    }
+    if let Some(tls) = &upstream.tls {
+        entry.insert("sni", toml_edit::value(tls.sni.as_str()));
+        entry.insert("verify_cert", toml_edit::value(true));
+        if let Some(ca) = &tls.ca {
+            entry.insert("ca", toml_edit::value(ca.as_str()));
+        }
+        if let Some((cert, key)) = &tls.client_cert {
+            entry.insert("client_cert", toml_edit::value(cert.as_str()));
+            entry.insert("client_key", toml_edit::value(key.as_str()));
+        }
     }
     entry.insert(
         "remark",
@@ -480,6 +506,9 @@ mod tests {
     use super::*;
     use serde::Deserialize;
     use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    use crate::gateway::model::LocationOptions;
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
@@ -502,6 +531,15 @@ mod tests {
         rewrite: Option<String>,
         proxy_set_headers: Option<Vec<String>>,
         plugins: Option<Vec<String>>,
+        max_retries: Option<u8>,
+        #[serde(default, with = "humantime_serde")]
+        max_retry_window: Option<Duration>,
+        #[serde(default, with = "humantime_serde")]
+        connection_timeout: Option<Duration>,
+        #[serde(default, with = "humantime_serde")]
+        read_timeout: Option<Duration>,
+        #[serde(default, with = "humantime_serde")]
+        write_timeout: Option<Duration>,
         remark: Option<String>,
     }
 
@@ -522,6 +560,11 @@ mod tests {
         discovery: Option<String>,
         update_frequency: Option<String>,
         health_check: Option<String>,
+        sni: Option<String>,
+        verify_cert: Option<bool>,
+        ca: Option<String>,
+        client_cert: Option<String>,
+        client_key: Option<String>,
         remark: Option<String>,
     }
 
@@ -544,6 +587,13 @@ mod tests {
             rewrite: Some("^/api/(.*) /$1".into()),
             proxy_set_headers: s(&["host:api.internal"]),
             plugins: s(&["pingap:requestId", "auth"]),
+            options: LocationOptions {
+                max_retries: Some(3),
+                max_retry_window: Some(15_000),
+                connection_timeout: Some(500),
+                read_timeout: Some(500),
+                write_timeout: Some(500),
+            },
         }
     }
 
@@ -561,6 +611,11 @@ mod tests {
         assert_eq!(conf.rewrite.as_deref(), Some("^/api/(.*) /$1"));
         assert_eq!(conf.proxy_set_headers, Some(s(&["host:api.internal"])));
         assert_eq!(conf.plugins, Some(s(&["pingap:requestId", "auth"])));
+        assert_eq!(conf.max_retries, Some(3));
+        assert_eq!(conf.max_retry_window, Some(Duration::from_secs(15)));
+        assert_eq!(conf.connection_timeout, Some(Duration::from_millis(500)));
+        assert_eq!(conf.read_timeout, Some(Duration::from_millis(500)));
+        assert_eq!(conf.write_timeout, Some(Duration::from_millis(500)));
         assert_eq!(
             conf.remark.as_deref(),
             Some("pingap-k8s httproute shop/web")
@@ -588,6 +643,7 @@ mod tests {
             rewrite: None,
             proxy_set_headers: vec![],
             plugins: vec![],
+            options: LocationOptions::default(),
         };
         let out = render_location("k8s-shop-web-default", &entry);
         let conf = parse::<LocationConf>(&out, "locations")
@@ -600,6 +656,20 @@ mod tests {
         assert_eq!(conf.weight, Some(0));
         assert_eq!(conf.plugins, None);
         assert_eq!(conf.rewrite, None);
+        assert_eq!(conf.max_retries, None);
+        assert_eq!(conf.read_timeout, None);
+    }
+
+    #[test]
+    fn longest_timeout_parses_as_a_pingap_duration() {
+        let mut entry = location();
+        let longest = crate::gateway::extended::LONGEST_TIMEOUT_MS;
+        entry.options.read_timeout = Some(longest);
+        let out = render_location("k8s-a", &entry);
+        let conf = parse::<LocationConf>(&out, "locations")
+            .remove("k8s-a")
+            .unwrap();
+        assert_eq!(conf.read_timeout, Some(Duration::from_millis(longest)));
     }
 
     #[test]
@@ -660,6 +730,7 @@ mod tests {
             },
             addr: addr.into(),
             health_check: None,
+            tls: None,
         }
     }
 
@@ -689,6 +760,32 @@ mod tests {
             conf.health_check.as_deref(),
             Some("tcp://db?check_frequency=5s")
         );
+    }
+
+    #[test]
+    fn external_upstream_with_tls() {
+        let mut upstream = external("db.example.com:443");
+        upstream.tls = Some(crate::types::UpstreamTls {
+            sni: "db.example.com".into(),
+            ca: Some("CA PEM".into()),
+            client_cert: Some(("CERT PEM".into(), "KEY PEM".into())),
+        });
+        let out = render_external_upstream("k8s-x", &upstream, "5s").unwrap();
+        let conf = parse::<UpstreamConf>(&out, "upstreams")
+            .remove("k8s-x")
+            .unwrap();
+        assert_eq!(conf.sni.as_deref(), Some("db.example.com"));
+        assert_eq!(conf.verify_cert, Some(true));
+        assert_eq!(conf.ca.as_deref(), Some("CA PEM"));
+        assert_eq!(conf.client_cert.as_deref(), Some("CERT PEM"));
+        assert_eq!(conf.client_key.as_deref(), Some("KEY PEM"));
+
+        let plain =
+            render_external_upstream("k8s-x", &external("db.example.com:443"), "5s").unwrap();
+        let conf = parse::<UpstreamConf>(&plain, "upstreams")
+            .remove("k8s-x")
+            .unwrap();
+        assert_eq!((conf.sni, conf.verify_cert, conf.ca), (None, None, None));
     }
 
     #[test]
@@ -732,7 +829,9 @@ mod tests {
              remark = 'pingap-k8s httproute shop/web', host = \"shop.example.com\", \
              path = '~^/api(/|$)', rewrite = '^/api/(.*) /$1', match_headers = ['x-env:canary'], \
              match_query = ['debug:1'], proxy_set_headers = ['host:api.internal'], \
-             plugins = [\n \"pingap:requestId\",\n \"auth\",\n] }}\n",
+             plugins = [\n \"pingap:requestId\",\n \"auth\",\n], max_retries = 3, \
+             max_retry_window = '15000ms', connection_timeout = \"500ms\", \
+             read_timeout = \"500ms\", write_timeout = \"500ms\" }}\n",
             60000
         );
         assert!(same_entry(&reformatted, &rendered));
@@ -875,6 +974,76 @@ global_certificates = true
         assert_eq!(entry["percentage"].as_integer(), Some(50));
         assert_eq!(entry["remark"].as_str(), Some("pingap-k8s plugin"));
         assert!(same_entry(&out, &render_plugin("k8s-mock-1", &plugin)));
+    }
+
+    /// The fields of Pingap's `cors` plugin, with the types it reads them as.
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct CorsConf {
+        category: String,
+        allow_origins: Vec<String>,
+        allow_methods: String,
+        allow_headers: Option<String>,
+        expose_headers: Option<String>,
+        allow_credentials: Option<bool>,
+        #[serde(with = "humantime_serde")]
+        max_age: Duration,
+        remark: String,
+    }
+
+    /// The fields of Pingap's `mirror` plugin, with the types it reads them as.
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct MirrorConf {
+        category: String,
+        target: String,
+        percentage: Option<u8>,
+        methods: Vec<String>,
+        max_body_size: String,
+        remark: String,
+    }
+
+    #[test]
+    fn cors_and_mirror_plugins_parse_as_pingap_plugins() {
+        use crate::gateway::api::httproutes::HttpRouteRulesFiltersCors;
+        use crate::gateway::extended::{cors_plugin, mirror_plugin};
+
+        let cors: HttpRouteRulesFiltersCors = serde_json::from_value(serde_json::json!({
+            "allowOrigins": ["https://*.bar.com"], "allowMethods": ["GET"],
+            "allowHeaders": ["x-a"], "exposeHeaders": ["x-b"], "allowCredentials": true,
+            "maxAge": 3600,
+        }))
+        .unwrap();
+        let (name, plugin) = cors_plugin(&cors).unwrap().unwrap();
+        let out = render_plugin(&name, &plugin);
+        let conf = parse::<CorsConf>(&out, "plugins").remove(&name).unwrap();
+        assert_eq!(conf.category, "cors");
+        assert_eq!(conf.max_age, Duration::from_secs(3600));
+        assert_eq!(conf.allow_methods, "GET");
+        assert_eq!(conf.allow_headers.as_deref(), Some("x-a"));
+        assert_eq!(conf.expose_headers.as_deref(), Some("x-b"));
+        assert_eq!(conf.allow_credentials, Some(true));
+        assert_eq!(conf.remark, "pingap-k8s plugin");
+        // Pingap compiles a `~` entry as an anchored pattern.
+        for origin in &conf.allow_origins {
+            let pattern = origin.strip_prefix('~').unwrap();
+            regex::Regex::new(&format!("^(?:{pattern})$")).unwrap();
+        }
+
+        let (name, plugin) = mirror_plugin("http://v2.ns.svc.cluster.local:8080", 20);
+        let out = render_plugin(&name, &plugin);
+        let conf = parse::<MirrorConf>(&out, "plugins").remove(&name).unwrap();
+        assert_eq!(conf.category, "mirror");
+        assert_eq!(conf.percentage, Some(20));
+        assert_eq!(conf.max_body_size, "1MiB");
+        assert!(conf.methods.contains(&"POST".to_string()));
+        assert_eq!(conf.remark, "pingap-k8s plugin");
+        // Pingap parses the target as a URL without a query.
+        let url = url::Url::parse(&conf.target).unwrap();
+        assert_eq!(url.scheme(), "http");
+        assert_eq!(url.host_str(), Some("v2.ns.svc.cluster.local"));
+        assert_eq!(url.port(), Some(8080));
+        assert_eq!(url.query(), None);
     }
 
     #[test]

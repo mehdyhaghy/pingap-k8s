@@ -35,7 +35,7 @@ use toml_edit::{Array, DocumentMut, Item, Table, TableLike, Value};
 use tracing::{debug, info, warn};
 
 use crate::metrics::EtcdHealth;
-use crate::types::{AddrsWriter, ForeignWrite, WriteOutcome};
+use crate::types::{AddrsWriter, ForeignWrite, UpstreamTls, WriteOutcome};
 
 /// The scheme of Pingap's etcd config URL.
 pub const ETCD_PROTOCOL: &str = "etcd://";
@@ -567,12 +567,29 @@ pub const SERVICE_UPDATE_FREQUENCY: &str = "5s";
 
 /// The entry written when an owned upstream key does not exist:
 /// `[upstreams.<name>]` with `addrs`, plus `update_frequency` when an address is a
-/// hostname ([`SERVICE_UPDATE_FREQUENCY`]) and `health_check` when given.
-pub fn minimal_upstream(upstream: &str, addrs: &[String], health_check: Option<&str>) -> String {
+/// hostname ([`SERVICE_UPDATE_FREQUENCY`]), `health_check` when given, and with `tls`
+/// its `sni`, `verify_cert = true`, `ca` and `client_cert` / `client_key`.
+pub fn minimal_upstream(
+    upstream: &str,
+    addrs: &[String],
+    health_check: Option<&str>,
+    tls: Option<&UpstreamTls>,
+) -> String {
     let mut entry = Table::new();
     entry.insert("addrs", toml_edit::value(new_array(addrs)));
     if let Some(health_check) = health_check {
         entry.insert("health_check", toml_edit::value(health_check));
+    }
+    if let Some(tls) = tls {
+        entry.insert("sni", toml_edit::value(tls.sni.as_str()));
+        entry.insert("verify_cert", toml_edit::value(true));
+        if let Some(ca) = &tls.ca {
+            entry.insert("ca", toml_edit::value(ca.as_str()));
+        }
+        if let Some((cert, key)) = &tls.client_cert {
+            entry.insert("client_cert", toml_edit::value(cert.as_str()));
+            entry.insert("client_key", toml_edit::value(key.as_str()));
+        }
     }
     if addrs.iter().any(|a| is_hostname(a)) {
         entry.insert(
@@ -726,6 +743,7 @@ impl EtcdWriter {
         upstream: &str,
         addrs: &[String],
         health_check: Option<&str>,
+        tls: Option<&UpstreamTls>,
     ) -> anyhow::Result<WriteOutcome> {
         check_name(upstream)?;
         if addrs.is_empty() {
@@ -762,7 +780,7 @@ impl EtcdWriter {
                         .when([Compare::create_revision(key.as_str(), CompareOp::Equal, 0)])
                         .and_then([TxnOp::put(
                             key.as_str(),
-                            minimal_upstream(upstream, addrs, health_check),
+                            minimal_upstream(upstream, addrs, health_check, tls),
                             None,
                         )]);
                     (txn, true)
@@ -877,7 +895,7 @@ impl AddrsWriter for EtcdWriter {
         upstream: &str,
         addrs: &[String],
     ) -> impl Future<Output = anyhow::Result<WriteOutcome>> + Send {
-        self.write_addrs_inner(upstream, addrs, None)
+        self.write_addrs_inner(upstream, addrs, None, None)
     }
 
     fn write_upstream(
@@ -885,8 +903,9 @@ impl AddrsWriter for EtcdWriter {
         upstream: &str,
         addrs: &[String],
         health_check: Option<&str>,
+        tls: Option<&UpstreamTls>,
     ) -> impl Future<Output = anyhow::Result<WriteOutcome>> + Send {
-        self.write_addrs_inner(upstream, addrs, health_check)
+        self.write_addrs_inner(upstream, addrs, health_check, tls)
     }
 }
 
@@ -1355,7 +1374,7 @@ connection_timeout = "10s"
 
     #[test]
     fn minimal_upstream_shape() {
-        let out = minimal_upstream("api-1", &s(&["10.0.0.1:80", "[::1]:80 2"]), None);
+        let out = minimal_upstream("api-1", &s(&["10.0.0.1:80", "[::1]:80 2"]), None, None);
         assert_eq!(
             out,
             "[upstreams.api-1]\naddrs = [\"10.0.0.1:80\", \"[::1]:80 2\"]\n"
@@ -1376,7 +1395,12 @@ connection_timeout = "10s"
 
     #[test]
     fn minimal_service_upstream_refreshes_dns_often() {
-        let out = minimal_upstream("legacy", &s(&["legacy.prod.svc.cluster.local:80 2"]), None);
+        let out = minimal_upstream(
+            "legacy",
+            &s(&["legacy.prod.svc.cluster.local:80 2"]),
+            None,
+            None,
+        );
         let value: toml::Table = toml::from_str(&out).unwrap();
         assert_eq!(
             value["upstreams"]["legacy"]["update_frequency"].as_str(),
@@ -1391,7 +1415,7 @@ connection_timeout = "10s"
     #[test]
     fn minimal_upstream_with_health_check() {
         let hc = "http://api/healthz?connection_timeout=1s&check_frequency=5s";
-        let out = minimal_upstream("k8s-api", &s(&["10.0.0.1:80"]), Some(hc));
+        let out = minimal_upstream("k8s-api", &s(&["10.0.0.1:80"]), Some(hc), None);
         let value: toml::Table = toml::from_str(&out).unwrap();
         assert_eq!(
             value["upstreams"]["k8s-api"]["health_check"].as_str(),
@@ -1406,6 +1430,41 @@ connection_timeout = "10s"
             value["upstreams"]["k8s-api"]["health_check"].as_str(),
             Some(hc)
         );
+    }
+
+    #[test]
+    fn minimal_upstream_with_tls() {
+        let tls = UpstreamTls {
+            sni: "api.example.com".into(),
+            ca: Some("-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n".into()),
+            client_cert: Some(("CERT".into(), "KEY".into())),
+        };
+        let out = minimal_upstream("k8s-api", &s(&["10.0.0.1:8443"]), None, Some(&tls));
+        let value: toml::Table = toml::from_str(&out).unwrap();
+        let entry = &value["upstreams"]["k8s-api"];
+        assert_eq!(entry["sni"].as_str(), Some("api.example.com"));
+        assert_eq!(entry["verify_cert"].as_bool(), Some(true));
+        assert_eq!(entry["ca"].as_str(), tls.ca.as_deref());
+        assert_eq!(entry["client_cert"].as_str(), Some("CERT"));
+        assert_eq!(entry["client_key"].as_str(), Some("KEY"));
+        // Updating addrs keeps them.
+        let updated = replace_addrs(&out, "k8s-api", &s(&["10.0.0.2:8443"]))
+            .unwrap()
+            .unwrap();
+        let value: toml::Table = toml::from_str(&updated).unwrap();
+        assert_eq!(
+            value["upstreams"]["k8s-api"]["sni"].as_str(),
+            Some("api.example.com")
+        );
+
+        let plain = UpstreamTls {
+            sni: "api.example.com".into(),
+            ..UpstreamTls::default()
+        };
+        let out = minimal_upstream("k8s-api", &s(&["10.0.0.1:8443"]), None, Some(&plain));
+        let value: toml::Table = toml::from_str(&out).unwrap();
+        let entry = value["upstreams"]["k8s-api"].as_table().unwrap();
+        assert!(!entry.contains_key("ca") && !entry.contains_key("client_cert"));
     }
 
     #[test]

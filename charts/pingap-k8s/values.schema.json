@@ -1,0 +1,416 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pingap-k8s chart values",
+  "type": "object",
+  "additionalProperties": false,
+  "$defs": {
+    "object": {
+      "description": "Passed through to Kubernetes as is.",
+      "type": ["object", "null"]
+    },
+    "list": {
+      "description": "Passed through to Kubernetes as is.",
+      "type": ["array", "null"]
+    },
+    "stringMap": {
+      "type": ["object", "null"],
+      "additionalProperties": { "type": "string" }
+    },
+    "stringList": {
+      "type": ["array", "null"],
+      "items": { "type": "string" }
+    },
+    "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+    "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] },
+    "duration": {
+      "description": "A humantime duration, e.g. \"500ms\", \"5m\".",
+      "type": "string",
+      "pattern": "^([0-9]+ *[a-zµ]+ *)+$"
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "pullPolicy": { "$ref": "#/$defs/pullPolicy" }
+      }
+    },
+    "tomlScalar": { "type": ["string", "boolean", "number"] },
+    "upstreamOptions": {
+      "description": "Per-upstream options of the controller config ([defaults] and [upstreams.<name>]).",
+      "type": "object",
+      "properties": {
+        "include_not_ready": { "type": "boolean" },
+        "drain_terminating": { "type": "boolean" },
+        "debounce": { "$ref": "#/$defs/duration" },
+        "debounce_max": { "$ref": "#/$defs/duration" },
+        "ip_family": { "enum": ["primary", "ipv4", "ipv6", "both"] },
+        "ipv4_only": {
+          "description": "Deprecated: use ip_family (true is \"ipv4\", false is \"primary\").",
+          "deprecated": true,
+          "type": "boolean"
+        },
+        "external_name": { "type": "boolean" },
+        "target": { "enum": ["pods", "service"] }
+      },
+      "not": { "required": ["ip_family", "ipv4_only"] }
+    }
+  },
+  "properties": {
+    "global": {
+      "description": "Values shared with a parent chart; not used.",
+      "type": "object"
+    },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "image": { "$ref": "#/$defs/image" },
+    "imagePullSecrets": { "$ref": "#/$defs/list" },
+    "replicaCount": { "type": "integer", "minimum": 0 },
+    "logFormat": { "enum": ["text", "json"] },
+    "logLevel": { "type": "string", "minLength": 1 },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": { "type": "boolean" },
+        "name": { "type": "string" },
+        "annotations": { "$ref": "#/$defs/stringMap" }
+      }
+    },
+    "rbac": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": { "type": "boolean" },
+        "namespaces": { "$ref": "#/$defs/stringList" },
+        "fromConfig": { "type": "boolean" }
+      }
+    },
+    "events": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" }
+      }
+    },
+    "gateway": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "controllerName": { "type": "string", "minLength": 1 },
+        "className": { "type": "string" },
+        "namespaces": { "$ref": "#/$defs/stringList" },
+        "secretNames": { "$ref": "#/$defs/stringList" },
+        "configMapNames": { "$ref": "#/$defs/stringList" },
+        "servers": { "$ref": "#/$defs/stringList" },
+        "externalName": { "type": "boolean" },
+        "addresses": { "$ref": "#/$defs/stringList" },
+        "healthCheck": { "type": "string" },
+        "maxTxnOps": { "type": "integer", "minimum": 2, "maximum": 1024 },
+        "groups": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "ports"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+                "maxLength": 63
+              },
+              "addresses": { "$ref": "#/$defs/stringList" },
+              "ports": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["port", "targetPort"],
+                  "properties": {
+                    "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+                    "targetPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+                    "tls": { "type": "boolean" },
+                    "settings": { "type": "object" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "etcd": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "url": { "type": "string" },
+        "tlsSecret": { "type": "string" },
+        "tlsKeys": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ca": { "type": "string", "minLength": 1 },
+            "cert": { "type": "string", "minLength": 1 },
+            "key": { "type": "string", "minLength": 1 }
+          }
+        },
+        "deploy": { "type": "boolean" },
+        "replicas": { "enum": [1, 3] },
+        "prefix": { "type": "string", "minLength": 1 },
+        "image": { "$ref": "#/$defs/image" },
+        "tls": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "autoGenerate": { "type": "boolean" },
+            "validityDays": { "type": "integer", "minimum": 1 },
+            "serverSecret": { "type": "string" },
+            "pingapClientSecret": { "type": "string" },
+            "peerAllowedCN": { "type": "string" }
+          }
+        },
+        "persistence": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "size": { "type": "string" },
+            "storageClass": { "type": "string" },
+            "accessModes": { "$ref": "#/$defs/stringList" }
+          }
+        },
+        "resources": { "$ref": "#/$defs/object" },
+        "extraArgs": { "$ref": "#/$defs/stringList" },
+        "nodeSelector": { "$ref": "#/$defs/stringMap" },
+        "tolerations": { "$ref": "#/$defs/list" },
+        "affinity": { "$ref": "#/$defs/object" },
+        "networkPolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "pingapPodLabels": { "$ref": "#/$defs/stringMap" },
+            "pingapNamespaceSelector": { "$ref": "#/$defs/object" },
+            "extraFrom": { "$ref": "#/$defs/list" }
+          }
+        },
+        "podDisruptionBudget": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kubernetes": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kubeconfig": { "type": "string" },
+            "context": { "type": "string" },
+            "default_namespace": { "type": "string" },
+            "cluster_domain": { "type": "string", "minLength": 1 }
+          }
+        },
+        "defaults": {
+          "allOf": [{ "$ref": "#/$defs/upstreamOptions" }],
+          "properties": {
+            "resync": { "$ref": "#/$defs/duration" }
+          },
+          "unevaluatedProperties": false
+        },
+        "upstreams": {
+          "type": ["object", "null"],
+          "propertyNames": { "pattern": "^[A-Za-z0-9_-]+$" },
+          "additionalProperties": {
+            "anyOf": [
+              { "type": "null" },
+              {
+                "allOf": [{ "$ref": "#/$defs/upstreamOptions" }],
+                "required": ["services"],
+                "properties": {
+                  "services": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": { "type": "string", "minLength": 1 }
+                  }
+                },
+                "unevaluatedProperties": false
+              }
+            ]
+          }
+        },
+        "server": {
+          "type": ["object", "null"],
+          "properties": {
+            "listen": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": {
+            "anyOf": [
+              { "$ref": "#/$defs/tomlScalar" },
+              { "type": "array", "items": { "$ref": "#/$defs/tomlScalar" } }
+            ]
+          }
+        },
+        "useSecret": { "type": "boolean" }
+      }
+    },
+    "metricsPort": { "$ref": "#/$defs/port" },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "service": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "port": { "$ref": "#/$defs/port" },
+            "annotations": { "$ref": "#/$defs/stringMap" }
+          }
+        }
+      }
+    },
+    "status": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "port": { "$ref": "#/$defs/port" }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "allowSameNamespace": { "type": "boolean" },
+        "metricsFrom": { "$ref": "#/$defs/list" }
+      }
+    },
+    "otel": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "endpoint": { "type": "string" },
+        "resourceAttributes": { "$ref": "#/$defs/stringMap" }
+      }
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minAvailable": { "type": ["integer", "string"] }
+      }
+    },
+    "podAnnotations": { "$ref": "#/$defs/stringMap" },
+    "podLabels": { "$ref": "#/$defs/stringMap" },
+    "podSecurityContext": { "$ref": "#/$defs/object" },
+    "securityContext": { "$ref": "#/$defs/object" },
+    "resources": { "$ref": "#/$defs/object" },
+    "livenessProbe": { "$ref": "#/$defs/object" },
+    "readinessProbe": { "$ref": "#/$defs/object" },
+    "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 },
+    "priorityClassName": { "type": "string" },
+    "nodeSelector": { "$ref": "#/$defs/stringMap" },
+    "tolerations": { "$ref": "#/$defs/list" },
+    "affinity": { "$ref": "#/$defs/object" },
+    "topologySpreadConstraints": { "$ref": "#/$defs/list" },
+    "extraEnv": { "$ref": "#/$defs/list" },
+    "pingap": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "deploy": { "type": "boolean" },
+        "replicas": { "type": "integer", "minimum": 0 },
+        "image": { "$ref": "#/$defs/image" },
+        "etcdUrl": { "type": "string" },
+        "etcdTlsSecret": { "type": "string" },
+        "httpPort": { "$ref": "#/$defs/port" },
+        "service": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": { "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+            "port": { "$ref": "#/$defs/port" },
+            "nodePort": {
+              "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/port" }]
+            },
+            "annotations": { "$ref": "#/$defs/stringMap" },
+            "loadBalancerSourceRanges": { "$ref": "#/$defs/stringList" },
+            "externalTrafficPolicy": { "enum": ["", "Cluster", "Local"] },
+            "ipFamilyPolicy": {
+              "enum": ["", "SingleStack", "PreferDualStack", "RequireDualStack"]
+            },
+            "ipFamilies": {
+              "type": ["array", "null"],
+              "maxItems": 2,
+              "uniqueItems": true,
+              "items": { "enum": ["IPv4", "IPv6"] }
+            }
+          }
+        },
+        "admin": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "port": { "$ref": "#/$defs/port" },
+            "user": { "type": "string" },
+            "password": { "type": "string" },
+            "existingSecret": { "type": "string" }
+          }
+        },
+        "networkPolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "extraPorts": {
+              "type": ["array", "null"],
+              "items": { "$ref": "#/$defs/port" }
+            },
+            "adminFrom": { "$ref": "#/$defs/list" }
+          }
+        },
+        "seed": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "config": { "type": "string" }
+          }
+        },
+        "extraArgs": { "$ref": "#/$defs/stringList" },
+        "extraEnv": { "$ref": "#/$defs/list" },
+        "podLabels": { "$ref": "#/$defs/stringMap" },
+        "podAnnotations": { "$ref": "#/$defs/stringMap" },
+        "podSecurityContext": { "$ref": "#/$defs/object" },
+        "securityContext": { "$ref": "#/$defs/object" },
+        "resources": { "$ref": "#/$defs/object" },
+        "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 },
+        "preStopSleepSeconds": { "type": "integer", "minimum": 0 },
+        "updateStrategy": { "$ref": "#/$defs/object" },
+        "podDisruptionBudget": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "minAvailable": { "type": ["integer", "string"] }
+          }
+        },
+        "nodeSelector": { "$ref": "#/$defs/stringMap" },
+        "tolerations": { "$ref": "#/$defs/list" },
+        "affinity": { "$ref": "#/$defs/object" },
+        "topologySpreadConstraints": { "$ref": "#/$defs/list" }
+      }
+    }
+  }
+}

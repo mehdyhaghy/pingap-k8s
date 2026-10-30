@@ -451,6 +451,7 @@ mod tests {
             rewrite: None,
             proxy_set_headers: vec![],
             plugins: vec![],
+            options: Default::default(),
         }
     }
 
@@ -698,6 +699,7 @@ mod tests {
             },
             addr: "legacy.example.com:80".into(),
             health_check: None,
+            tls: None,
         };
         case.desired
             .external

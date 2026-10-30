@@ -87,7 +87,8 @@ fn upstreams(target: UpstreamTarget) -> BTreeMap<String, UpstreamConfig> {
     let options = UpstreamOptions {
         include_not_ready: false,
         drain_terminating: true,
-        ipv4_only: false,
+        ip_family: pingap_k8s::types::IpFamily::Primary,
+        external_name: false,
         debounce: Duration::from_millis(500),
         debounce_max: Duration::from_secs(2),
         target,
@@ -107,6 +108,7 @@ fn upstreams(target: UpstreamTarget) -> BTreeMap<String, UpstreamConfig> {
             }],
             options,
             health_check: None,
+            tls: None,
         },
     );
     upstreams

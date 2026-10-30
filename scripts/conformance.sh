@@ -150,7 +150,7 @@ log "installing the Gateway API $GATEWAY_API_VERSION CRDs"
 kubectl apply --server-side -f "$gateway_crds" >/dev/null
 kubectl wait --for=condition=Established --timeout=60s \
   crd/gatewayclasses.gateway.networking.k8s.io crd/gateways.gateway.networking.k8s.io \
-  crd/listenersets.gateway.networking.k8s.io \
+  crd/listenersets.gateway.networking.k8s.io crd/backendtlspolicies.gateway.networking.k8s.io \
   crd/httproutes.gateway.networking.k8s.io crd/referencegrants.gateway.networking.k8s.io
 
 # --- chart --------------------------------------------------------------------

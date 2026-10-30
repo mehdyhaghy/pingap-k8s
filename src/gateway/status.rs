@@ -1,5 +1,5 @@
-//! Gateway provider: the `status` subresources of GatewayClasses, Gateways, ListenerSets
-//! and HTTPRoutes.
+//! Gateway provider: the `status` subresources of GatewayClasses, Gateways, ListenerSets,
+//! HTTPRoutes and BackendTLSPolicies.
 //!
 //! The desired statuses come from the translation with a placeholder
 //! `lastTransitionTime`. Before comparing, every desired condition takes the stored time
@@ -18,8 +18,9 @@
 //! replaced whole; other fields (`supportedFeatures`, `attachedListenerSets`) are only
 //! written when the translation sets them. Conditions of a type this controller never
 //! sets (on the object or on a listener) belong to someone else and are kept as they
-//! are. Route `status.parents` is shared with other controllers: their entries are kept
-//! as they are, only ours are replaced or removed.
+//! are. Route `status.parents` and BackendTLSPolicy `status.ancestors` are shared with
+//! other controllers: their entries are kept as they are, only ours are replaced or
+//! removed.
 
 use std::fmt::Debug;
 
@@ -33,6 +34,9 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tracing::debug;
 
+use super::api::backendtlspolicies::{
+    BackendTlsPolicy, BackendTlsPolicyStatus, BackendTlsPolicyStatusAncestors,
+};
 use super::api::gatewayclasses::{GatewayClass, GatewayClassStatus};
 use super::api::gateways::{
     Gateway, GatewayStatus, GatewayStatusAddresses, GatewayStatusListeners,
@@ -54,7 +58,7 @@ const DEFAULT_PARENT_KIND: &str = "Gateway";
 
 /// The condition types this controller sets, per object: other types are kept.
 const CLASS_CONDITIONS: &[&str] = &["Accepted", "SupportedVersion"];
-const GATEWAY_CONDITIONS: &[&str] = &["Accepted", "Programmed"];
+const GATEWAY_CONDITIONS: &[&str] = &["Accepted", "Programmed", "ResolvedRefs"];
 const LISTENER_SET_CONDITIONS: &[&str] = &["Accepted", "Programmed"];
 const LISTENER_CONDITIONS: &[&str] = &["Accepted", "Conflicted", "ResolvedRefs", "Programmed"];
 
@@ -448,6 +452,94 @@ pub fn route_patch_body(status: &HttpRouteStatus) -> Value {
     serde_json::json!({ "parents": status.parents })
 }
 
+// BackendTLSPolicy
+
+/// Identity of a policy ancestor entry, API server defaults filled in.
+type AncestorKey = ParentKey;
+
+fn ancestor_key(a: &BackendTlsPolicyStatusAncestors) -> AncestorKey {
+    let r = &a.ancestor_ref;
+    (
+        a.controller_name.clone(),
+        r.group.clone().unwrap_or_else(|| GATEWAY_GROUP.to_string()),
+        r.kind
+            .clone()
+            .unwrap_or_else(|| DEFAULT_PARENT_KIND.to_string()),
+        r.namespace.clone(),
+        r.name.clone(),
+        r.section_name.clone(),
+        r.port,
+    )
+}
+
+fn normalize_ancestor(mut a: BackendTlsPolicyStatusAncestors) -> BackendTlsPolicyStatusAncestors {
+    a.ancestor_ref
+        .group
+        .get_or_insert_with(|| GATEWAY_GROUP.to_string());
+    a.ancestor_ref
+        .kind
+        .get_or_insert_with(|| DEFAULT_PARENT_KIND.to_string());
+    a
+}
+
+/// The policy status to store: the `stored` ancestor entries of other controllers,
+/// untouched and in their order, followed by the `desired` entries of `controller` with
+/// transition times merged. Stored entries of `controller` that are not desired are
+/// dropped.
+pub fn splice_policy_ancestors(
+    stored: Option<&BackendTlsPolicyStatus>,
+    desired: &BackendTlsPolicyStatus,
+    controller: &str,
+    now: &Time,
+) -> BackendTlsPolicyStatus {
+    let stored_ancestors = stored.map_or(&[][..], |s| s.ancestors.as_slice());
+    let mut ancestors: Vec<BackendTlsPolicyStatusAncestors> = stored_ancestors
+        .iter()
+        .filter(|a| a.controller_name != controller)
+        .cloned()
+        .collect();
+    for want in desired
+        .ancestors
+        .iter()
+        .filter(|a| a.controller_name == controller)
+    {
+        let key = ancestor_key(want);
+        let old = stored_ancestors
+            .iter()
+            .find(|a| ancestor_key(a) == key)
+            .map_or(&[][..], |a| a.conditions.as_slice());
+        ancestors.push(normalize_ancestor(BackendTlsPolicyStatusAncestors {
+            conditions: merge_conditions(old, &want.conditions, now),
+            ..want.clone()
+        }));
+    }
+    BackendTlsPolicyStatus { ancestors }
+}
+
+fn canonical_policy(status: Option<&BackendTlsPolicyStatus>) -> Vec<(AncestorKey, Vec<Condition>)> {
+    let mut list: Vec<(AncestorKey, Vec<Condition>)> = status
+        .map_or(&[][..], |s| s.ancestors.as_slice())
+        .iter()
+        .map(|a| (ancestor_key(a), sorted_conditions(&a.conditions)))
+        .collect();
+    list.sort_by(|a, b| a.0.cmp(&b.0));
+    list
+}
+
+/// Whether two policy statuses are the same (ancestors compared as a set by controller
+/// and `ancestorRef`, API server defaults filled in).
+pub fn policy_status_equal(
+    a: Option<&BackendTlsPolicyStatus>,
+    b: Option<&BackendTlsPolicyStatus>,
+) -> bool {
+    canonical_policy(a) == canonical_policy(b)
+}
+
+/// The `status` object of the merge patch: the whole `ancestors` list.
+pub fn policy_patch_body(status: &BackendTlsPolicyStatus) -> Value {
+    serde_json::json!({ "ancestors": status.ancestors })
+}
+
 fn set_null_if_absent(body: &mut Value, keys: &[&str]) {
     if let Value::Object(map) = body {
         for key in keys {
@@ -649,6 +741,34 @@ impl super::model::StatusPublisher for KubeStatus {
                 let merged = splice_route_parents(obj.status.as_ref(), status, controller, &now);
                 (!route_status_equal(obj.status.as_ref(), Some(&merged)))
                     .then(|| route_patch_body(&merged))
+            },
+        )
+        .await
+    }
+
+    async fn publish_backend_tls_policy(
+        &self,
+        policy: &BackendTlsPolicy,
+        status: &BackendTlsPolicyStatus,
+    ) -> anyhow::Result<bool> {
+        let namespace = policy
+            .metadata
+            .namespace
+            .as_deref()
+            .context("BackendTLSPolicy without a namespace")?;
+        let what = format!("BackendTLSPolicy {namespace}/{}", policy.name_any());
+        let rbac = format!("patch on backendtlspolicies/status in namespace {namespace}");
+        let now = now();
+        let controller = self.controller_name.as_str();
+        write_status(
+            Api::namespaced(self.client.clone(), namespace),
+            policy,
+            &what,
+            &rbac,
+            |obj: &BackendTlsPolicy| {
+                let merged = splice_policy_ancestors(obj.status.as_ref(), status, controller, &now);
+                (!policy_status_equal(obj.status.as_ref(), Some(&merged)))
+                    .then(|| policy_patch_body(&merged))
             },
         )
         .await
@@ -872,6 +992,90 @@ mod tests {
         assert!(!route_status_equal(Some(&stored), Some(&merged)));
         let body = route_patch_body(&merged);
         assert_eq!(body["parents"].as_array().unwrap().len(), 3);
+    }
+
+    fn ancestor(
+        controller: &str,
+        gateway: &str,
+        conditions: Vec<Condition>,
+    ) -> BackendTlsPolicyStatusAncestors {
+        BackendTlsPolicyStatusAncestors {
+            ancestor_ref: crate::gateway::api::backendtlspolicies::BackendTlsPolicyStatusAncestorsAncestorRef {
+                name: gateway.into(),
+                namespace: Some("ns".into()),
+                ..Default::default()
+            },
+            conditions,
+            controller_name: controller.into(),
+        }
+    }
+
+    #[test]
+    fn policy_ancestors_of_other_controllers_are_kept() {
+        let foreign = ancestor("other.io/ctl", "gw", vec![cond("Accepted", "True", 50)]);
+        let stored = BackendTlsPolicyStatus {
+            ancestors: vec![
+                foreign.clone(),
+                normalize_ancestor(ancestor(OURS, "gw", vec![cond("Accepted", "True", 100)])),
+                ancestor(OURS, "old", vec![cond("Accepted", "True", 100)]),
+            ],
+        };
+        let desired = BackendTlsPolicyStatus {
+            ancestors: vec![
+                ancestor(OURS, "gw", vec![cond("Accepted", "True", 0)]),
+                ancestor(OURS, "new", vec![cond("Accepted", "False", 0)]),
+            ],
+        };
+        let merged = splice_policy_ancestors(Some(&stored), &desired, OURS, &at(500));
+        assert_eq!(merged.ancestors.len(), 3);
+        assert_eq!(merged.ancestors[0], foreign, "untouched");
+        assert_eq!(merged.ancestors[1].ancestor_ref.name, "gw");
+        assert_eq!(
+            merged.ancestors[1].conditions[0].last_transition_time,
+            at(100)
+        );
+        assert_eq!(
+            merged.ancestors[1].ancestor_ref.group.as_deref(),
+            Some(GATEWAY_GROUP)
+        );
+        assert_eq!(merged.ancestors[2].ancestor_ref.name, "new");
+        assert_eq!(
+            merged.ancestors[2].conditions[0].last_transition_time,
+            at(500)
+        );
+        assert!(!policy_status_equal(Some(&stored), Some(&merged)));
+        let body = policy_patch_body(&merged);
+        assert_eq!(body["ancestors"].as_array().unwrap().len(), 3);
+
+        // Nothing desired: ours go, the foreign entry stays.
+        let cleared = splice_policy_ancestors(
+            Some(&stored),
+            &BackendTlsPolicyStatus::default(),
+            OURS,
+            &at(500),
+        );
+        assert_eq!(cleared.ancestors, vec![foreign]);
+
+        // Unchanged (defaults filled in on the stored side, other order): no write.
+        let stored = BackendTlsPolicyStatus {
+            ancestors: vec![normalize_ancestor(ancestor(
+                OURS,
+                "gw",
+                vec![
+                    cond("ResolvedRefs", "True", 100),
+                    cond("Accepted", "True", 100),
+                ],
+            ))],
+        };
+        let desired = BackendTlsPolicyStatus {
+            ancestors: vec![ancestor(
+                OURS,
+                "gw",
+                vec![cond("Accepted", "True", 0), cond("ResolvedRefs", "True", 0)],
+            )],
+        };
+        let merged = splice_policy_ancestors(Some(&stored), &desired, OURS, &at(500));
+        assert!(policy_status_equal(Some(&stored), Some(&merged)));
     }
 
     #[test]
