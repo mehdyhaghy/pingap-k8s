@@ -11,15 +11,29 @@
 //!   protocol TCP (unset protocol means TCP). Nothing is guessed: an
 //!   unresolved entry contributes nothing and produces a [`ResolveWarning`].
 //! - Classification: see [`classify`]. Only the first address of each
-//!   endpoint is used. FQDN slices are skipped, IPv6 slices are skipped with
-//!   `ipv4_only`.
+//!   endpoint is used. FQDN slices are skipped.
+//! - Address family (`ip_family`): a dual-stack Service has one slice per family,
+//!   so each pod shows up twice. `primary` (the default) reads the slices of the
+//!   Service's primary family (`spec.ipFamilies[0]`) first and takes an endpoint of
+//!   the other family only when its pod (`targetRef`) has no address in the primary
+//!   one; an endpoint without `targetRef` is taken from the other family only when
+//!   the primary family has no endpoint on the port at all. `ipv4` and `ipv6` read
+//!   only that family, `both` reads every slice (one address per family).
+//! - `ExternalName` Services: with `external_name`, the entry contributes
+//!   `<spec.externalName>:<port>` (Pingap resolves the name itself, see
+//!   `etcd::minimal_upstream`), in either target mode. Without it, `target = "pods"`
+//!   warns ([`ResolveWarning::ExternalNameNotEnabled`]) and `target = "service"` keeps
+//!   writing the Service's cluster DNS name.
+//! - `target = "pods"` writes every endpoint, so a Service's `trafficDistribution`
+//!   and `internalTrafficPolicy: Local` have no effect; each produces a
+//!   [`ResolveWarning::TrafficPolicyIgnored`] (the addresses are still written).
 //! - Drain: ready endpoints are written; if there are none but some are
 //!   draining, the draining ones are written and `fallback` is set. With
 //!   `drain_terminating = false`, draining endpoints count as ready.
 //!
 //! - Target mode: with `target = "service"` the Service and its port are
 //!   checked as for pods, and each entry contributes its ClusterIP (or, when
-//!   headless, its DNS name) instead of pod IPs, once a slice has a ready or
+//!   headless, its DNS name; with `ip_family = "both"`, every ClusterIP) instead of pod IPs, once a slice has a ready or
 //!   serving endpoint on that port (see `resolve_service_target`). `ready`
 //!   counts the addresses written, and the drain fallback never applies.
 //!
@@ -28,15 +42,15 @@
 //! config order keeps its weight (no warning); if any occurrence is ready, the
 //! address counts as ready.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 
 use k8s_openapi::api::core::v1::{Service, ServicePort};
-use k8s_openapi::api::discovery::v1::{EndpointConditions, EndpointSlice};
+use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointSlice};
 
 use crate::types::{
-    PortRef, ServiceKey, ServiceRef, ServiceSnapshot, UpstreamOptions, UpstreamTarget,
+    IpFamily, PortRef, ServiceKey, ServiceRef, ServiceSnapshot, UpstreamOptions, UpstreamTarget,
 };
 
 /// One `services` entry of an upstream together with the current state of
@@ -47,8 +61,8 @@ pub struct ServiceInput<'a> {
     pub snapshot: &'a ServiceSnapshot,
 }
 
-/// Why a `services` entry contributed nothing. Reconcile logs each distinct
-/// warning once.
+/// Why a `services` entry contributed nothing, or (`TrafficPolicyIgnored`) a setting
+/// it does not honor. Reconcile logs each distinct warning once.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ResolveWarning {
     /// The Service does not exist (or is not listed yet).
@@ -61,6 +75,15 @@ pub enum ResolveWarning {
         service: ServiceKey,
         port: PortRef,
         port_name: String,
+    },
+    /// An `ExternalName` Service in `target = "pods"` mode while `external_name` is off.
+    ExternalNameNotEnabled(ServiceKey),
+    /// An `ExternalName` Service whose `externalName` or port cannot be written.
+    ExternalNameInvalid { service: ServiceKey, reason: String },
+    /// `target = "pods"` ignores this Service setting (`setting` is `field: value`).
+    TrafficPolicyIgnored {
+        service: ServiceKey,
+        setting: String,
     },
 }
 
@@ -81,6 +104,17 @@ impl fmt::Display for ResolveWarning {
                 f,
                 "endpoint slices of service {service} have no TCP port named {port_name:?} (configured port {port})"
             ),
+            ResolveWarning::ExternalNameNotEnabled(service) => write!(
+                f,
+                "service {service} is of type ExternalName, which needs external_name = true"
+            ),
+            ResolveWarning::ExternalNameInvalid { service, reason } => {
+                write!(f, "ExternalName service {service}: {reason}")
+            }
+            ResolveWarning::TrafficPolicyIgnored { service, setting } => write!(
+                f,
+                "service {service} sets {setting}, which target = \"pods\" does not honor (every endpoint is written); use target = \"service\" to have kube-proxy apply it"
+            ),
         }
     }
 }
@@ -89,7 +123,8 @@ impl fmt::Display for ResolveWarning {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Resolved {
     /// Sorted by the final string, deduped by `ip:port`, in Pingap form
-    /// `ip:port[ weight]` (IPv6 as `[ip]:port`). Empty means "nothing to
+    /// `ip:port[ weight]` (IPv6 as `[ip]:port`; `host:port` for an `ExternalName`
+    /// Service). Empty means "nothing to
     /// write" (the caller keeps the last `addrs`).
     pub addrs: Vec<String>,
     /// Unique ready endpoints. With `drain_terminating = false` this includes
@@ -257,6 +292,8 @@ pub fn resolve(inputs: &[ServiceInput<'_>], opts: &UpstreamOptions) -> Resolved 
     }
     let mut warnings = Vec::new();
     let mut seen: HashMap<SocketAddr, Entry> = HashMap::new();
+    // `ExternalName` addresses: address -> (source, weight), first in config order wins.
+    let mut external: HashMap<String, (usize, Option<u32>)> = HashMap::new();
 
     for (source, input) in inputs.iter().enumerate() {
         let sref = input.service_ref;
@@ -264,6 +301,20 @@ pub fn resolve(inputs: &[ServiceInput<'_>], opts: &UpstreamOptions) -> Resolved 
             warnings.push(ResolveWarning::ServiceMissing(sref.key.clone()));
             continue;
         };
+        if is_external_name(service) {
+            if !opts.external_name {
+                warnings.push(ResolveWarning::ExternalNameNotEnabled(sref.key.clone()));
+                continue;
+            }
+            match external_addr(service, sref) {
+                Ok(addr) => {
+                    external.entry(addr).or_insert((source, sref.weight));
+                }
+                Err(w) => warnings.push(w),
+            }
+            continue;
+        }
+        warnings.extend(traffic_policy_warnings(service, &sref.key));
         let Some(service_port) = find_service_port(service, &sref.port) else {
             warnings.push(ResolveWarning::PortNotInService {
                 service: sref.key.clone(),
@@ -273,17 +324,30 @@ pub fn resolve(inputs: &[ServiceInput<'_>], opts: &UpstreamOptions) -> Resolved 
         };
         let port_name = service_port.name.as_deref().unwrap_or("");
 
-        let mut port_missing = false;
-        for slice in &input.snapshot.slices {
-            let ipv6 = match slice.address_type.as_str() {
-                "IPv4" => false,
-                "IPv6" => true,
+        // `(slice, is IPv6)`; with `ip_family = "primary"` the primary family first.
+        let primary_v6 = primary_is_ipv6(service);
+        let mut slices: Vec<(&EndpointSlice, bool)> = input
+            .snapshot
+            .slices
+            .iter()
+            .filter_map(|slice| match slice.address_type.as_str() {
+                "IPv4" => Some((&**slice, false)),
+                "IPv6" => Some((&**slice, true)),
                 // FQDN (and anything unknown) is not supported.
-                _ => continue,
-            };
-            if ipv6 && opts.ipv4_only {
-                continue;
-            }
+                _ => None,
+            })
+            .filter(|(_, ipv6)| opts.ip_family.allows(*ipv6))
+            .collect();
+        let dedupe_pods = opts.ip_family == IpFamily::Primary;
+        if dedupe_pods {
+            slices.sort_by_key(|(_, ipv6)| *ipv6 != primary_v6);
+        }
+        // Pods with an endpoint in the primary family, and whether there was any.
+        let mut primary_pods: HashSet<String> = HashSet::new();
+        let mut primary_any = false;
+
+        let mut port_missing = false;
+        for (slice, ipv6) in slices {
             if slice.endpoints.is_empty() {
                 continue;
             }
@@ -291,7 +355,21 @@ pub fn resolve(inputs: &[ServiceInput<'_>], opts: &UpstreamOptions) -> Resolved 
                 port_missing = true;
                 continue;
             };
+            let primary = ipv6 == primary_v6;
             for endpoint in &slice.endpoints {
+                if dedupe_pods {
+                    let pod = pod_identity(endpoint);
+                    if primary {
+                        primary_any = true;
+                        primary_pods.extend(pod);
+                    } else if match &pod {
+                        Some(pod) => primary_pods.contains(pod),
+                        None => primary_any,
+                    } {
+                        // Already written with its primary-family address.
+                        continue;
+                    }
+                }
                 let mut class = classify(endpoint.conditions.as_ref(), opts.include_not_ready);
                 if class == Class::Excluded {
                     continue;
@@ -335,8 +413,8 @@ pub fn resolve(inputs: &[ServiceInput<'_>], opts: &UpstreamOptions) -> Resolved 
         }
     }
 
-    let ready = seen.values().filter(|e| e.class == Class::Ready).count();
-    let draining = seen.len() - ready;
+    let ready = seen.values().filter(|e| e.class == Class::Ready).count() + external.len();
+    let draining = seen.len() + external.len() - ready;
     let (wanted, fallback) = if ready > 0 {
         (Class::Ready, false)
     } else if draining > 0 {
@@ -349,6 +427,12 @@ pub fn resolve(inputs: &[ServiceInput<'_>], opts: &UpstreamOptions) -> Resolved 
         seen.iter()
             .filter(|(_, e)| e.class == wanted)
             .map(|(addr, e)| (addr.to_string(), e.source, e.weight))
+            .chain(
+                external
+                    .into_iter()
+                    .filter(|_| wanted == Class::Ready)
+                    .map(|(addr, (source, weight))| (addr, source, weight)),
+            )
             .collect(),
         opts.spread_weights,
     );
@@ -367,7 +451,7 @@ pub fn resolve(inputs: &[ServiceInput<'_>], opts: &UpstreamOptions) -> Resolved 
 
 /// `target = "service"`: one Service address per entry, port is the Service `port`.
 ///
-/// The address is the Service's ClusterIP (with `ipv4_only`, its first IPv4 one), so a
+/// The address is the Service's ClusterIP (see [`cluster_ips`] for `ip_family`), so a
 /// Service deleted and recreated with a new ClusterIP is followed by a write within the
 /// debounce, like a pod change. Writing the DNS name instead left it to Pingap's DNS
 /// discovery, which keeps an answer for its TTL (30 s with the default CoreDNS config)
@@ -379,7 +463,6 @@ fn resolve_service_target(
     cluster_domain: &str,
     opts: &UpstreamOptions,
 ) -> Resolved {
-    let ipv4_only = opts.ipv4_only;
     let mut warnings = Vec::new();
     // address -> (source, weight); the first entry in config order keeps its weight.
     let mut seen: HashMap<String, (usize, Option<u32>)> = HashMap::new();
@@ -390,6 +473,15 @@ fn resolve_service_target(
             warnings.push(ResolveWarning::ServiceMissing(sref.key.clone()));
             continue;
         };
+        if opts.external_name && is_external_name(service) {
+            match external_addr(service, sref) {
+                Ok(addr) => {
+                    seen.entry(addr).or_insert((source, sref.weight));
+                }
+                Err(w) => warnings.push(w),
+            }
+            continue;
+        }
         let Some(service_port) = find_service_port(service, &sref.port) else {
             warnings.push(ResolveWarning::PortNotInService {
                 service: sref.key.clone(),
@@ -405,22 +497,26 @@ fn resolve_service_target(
             });
             continue;
         };
-        let host = match cluster_ip(service, ipv4_only) {
+        let ips = cluster_ips(service, opts.ip_family);
+        let hosts: Vec<String> = if ips.is_empty() {
+            vec![format!(
+                "{}.{}.svc.{cluster_domain}",
+                sref.key.name, sref.key.namespace
+            )]
+        } else if !has_endpoint(input.snapshot, port_name) {
             // The ClusterIP is routed only once the Service has endpoints (kube-proxy
             // programs it from the EndpointSlices): until then it contributes nothing
             // and the stored address is kept. Written earlier, Pingap's first health
             // check of a recreated Service timed out and held it unhealthy for a whole
             // check interval.
-            Some(_) if !has_endpoint(input.snapshot, port_name) => continue,
-            Some(IpAddr::V4(v4)) => v4.to_string(),
-            Some(IpAddr::V6(v6)) => format!("[{v6}]"),
-            None => format!(
-                "{}.{}.svc.{cluster_domain}",
-                sref.key.name, sref.key.namespace
-            ),
+            continue;
+        } else {
+            ips.iter().map(host_of).collect()
         };
-        seen.entry(format!("{host}:{port}"))
-            .or_insert((source, sref.weight));
+        for host in hosts {
+            seen.entry(format!("{host}:{port}"))
+                .or_insert((source, sref.weight));
+        }
     }
 
     let addrs = format_addrs(
@@ -451,11 +547,14 @@ fn has_endpoint(snapshot: &ServiceSnapshot, port_name: &str) -> bool {
     })
 }
 
-/// The ClusterIP to write for a Service: the first of `clusterIPs` (the primary family),
-/// or with `ipv4_only` the first IPv4 one. `None` for a headless Service (`None`), a
-/// Service without one, or no address of the wanted family.
-fn cluster_ip(service: &Service, ipv4_only: bool) -> Option<IpAddr> {
-    let spec = service.spec.as_ref()?;
+/// The ClusterIPs to write for a Service: the first of `clusterIPs` (the primary family)
+/// for `primary`, the first one of the family for `ipv4` / `ipv6`, all of them for
+/// `both`. Empty for a headless Service (`None`), a Service without one, or no address
+/// of the wanted family.
+fn cluster_ips(service: &Service, family: IpFamily) -> Vec<IpAddr> {
+    let Some(spec) = service.spec.as_ref() else {
+        return Vec::new();
+    };
     let ips: Vec<IpAddr> = match spec.cluster_ips.as_deref() {
         Some(ips) if !ips.is_empty() => ips.iter().filter_map(|ip| ip.parse().ok()).collect(),
         _ => spec
@@ -464,7 +563,134 @@ fn cluster_ip(service: &Service, ipv4_only: bool) -> Option<IpAddr> {
             .filter_map(|ip| ip.parse().ok())
             .collect(),
     };
-    ips.into_iter().find(|ip| !ipv4_only || ip.is_ipv4())
+    match family {
+        IpFamily::Both => ips,
+        IpFamily::Primary => ips.into_iter().take(1).collect(),
+        IpFamily::Ipv4 | IpFamily::Ipv6 => ips
+            .into_iter()
+            .filter(|ip| family.allows(ip.is_ipv6()))
+            .take(1)
+            .collect(),
+    }
+}
+
+/// An IP as the host part of an address: IPv6 in brackets.
+fn host_of(ip: &IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => format!("[{v6}]"),
+    }
+}
+
+/// Whether the Service's primary family is IPv6: `spec.ipFamilies[0]`, else the family
+/// of its first ClusterIP; IPv4 when neither says.
+fn primary_is_ipv6(service: &Service) -> bool {
+    let Some(spec) = service.spec.as_ref() else {
+        return false;
+    };
+    if let Some(family) = spec.ip_families.as_deref().and_then(<[String]>::first) {
+        return family == "IPv6";
+    }
+    spec.cluster_ips
+        .as_deref()
+        .and_then(<[String]>::first)
+        .or(spec.cluster_ip.as_ref())
+        .and_then(|ip| ip.parse::<IpAddr>().ok())
+        .is_some_and(|ip| ip.is_ipv6())
+}
+
+/// The pod behind an endpoint (`targetRef`), the same in the slices of both families.
+fn pod_identity(endpoint: &Endpoint) -> Option<String> {
+    let target = endpoint.target_ref.as_ref()?;
+    if let Some(uid) = target.uid.as_deref().filter(|u| !u.is_empty()) {
+        return Some(uid.to_string());
+    }
+    let name = target.name.as_deref().filter(|n| !n.is_empty())?;
+    Some(format!(
+        "{}/{}/{name}",
+        target.kind.as_deref().unwrap_or(""),
+        target.namespace.as_deref().unwrap_or("")
+    ))
+}
+
+fn is_external_name(service: &Service) -> bool {
+    service.spec.as_ref().and_then(|s| s.type_.as_deref()) == Some("ExternalName")
+}
+
+/// `<externalName>:<port>` of an `ExternalName` Service, checked as the Gateway API
+/// provider checks it (`gateway::render::render_external_upstream`): the trailing dot is
+/// dropped, an IPv6 literal is bracketed, and an IP literal must pass
+/// [`is_pod_address`]. The port is the configured number, or the `port` of the Service
+/// port with the configured name.
+fn external_addr(service: &Service, sref: &ServiceRef) -> Result<String, ResolveWarning> {
+    let invalid = |reason: String| ResolveWarning::ExternalNameInvalid {
+        service: sref.key.clone(),
+        reason,
+    };
+    let host = service
+        .spec
+        .as_ref()
+        .and_then(|s| s.external_name.as_deref())
+        .map(|h| h.trim().trim_end_matches('.'))
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| invalid("spec.externalName is empty".into()))?;
+    let port = match &sref.port {
+        PortRef::Number(number) => *number,
+        PortRef::Name(_) => match find_service_port(service, &sref.port) {
+            Some(p) => p.port,
+            None => {
+                return Err(ResolveWarning::PortNotInService {
+                    service: sref.key.clone(),
+                    port: sref.port.clone(),
+                });
+            }
+        },
+    };
+    let port = u16::try_from(port)
+        .ok()
+        .filter(|p| *p != 0)
+        .ok_or_else(|| invalid(format!("port {port} is not valid")))?;
+    let host = match host.parse::<IpAddr>() {
+        Ok(ip) if !is_pod_address(&ip) => {
+            return Err(invalid(format!(
+                "{host} is a loopback, link-local, multicast or unspecified address"
+            )));
+        }
+        Ok(ip) => host_of(&ip),
+        Err(_)
+            if host.contains(|c: char| matches!(c, ':' | '/' | '[' | ']') || c.is_whitespace()) =>
+        {
+            return Err(invalid(format!("{host:?} is not a host name")));
+        }
+        Err(_) => host.to_ascii_lowercase(),
+    };
+    Ok(format!("{host}:{port}"))
+}
+
+/// `target = "pods"` writes every endpoint itself, so kube-proxy's topology settings
+/// never apply: `trafficDistribution` (any value) and `internalTrafficPolicy: Local`.
+fn traffic_policy_warnings(service: &Service, key: &ServiceKey) -> Vec<ResolveWarning> {
+    let Some(spec) = service.spec.as_ref() else {
+        return Vec::new();
+    };
+    let distribution = spec
+        .traffic_distribution
+        .as_deref()
+        .filter(|d| !d.is_empty())
+        .map(|d| format!("trafficDistribution: {d}"));
+    let internal = spec
+        .internal_traffic_policy
+        .as_deref()
+        .filter(|p| *p == "Local")
+        .map(|p| format!("internalTrafficPolicy: {p}"));
+    distribution
+        .into_iter()
+        .chain(internal)
+        .map(|setting| ResolveWarning::TrafficPolicyIgnored {
+            service: key.clone(),
+            setting,
+        })
+        .collect()
 }
 
 /// Kubernetes rejects these for pod and Endpoints addresses; an EndpointSlice
@@ -495,7 +721,8 @@ mod tests {
         UpstreamOptions {
             include_not_ready: false,
             drain_terminating: true,
-            ipv4_only: false,
+            ip_family: IpFamily::Primary,
+            external_name: false,
             debounce: Duration::from_millis(500),
             debounce_max: Duration::from_secs(2),
             target: UpstreamTarget::Pods,
@@ -856,7 +1083,8 @@ mod tests {
     fn slices_table() {
         type Tweak = fn(&mut UpstreamOptions);
         let none: Tweak = |_| {};
-        let v4only: Tweak = |o| o.ipv4_only = true;
+        let v4only: Tweak = |o| o.ip_family = IpFamily::Ipv4;
+        let both: Tweak = |o| o.ip_family = IpFamily::Both;
         let p = &[("http", 8080, "TCP")];
         let cases: Vec<(&str, Vec<Arc<EndpointSlice>>, Tweak, Vec<&str>)> = vec![
             (
@@ -869,16 +1097,25 @@ mod tests {
                 vec!["10.0.0.1:8080", "10.0.0.2:8080"],
             ),
             (
-                "dual stack merged, IPv6 bracketed",
+                "both: dual stack merged, IPv6 bracketed",
+                vec![
+                    v4(vec![ep("10.0.0.1", READY)]),
+                    slice("IPv6", p, vec![ep("fd00::1", READY)]),
+                ],
+                both,
+                vec!["10.0.0.1:8080", "[fd00::1]:8080"],
+            ),
+            (
+                "primary: an endpoint without targetRef only when the primary family has none",
                 vec![
                     v4(vec![ep("10.0.0.1", READY)]),
                     slice("IPv6", p, vec![ep("fd00::1", READY)]),
                 ],
                 none,
-                vec!["10.0.0.1:8080", "[fd00::1]:8080"],
+                vec!["10.0.0.1:8080"],
             ),
             (
-                "ipv4_only drops IPv6 slices",
+                "ipv4 drops IPv6 slices",
                 vec![
                     v4(vec![ep("10.0.0.1", READY)]),
                     slice("IPv6", p, vec![ep("fd00::1", READY)]),
@@ -945,6 +1182,299 @@ mod tests {
             assert_eq!(got.ready, addrs.len(), "case {name} ready");
             assert!(got.warnings.is_empty(), "case {name}: {:?}", got.warnings);
         }
+    }
+
+    fn pod_ep(addr: &str, pod: &str, c: Cond) -> Endpoint {
+        Endpoint {
+            target_ref: Some(k8s_openapi::api::core::v1::ObjectReference {
+                kind: Some("Pod".into()),
+                namespace: Some("prod".into()),
+                name: Some(pod.into()),
+                uid: Some(format!("uid-{pod}")),
+                ..Default::default()
+            }),
+            ..ep(addr, c)
+        }
+    }
+
+    fn with_families(svc: Arc<Service>, families: &[&str]) -> Arc<Service> {
+        let mut svc = (*svc).clone();
+        svc.spec.as_mut().unwrap().ip_families =
+            Some(families.iter().map(|f| f.to_string()).collect());
+        Arc::new(svc)
+    }
+
+    #[test]
+    fn dual_stack_one_address_per_pod() {
+        let p = &[("http", 8080, "TCP")];
+        // Pods a and b in both families; c only has an IPv6 address; d is draining.
+        let slices = vec![
+            v4(vec![
+                pod_ep("10.0.0.1", "a", READY),
+                pod_ep("10.0.0.2", "b", READY),
+                pod_ep("10.0.0.4", "d", DRAINING),
+            ]),
+            slice(
+                "IPv6",
+                p,
+                vec![
+                    pod_ep("fd00::1", "a", READY),
+                    pod_ep("fd00::2", "b", READY),
+                    pod_ep("fd00::3", "c", READY),
+                    pod_ep("fd00::4", "d", DRAINING),
+                ],
+            ),
+        ];
+        let r = sref("api", named("http"), None);
+        use IpFamily::{Both, Ipv4, Ipv6, Primary};
+        let cases: Vec<(&str, &[&str], IpFamily, Vec<&str>, usize, usize)> = vec![
+            (
+                "IPv4 primary",
+                &["IPv4", "IPv6"],
+                Primary,
+                vec!["10.0.0.1:8080", "10.0.0.2:8080", "[fd00::3]:8080"],
+                3,
+                1,
+            ),
+            (
+                "IPv6 primary",
+                &["IPv6", "IPv4"],
+                Primary,
+                vec!["[fd00::1]:8080", "[fd00::2]:8080", "[fd00::3]:8080"],
+                3,
+                1,
+            ),
+            (
+                "no ipFamilies: IPv4",
+                &[],
+                Primary,
+                vec!["10.0.0.1:8080", "10.0.0.2:8080", "[fd00::3]:8080"],
+                3,
+                1,
+            ),
+            (
+                "ipv4",
+                &["IPv6", "IPv4"],
+                Ipv4,
+                vec!["10.0.0.1:8080", "10.0.0.2:8080"],
+                2,
+                1,
+            ),
+            (
+                "ipv6",
+                &["IPv4", "IPv6"],
+                Ipv6,
+                vec!["[fd00::1]:8080", "[fd00::2]:8080", "[fd00::3]:8080"],
+                3,
+                1,
+            ),
+            (
+                "both",
+                &["IPv4", "IPv6"],
+                Both,
+                vec![
+                    "10.0.0.1:8080",
+                    "10.0.0.2:8080",
+                    "[fd00::1]:8080",
+                    "[fd00::2]:8080",
+                    "[fd00::3]:8080",
+                ],
+                5,
+                2,
+            ),
+        ];
+        for (name, families, family, want, ready, draining) in cases {
+            let svc = if families.is_empty() {
+                http_svc().unwrap()
+            } else {
+                with_families(http_svc().unwrap(), families)
+            };
+            let mut o = opts();
+            o.ip_family = family;
+            let got = run1(&r, &snap(Some(svc), slices.clone()), &o);
+            assert_eq!(got.addrs, want, "{name}");
+            assert_eq!((got.ready, got.draining), (ready, draining), "{name}");
+        }
+
+        // Only draining pods: the fallback writes each pod once too.
+        let draining = vec![
+            v4(vec![pod_ep("10.0.0.4", "d", DRAINING)]),
+            slice("IPv6", p, vec![pod_ep("fd00::4", "d", DRAINING)]),
+        ];
+        let got = run1(&r, &snap(http_svc(), draining), &opts());
+        assert_eq!(got.addrs, vec!["10.0.0.4:8080"]);
+        assert_eq!((got.ready, got.draining, got.fallback), (0, 1, true));
+
+        // A secondary-family endpoint without targetRef is written when the primary
+        // family has no endpoint on the port.
+        let got = run1(
+            &r,
+            &snap(
+                http_svc(),
+                vec![slice("IPv6", p, vec![ep("fd00::9", READY)])],
+            ),
+            &opts(),
+        );
+        assert_eq!(got.addrs, vec!["[fd00::9]:8080"]);
+    }
+
+    fn external(name: &str, ports: &[(&str, i32, &str)]) -> Arc<Service> {
+        let mut svc = (*service(ports)).clone();
+        let spec = svc.spec.as_mut().unwrap();
+        spec.type_ = Some("ExternalName".into());
+        spec.external_name = (!name.is_empty()).then(|| name.to_string());
+        Arc::new(svc)
+    }
+
+    #[test]
+    fn external_name_services() {
+        let ext = external("API.example.net.", &[("https", 443, "TCP")]);
+        let by_name = sref("ext", named("https"), Some(3));
+        let by_number = sref("ext", PortRef::Number(8443), None);
+        let s = snap(Some(ext.clone()), vec![]);
+        let mut on = opts();
+        on.external_name = true;
+
+        // Off: pods mode warns, writes nothing.
+        let got = run1(&by_name, &s, &opts());
+        assert!(got.addrs.is_empty());
+        assert_eq!(
+            got.warnings,
+            vec![ResolveWarning::ExternalNameNotEnabled(key("ext"))]
+        );
+        // Off: service mode keeps the cluster DNS name.
+        let got = run1(&by_name, &s, &svc_opts("cluster.local"));
+        assert_eq!(got.addrs, vec!["ext.prod.svc.cluster.local:443 3"]);
+
+        // On, both modes: the external name, lower case, without the trailing dot.
+        let mut svc_on = svc_opts("cluster.local");
+        svc_on.external_name = true;
+        for o in [&on, &svc_on] {
+            let got = run1(&by_name, &s, o);
+            assert_eq!(got.addrs, vec!["api.example.net:443 3"]);
+            assert_eq!(got.ready, 1);
+            assert!(got.warnings.is_empty(), "{:?}", got.warnings);
+            // A port number need not be listed.
+            let got = run1(&by_number, &s, o);
+            assert_eq!(got.addrs, vec!["api.example.net:8443"]);
+        }
+
+        // Mixed with pods: both are written.
+        let pods = sref("api", named("http"), None);
+        let pod_snap = snap(http_svc(), vec![v4(vec![ep("10.0.0.1", READY)])]);
+        let got = resolve(
+            &[
+                ServiceInput {
+                    service_ref: &pods,
+                    snapshot: &pod_snap,
+                },
+                ServiceInput {
+                    service_ref: &by_number,
+                    snapshot: &s,
+                },
+            ],
+            &on,
+        );
+        assert_eq!(got.addrs, vec!["10.0.0.1:8080", "api.example.net:8443"]);
+        assert_eq!(got.ready, 2);
+
+        // Invalid ones.
+        let cases: Vec<(&str, Arc<Service>, &ServiceRef, ResolveWarning)> = vec![
+            (
+                "no externalName",
+                external("", &[("https", 443, "TCP")]),
+                &by_name,
+                ResolveWarning::ExternalNameInvalid {
+                    service: key("ext"),
+                    reason: "spec.externalName is empty".into(),
+                },
+            ),
+            (
+                "unknown port name",
+                external("api.example.net", &[]),
+                &by_name,
+                ResolveWarning::PortNotInService {
+                    service: key("ext"),
+                    port: named("https"),
+                },
+            ),
+            (
+                "loopback",
+                external("127.0.0.1", &[]),
+                &by_number,
+                ResolveWarning::ExternalNameInvalid {
+                    service: key("ext"),
+                    reason: "127.0.0.1 is a loopback, link-local, multicast or unspecified address"
+                        .into(),
+                },
+            ),
+            (
+                "link-local metadata address",
+                external("169.254.169.254", &[]),
+                &by_number,
+                ResolveWarning::ExternalNameInvalid {
+                    service: key("ext"),
+                    reason:
+                        "169.254.169.254 is a loopback, link-local, multicast or unspecified address"
+                            .into(),
+                },
+            ),
+            (
+                "not a host name",
+                external("api.example.net:80", &[]),
+                &by_number,
+                ResolveWarning::ExternalNameInvalid {
+                    service: key("ext"),
+                    reason: "\"api.example.net:80\" is not a host name".into(),
+                },
+            ),
+        ];
+        for (name, svc, r, warning) in cases {
+            let got = run1(r, &snap(Some(svc), vec![]), &on);
+            assert!(got.addrs.is_empty(), "{name}");
+            assert_eq!(got.warnings, vec![warning], "{name}");
+        }
+        // IP literals are written as addresses.
+        let got = run1(
+            &by_number,
+            &snap(Some(external("2001:db8::1", &[])), vec![]),
+            &on,
+        );
+        assert_eq!(got.addrs, vec!["[2001:db8::1]:8443"]);
+    }
+
+    #[test]
+    fn pods_mode_warns_about_traffic_policies() {
+        let mut svc = (*service(&[("http", 80, "TCP")])).clone();
+        let spec = svc.spec.as_mut().unwrap();
+        spec.traffic_distribution = Some("PreferSameZone".into());
+        spec.internal_traffic_policy = Some("Local".into());
+        let svc = Arc::new(svc);
+        let r = sref("api", named("http"), None);
+        let s = snap(Some(svc), vec![v4(vec![ep("10.0.0.1", READY)])]);
+        let got = run1(&r, &s, &opts());
+        assert_eq!(got.addrs, vec!["10.0.0.1:8080"]);
+        assert_eq!(
+            got.warnings,
+            vec![
+                ResolveWarning::TrafficPolicyIgnored {
+                    service: key("api"),
+                    setting: "internalTrafficPolicy: Local".into(),
+                },
+                ResolveWarning::TrafficPolicyIgnored {
+                    service: key("api"),
+                    setting: "trafficDistribution: PreferSameZone".into(),
+                },
+            ]
+        );
+        // Service mode honors them through kube-proxy: no warning.
+        let got = run1(&r, &s, &svc_opts("cluster.local"));
+        assert!(got.warnings.is_empty());
+        // The default internalTrafficPolicy (Cluster) does not warn.
+        let mut plain = (*service(&[("http", 80, "TCP")])).clone();
+        plain.spec.as_mut().unwrap().internal_traffic_policy = Some("Cluster".into());
+        let got = run1(&r, &snap(Some(Arc::new(plain)), vec![]), &opts());
+        assert!(got.warnings.is_empty());
     }
 
     #[test]
@@ -1174,7 +1704,11 @@ mod tests {
             http_svc(),
             vec![
                 v4(vec![ep("10.0.0.9", READY), ep("10.0.0.10", READY)]),
-                slice("IPv6", &[("http", 8080, "TCP")], vec![ep("fd00::1", READY)]),
+                slice(
+                    "IPv6",
+                    &[("http", 8080, "TCP")],
+                    vec![pod_ep("fd00::1", "v6-only", READY)],
+                ),
             ],
         );
         let sg = snap(http_svc(), vec![v4(vec![ep("10.0.1.1", READY)])]);
@@ -1202,7 +1736,11 @@ mod tests {
         let sb_rev = snap(
             http_svc(),
             vec![
-                slice("IPv6", &[("http", 8080, "TCP")], vec![ep("fd00::1", READY)]),
+                slice(
+                    "IPv6",
+                    &[("http", 8080, "TCP")],
+                    vec![pod_ep("fd00::1", "v6-only", READY)],
+                ),
                 v4(vec![ep("10.0.0.10", READY), ep("10.0.0.9", READY)]),
             ],
         );
@@ -1531,49 +2069,62 @@ mod tests {
     fn service_target_writes_the_cluster_ip() {
         let web = service(&[("http", 80, "TCP")]);
         let r = sref("web", named("http"), Some(4));
-        let cases: Vec<(&str, Vec<&str>, bool, &str)> = vec![
-            ("IPv4", vec!["10.96.0.10"], false, "10.96.0.10:80 4"),
+        use IpFamily::{Both, Ipv4, Ipv6, Primary};
+        let cases: Vec<(&str, Vec<&str>, IpFamily, Vec<&str>)> = vec![
+            ("IPv4", vec!["10.96.0.10"], Primary, vec!["10.96.0.10:80 4"]),
             (
                 "IPv6 in brackets",
                 vec!["fd00:10:96::a"],
-                false,
-                "[fd00:10:96::a]:80 4",
+                Primary,
+                vec!["[fd00:10:96::a]:80 4"],
             ),
             (
                 "dual-stack: the primary family",
                 vec!["fd00:10:96::a", "10.96.0.10"],
-                false,
-                "[fd00:10:96::a]:80 4",
+                Primary,
+                vec!["[fd00:10:96::a]:80 4"],
             ),
             (
-                "dual-stack with ipv4_only: the IPv4 one",
+                "dual-stack with ipv4: the IPv4 one",
                 vec!["fd00:10:96::a", "10.96.0.10"],
-                true,
-                "10.96.0.10:80 4",
+                Ipv4,
+                vec!["10.96.0.10:80 4"],
             ),
             (
-                "IPv6 only with ipv4_only: the name",
+                "dual-stack with ipv6: the IPv6 one",
+                vec!["10.96.0.10", "fd00:10:96::a"],
+                Ipv6,
+                vec!["[fd00:10:96::a]:80 4"],
+            ),
+            (
+                "dual-stack with both: both",
+                vec!["10.96.0.10", "fd00:10:96::a"],
+                Both,
+                vec!["10.96.0.10:80 4", "[fd00:10:96::a]:80 4"],
+            ),
+            (
+                "IPv6 only with ipv4: the name",
                 vec!["fd00:10:96::a"],
-                true,
-                "web.prod.svc.cluster.local:80 4",
+                Ipv4,
+                vec!["web.prod.svc.cluster.local:80 4"],
             ),
             (
                 "headless: the name",
                 vec!["None"],
-                false,
-                "web.prod.svc.cluster.local:80 4",
+                Primary,
+                vec!["web.prod.svc.cluster.local:80 4"],
             ),
         ];
         let ready = v4(vec![ep("10.244.0.5", READY)]);
-        for (name, ips, ipv4_only, want) in cases {
+        for (name, ips, family, want) in cases {
             let s = snap(
                 Some(with_cluster_ips(web.clone(), &ips)),
                 vec![ready.clone()],
             );
             let mut o = svc_opts("cluster.local");
-            o.ipv4_only = ipv4_only;
+            o.ip_family = family;
             let got = run1(&r, &s, &o);
-            assert_eq!(got.addrs, vec![want], "{name}");
+            assert_eq!(got.addrs, want, "{name}");
             assert!(got.warnings.is_empty(), "{name}");
         }
         // Only `clusterIP` set (older objects): it is used.

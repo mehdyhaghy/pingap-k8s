@@ -2172,7 +2172,8 @@ mod tests {
             upstream_defaults: UpstreamOptions {
                 include_not_ready: false,
                 drain_terminating: true,
-                ipv4_only: false,
+                ip_family: crate::types::IpFamily::Primary,
+                external_name: false,
                 debounce: Duration::from_millis(100),
                 debounce_max: Duration::from_secs(1),
                 target: UpstreamTarget::Pods,
