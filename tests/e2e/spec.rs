@@ -1,4 +1,4 @@
-//! The end-to-end tests 1–18, one test function each.
+//! The end-to-end tests 1–18 and 33 (controller, Pingap, upstreams), one test function each.
 //!
 //! Every test starts from the same baseline ([`baseline`]: etcd up, both controller
 //! replicas rolled out, echo at 3 replicas with no pod terminating, both upstreams equal to
@@ -2995,6 +2995,109 @@ async fn e2e_18_service_target_recreated() {
         "requests failed after the recreate: {:?}",
         &failed[..failed.len().min(5)]
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// 33. ExternalName upstream
+// ---------------------------------------------------------------------------------------
+
+/// Upstream `ext` (`external_name = true`, location `/ext/`) follows the ExternalName
+/// Service `e2e-ext` (tests/e2e/manifests/app.yaml).
+const EXT_UPSTREAM: &str = "ext";
+const EXT_SERVICE: &str = "e2e-ext";
+const EXT_HTTPBIN: &str = "httpbin.e2e-app.svc.cluster.local";
+const EXT_ECHO: &str = "echo.e2e-app.svc.cluster.local";
+
+/// Points Service `e2e-ext` at `host`.
+async fn set_external_name(env: &Env, host: &str) -> anyhow::Result<()> {
+    let patch = json!({ "spec": { "externalName": host } }).to_string();
+    env.kubectl
+        .run(&[
+            "patch",
+            "service",
+            EXT_SERVICE,
+            "-n",
+            env.app_namespace.as_str(),
+            "--type=merge",
+            "-p",
+            patch.as_str(),
+        ])
+        .await?;
+    Ok(())
+}
+
+/// Waits until upstream `ext` holds `<host>:80` and `/ext/hostname` answers with `want`.
+async fn wait_external(env: &Env, host: &str, want: &str) -> String {
+    let addr = format!("{host}:80");
+    wait_for(
+        &format!("upstream {EXT_UPSTREAM} = {addr}"),
+        CONVERGE,
+        Duration::from_millis(200),
+        || async {
+            let addrs = env.etcd.upstream_addrs(EXT_UPSTREAM).await?;
+            Ok((addrs.as_deref() == Some(std::slice::from_ref(&addr))).then_some(()))
+        },
+    )
+    .await
+    .unwrap();
+    wait_for(
+        &format!("/ext/hostname answered by {want}"),
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+        || async {
+            let r = env.pingap.get("/ext/hostname", &[]).await?;
+            Ok((r.status == 200 && r.body.contains(want)).then_some(r.body))
+        },
+    )
+    .await
+    .unwrap()
+}
+
+/// E2E test 33. Upstream `ext` has `external_name = true` and follows the ExternalName
+/// Service `e2e-ext`: the controller writes `<externalName>:<port>` (no pod IPs) and
+/// Pingap resolves it. Pointing the Service from httpbin's cluster DNS name to echo's
+/// rewrites the address, and `/ext/` follows: go-httpbin first, then the echo pods. The
+/// guard points it back at httpbin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_33_external_name_upstream() {
+    const T: &str = "e2e_33";
+    let Some(env) = Env::setup("e2e_33_external_name_upstream").await else {
+        return;
+    };
+    baseline(&env).await;
+    set_external_name(&env, EXT_HTTPBIN).await.unwrap();
+    guarded(
+        async {
+            let body = wait_external(&env, EXT_HTTPBIN, "go-httpbin").await;
+            println!(
+                "[{T}] {EXT_HTTPBIN}:80 -> {}",
+                body.trim().replace('\n', "")
+            );
+            let changed = SystemTime::now();
+            set_external_name(&env, EXT_ECHO).await.unwrap();
+            let body = wait_external(&env, EXT_ECHO, "echo-").await;
+            println!(
+                "[{T}] {EXT_ECHO}:80 -> {} ({} after the change)",
+                body.trim(),
+                s(track::secs_between(SystemTime::now(), changed))
+            );
+            let entry = env
+                .etcd
+                .upstream(EXT_UPSTREAM)
+                .await
+                .unwrap()
+                .unwrap()
+                .value;
+            println!("[{T}] entry:\n{entry}");
+            assert!(entry.contains(&format!("\"{EXT_ECHO}:80\"")), "{entry}");
+        },
+        async {
+            set_external_name(&env, EXT_HTTPBIN).await?;
+            wait_external(&env, EXT_HTTPBIN, "go-httpbin").await;
+            Ok(())
+        },
+    )
+    .await;
 }
 
 #[cfg(test)]

@@ -23,6 +23,17 @@ gateway:
   namespaces: ["e2e-app"]
   servers: ["gw-http", "gw-https"]
   addresses: ["pingap-k8s-pingap.pingap-k8s.svc"]
+  # E2E test 30: two server groups, each with its own Pingap server and Service
+  # (pingap-k8s-pingap-gw-a / -gw-b, port 80). The test's Gateways ask for them by
+  # address; the other tests' Gateways ask for the shared address above, so they
+  # never take a group.
+  groups:
+    - name: a
+      ports:
+        - { port: 80, targetPort: 9180 }
+    - name: b
+      ports:
+        - { port: 80, targetPort: 9280 }
 
 # The tests scrape the controller's metrics from the client pod.
 networkPolicy:
@@ -62,7 +73,8 @@ pingap:
     # the httpbin pods, everything else to the echo HTTP port. E2E tests 15 to 18 have
     # a prefix each, stripped by a rewrite: "/headers-test/" (httpbin, forwarded
     # headers), "/sticky/" (echo pods with a sticky cookie), "/jwt/" and "/fwd/"
-    # (httpbin behind the jwt and forward_auth plugins), "/svc/" (target = "service").
+    # (httpbin behind the jwt and forward_auth plugins), "/svc/" (target = "service"),
+    # "/ext/" (an ExternalName Service, test 33).
     # Listener 8081: HTTP/2 without TLS (h2c, enabled_h2) for gRPC,
     # every path to the podinfo gRPC port over h2c (alpn "H2"), with a gRPC health
     # check. A separate listener, so the HTTP/1 tests on 8080 are unaffected; the
@@ -76,7 +88,7 @@ pingap:
 
       [servers.e2e]
       addr = "[::]:8080"
-      locations = ["echo-ws", "httpbin-sse", "headers", "sticky", "jwt", "fwd", "svc", "echo"]
+      locations = ["echo-ws", "httpbin-sse", "headers", "sticky", "jwt", "fwd", "svc", "ext", "echo"]
 
       [servers.grpc]
       addr = "[::]:8081"
@@ -136,6 +148,11 @@ pingap:
       path = "/svc/"
       rewrite = "^/svc/(.*)$ /$1"
 
+      [locations.ext]
+      upstream = "ext"
+      path = "/ext/"
+      rewrite = "^/ext/(.*)$ /$1"
+
       # HS256 with a test-only secret; the tokens are in tests/e2e/spec.rs.
       [plugins.e2eJwt]
       category = "jwt"
@@ -168,6 +185,9 @@ pingap:
       [upstreams.echo-svc]
       addrs = ["127.0.0.1:9"]
 
+      [upstreams.ext]
+      addrs = ["127.0.0.1:9"]
+
       [upstreams.grpc]
       addrs = ["127.0.0.1:9"]
       alpn = "H2"
@@ -189,3 +209,7 @@ config:
     echo-svc:
       services: ["echo-svc.e2e-app:http"]
       target: service
+    # E2E test 33: the ExternalName Service e2e-ext (tests/e2e/manifests/app.yaml).
+    ext:
+      services: ["e2e-ext.e2e-app:http"]
+      external_name: true

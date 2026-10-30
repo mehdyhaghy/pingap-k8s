@@ -9,6 +9,7 @@
 # - podinfo: Deployment + Service for the gRPC test. Each pod serves gRPC
 #   on 9999 (Service port "grpc", appProtocol kubernetes.io/h2c): info.InfoService/Info
 #   returns the pod name, grpc.health.v1 answers for the service "podinfo".
+# - e2e-ext: ExternalName Service (httpbin's cluster DNS name) for e2e test 33.
 # - httpbin: Deployment + Service for the SSE test: go-httpbin on 8080
 #   (Service port "http"), GET /sse?count=N&duration=D streams N events over D.
 # - e2e-client: agnhost (has curl with HTTP/2 and sh) for single requests through Pingap.
@@ -124,6 +125,20 @@ spec:
     - name: http
       port: 80
       targetPort: http
+---
+# ExternalName Service behind upstream "ext" (external_name = true) of e2e test 33,
+# which points it at echo and back.
+apiVersion: v1
+kind: Service
+metadata:
+  name: e2e-ext
+  namespace: e2e-app
+spec:
+  type: ExternalName
+  externalName: httpbin.e2e-app.svc.cluster.local
+  ports:
+    - name: http
+      port: 80
 ---
 apiVersion: apps/v1
 kind: Deployment

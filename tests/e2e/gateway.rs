@@ -1,8 +1,10 @@
-//! The end-to-end tests 19–27 of the Gateway API provider, one test function each.
+//! The end-to-end tests 19–32 of the Gateway API provider, one test function each.
 //!
 //! The chart creates the GatewayClass `pingap` (tests/e2e/values.yaml): listeners map onto
-//! the seed's Pingap servers `gw-http` (plain HTTP, port 8082) and `gw-https` (TLS by SNI,
-//! port 8443), backends and listener Secrets live in `e2e-app`. The chart's Pingap
+//! the seed's Pingap servers `gw-http` (plain HTTP and h2c, port 8082) and `gw-https` (TLS
+//! by SNI, port 8443), backends and listener Secrets live in `e2e-app`. The server groups
+//! `a` and `b` (port 80 each, own Service) are only for test 30: the other Gateways ask
+//! for the shared address ([`gateway`]), so they never take a group. The chart's Pingap
 //! Service exposes port 80 only, so requests go from the client pod to the Pingap pod IP
 //! with curl's `--resolve` (the Host header then carries the listener port, as for a
 //! client that connects to the listener directly).
@@ -47,6 +49,9 @@ const GATEWAYS: &str = "gateways.gateway.networking.k8s.io";
 const ROUTES: &str = "httproutes.gateway.networking.k8s.io";
 const GRANTS: &str = "referencegrants.gateway.networking.k8s.io";
 const CLASSES: &str = "gatewayclasses.gateway.networking.k8s.io";
+const GRPC_ROUTES: &str = "grpcroutes.gateway.networking.k8s.io";
+const LISTENER_SETS: &str = "listenersets.gateway.networking.k8s.io";
+const BACKEND_TLS: &str = "backendtlspolicies.gateway.networking.k8s.io";
 
 // ---------------------------------------------------------------------------------------
 // Objects: apply, get, delete
@@ -160,8 +165,12 @@ async fn ready(env: &Env) {
 // Object builders
 // ---------------------------------------------------------------------------------------
 
+/// A Gateway of our class on the shared servers: it asks for the shared address, so it
+/// never takes one of the server groups of tests/e2e/values.yaml.
 fn gateway(ns: &str, name: &str, listeners: Vec<Value>) -> Value {
-    gateway_of(ns, name, CLASS, listeners)
+    let mut gw = gateway_of(ns, name, CLASS, listeners);
+    gw["spec"]["addresses"] = json!([{ "type": "Hostname", "value": ADDRESS }]);
+    gw
 }
 
 fn gateway_of(ns: &str, name: &str, class: &str, listeners: Vec<Value>) -> Value {
@@ -309,8 +318,21 @@ async fn wait_route(
     gateway: &str,
     want: &[(&str, &str, &str)],
 ) -> Value {
-    let what = format!("HTTPRoute {ns}/{name} on {gateway}: {want:?}");
-    wait_obj(env, &what, ROUTES, Some(ns), name, |r| {
+    wait_route_of(env, ROUTES, ns, name, gateway, want).await
+}
+
+/// [`wait_route`] for a route of resource `kind` (e.g. [`GRPC_ROUTES`]); `gateway` is the
+/// name of the parent (a Gateway or a ListenerSet).
+async fn wait_route_of(
+    env: &Env,
+    kind: &str,
+    ns: &str,
+    name: &str,
+    gateway: &str,
+    want: &[(&str, &str, &str)],
+) -> Value {
+    let what = format!("{kind} {ns}/{name} on {gateway}: {want:?}");
+    wait_obj(env, &what, kind, Some(ns), name, |r| {
         our_parent(r, gateway).is_some_and(|p| {
             current(r, &p["conditions"])
                 && want
@@ -1682,6 +1704,631 @@ async fn e2e_27_status_ownership() {
     .await;
 }
 
+// ---------------------------------------------------------------------------------------
+// 28. GRPCRoute
+// ---------------------------------------------------------------------------------------
+
+/// podinfo's gRPC port (Service port `grpc`, appProtocol `kubernetes.io/h2c`).
+const PODINFO_GRPC_PORT: u16 = 9999;
+
+/// A unary gRPC call over h2c (prior knowledge) to `$2`, resolved by `$1`: an empty
+/// request message. Prints `<http status> <http version>`, then the `grpc-status`
+/// header or trailer if any, then `BODY` and the response with everything but
+/// `[A-Za-z0-9.-]` blanked.
+const GRPC_CALL_SCRIPT: &str = r#"d=$(mktemp -d); head -c 5 /dev/zero > "$d/req"
+curl -s -m 5 --http2-prior-knowledge --resolve "$1" -H 'content-type: application/grpc' \
+  -H 'te: trailers' --data-binary "@$d/req" -D "$d/h" -o "$d/b" -w '%{http_code} %{http_version}' "$2"
+echo; grep -i '^grpc-status:' "$d/h" | tr -d '\r'; echo "BODY $(tr -c 'A-Za-z0-9.-' ' ' < "$d/b" 2>/dev/null)"
+rm -rf "$d""#;
+
+/// One call of [`Front::grpc`].
+#[derive(Debug, Clone, Default)]
+struct GrpcResp {
+    status: u16,
+    http_version: String,
+    grpc_status: Option<String>,
+    body: String,
+}
+
+fn parse_grpc(stdout: &str) -> Option<GrpcResp> {
+    let mut lines = stdout.lines();
+    let mut first = lines.next()?.split_whitespace();
+    let mut r = GrpcResp {
+        status: first.next()?.parse().ok()?,
+        http_version: first.next().unwrap_or_default().to_string(),
+        ..GrpcResp::default()
+    };
+    for line in lines {
+        if let Some(v) = line.strip_prefix("BODY") {
+            r.body = v.split_whitespace().collect::<Vec<_>>().join(" ");
+        } else if let Some((k, v)) = line.split_once(':')
+            && k.eq_ignore_ascii_case("grpc-status")
+        {
+            r.grpc_status = Some(v.trim().to_string());
+        }
+    }
+    Some(r)
+}
+
+impl Front {
+    /// A unary gRPC call of `/<service>/<method>` on listener port [`HTTP_PORT`]
+    /// ([`GRPC_CALL_SCRIPT`]).
+    async fn grpc(&self, host: &str, path: &str) -> anyhow::Result<GrpcResp> {
+        let resolve = self.resolve(host, HTTP_PORT);
+        let url = format!("http://{host}:{HTTP_PORT}{path}");
+        let out = self
+            .kubectl
+            .exec(
+                &self.namespace,
+                &self.pod,
+                None,
+                &["sh", "-c", GRPC_CALL_SCRIPT, "sh", &resolve, &url],
+            )
+            .await?;
+        parse_grpc(&out.stdout)
+            .ok_or_else(|| anyhow::anyhow!("unexpected output {:?} ({:?})", out.stdout, out.stderr))
+    }
+}
+
+/// GRPCRoute `t28` on Gateway `t28` (listener on `gw-http`, which speaks h2c) sends the
+/// method `info.InfoService/Info` (Exact service and method) and the whole service
+/// `grpc.health.v1.Health` (service only) to podinfo's h2c port. The route is accepted
+/// with its references resolved and counted on the listener. Unary calls over h2c
+/// through Pingap reach podinfo (InfoResponse with the pod name, grpc-status 0); a method
+/// no rule matches gets Pingap's 404.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_28_grpc_route() {
+    const T: &str = "e2e_28";
+    let Some(env) = Env::setup("e2e_28_grpc_route").await else {
+        return;
+    };
+    let ns = env.app_namespace.clone();
+    let host = "t28.example.com";
+    let objs = [obj(GATEWAYS, &ns, "t28"), obj(GRPC_ROUTES, &ns, "t28")];
+    ready(&env).await;
+    with_objects(&env, &objs, async {
+        let podinfo = json!([{ "name": "podinfo", "port": PODINFO_GRPC_PORT }]);
+        apply(
+            &env,
+            &list(vec![
+                gateway(&ns, "t28", vec![http_listener("http", host)]),
+                json!({
+                    "apiVersion": API_VERSION, "kind": "GRPCRoute",
+                    "metadata": { "name": "t28", "namespace": ns },
+                    "spec": {
+                        "parentRefs": [{ "name": "t28" }],
+                        "hostnames": [host],
+                        "rules": [
+                            { "matches": [{ "method": { "type": "Exact", "service": "info.InfoService", "method": "Info" } }],
+                              "backendRefs": podinfo },
+                            { "matches": [{ "method": { "service": "grpc.health.v1.Health" } }],
+                              "backendRefs": podinfo },
+                        ],
+                    },
+                }),
+            ]),
+        )
+        .await
+        .unwrap();
+        let r = wait_route_of(&env, GRPC_ROUTES, &ns, "t28", "t28", &[("Accepted", "True", "Accepted"), ("ResolvedRefs", "True", "ResolvedRefs")]).await;
+        println!("[{T}] route: {}", show(&our_parent(&r, "t28").unwrap()["conditions"]));
+        let gw = wait_gateway(&env, &ns, "t28", "GRPCRoute attached", |g| attached(g, "http") == Some(1)).await;
+        assert!(listener_cond_is(&gw, "http", "Programmed", "True", "Programmed"));
+
+        let front = Front::new(&env).await.unwrap();
+        let info = wait_for("info.InfoService/Info through t28", TRAFFIC_WAIT, POLL, || async {
+            let r = front.grpc(host, "/info.InfoService/Info").await?;
+            if r.status == 200 && r.body.contains("podinfo-") {
+                Ok(Some(r))
+            } else {
+                anyhow::bail!("last call: {r:?}")
+            }
+        })
+        .await
+        .unwrap();
+        println!("[{T}] Info: {info:?}");
+        assert_eq!(info.http_version, "2", "{info:?}");
+        assert_eq!(info.grpc_status.as_deref(), Some("0"), "{info:?}");
+
+        let health = front.grpc(host, "/grpc.health.v1.Health/Check").await.unwrap();
+        println!("[{T}] Health/Check: {health:?}");
+        assert_eq!((health.status, health.http_version.as_str()), (200, "2"), "{health:?}");
+        assert!(health.grpc_status.is_some(), "no grpc-status from podinfo: {health:?}");
+
+        let other = front.grpc(host, "/info.InfoService/Other").await.unwrap();
+        println!("[{T}] info.InfoService/Other: {other:?}");
+        assert_eq!(other.status, 404, "a method no rule matches: {other:?}");
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------------------
+// 29. HTTPRoute backend over h2c
+// ---------------------------------------------------------------------------------------
+
+/// The Gateway API conformance echo server (as in the v1.7.0 conformance manifests): HTTP
+/// on 3000, h2c only on 3001; its JSON answer has the request's `proto`.
+const ECHO_BASIC_IMAGE: &str = "registry.k8s.io/gateway-api/conformance/echo-basic:v0.1.0";
+
+/// Deployment `name` (1 replica, label `app: <name>`) of one container.
+fn deployment(ns: &str, name: &str, container: Value, volumes: Value) -> Value {
+    json!({
+        "apiVersion": "apps/v1", "kind": "Deployment",
+        "metadata": { "name": name, "namespace": ns },
+        "spec": {
+            "replicas": 1,
+            "selector": { "matchLabels": { "app": name } },
+            "template": {
+                "metadata": { "labels": { "app": name } },
+                "spec": { "terminationGracePeriodSeconds": 1, "containers": [container], "volumes": volumes },
+            },
+        },
+    })
+}
+
+fn service(ns: &str, name: &str, ports: Value) -> Value {
+    json!({
+        "apiVersion": "v1", "kind": "Service",
+        "metadata": { "name": name, "namespace": ns },
+        "spec": { "selector": { "app": name }, "ports": ports },
+    })
+}
+
+/// Service `t29` (echo-basic) has port `h2c` (8081 -> 3001, appProtocol
+/// `kubernetes.io/h2c`) and port `http` (8080 -> 3000). Route `t29` sends `/h2c` to the
+/// first and `/h1` to the second. A plain HTTP/1.1 client gets an answer through both:
+/// echo-basic saw HTTP/2.0 on the h2c port (which takes nothing else) and HTTP/1.1 on
+/// the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_29_h2c_backend() {
+    const T: &str = "e2e_29";
+    let Some(env) = Env::setup("e2e_29_h2c_backend").await else {
+        return;
+    };
+    let ns = env.app_namespace.clone();
+    let host = "t29.example.com";
+    let objs = [
+        obj("deployment", &ns, "t29"),
+        obj("service", &ns, "t29"),
+        obj(GATEWAYS, &ns, "t29"),
+        obj(ROUTES, &ns, "t29"),
+    ];
+    ready(&env).await;
+    with_objects(&env, &objs, async {
+        let container = json!({
+            "name": "echo", "image": ECHO_BASIC_IMAGE,
+            "env": [
+                { "name": "POD_NAME", "valueFrom": { "fieldRef": { "fieldPath": "metadata.name" } } },
+                { "name": "NAMESPACE", "valueFrom": { "fieldRef": { "fieldPath": "metadata.namespace" } } },
+            ],
+            "ports": [{ "containerPort": 3000 }, { "containerPort": 3001 }],
+            "readinessProbe": { "httpGet": { "path": "/", "port": 3000 }, "periodSeconds": 1 },
+            "resources": { "requests": { "cpu": "10m", "memory": "16Mi" } },
+        });
+        apply(
+            &env,
+            &list(vec![
+                deployment(&ns, "t29", container, json!([])),
+                service(&ns, "t29", json!([
+                    { "name": "h2c", "port": 8081, "targetPort": 3001, "appProtocol": "kubernetes.io/h2c" },
+                    { "name": "http", "port": 8080, "targetPort": 3000 },
+                ])),
+                gateway(&ns, "t29", vec![http_listener("http", host)]),
+                route(&ns, "t29", json!([{ "name": "t29" }]), &[host], json!([
+                    { "matches": [prefix("/h2c")], "backendRefs": [{ "name": "t29", "port": 8081 }] },
+                    { "matches": [prefix("/h1")], "backendRefs": [{ "name": "t29", "port": 8080 }] },
+                ])),
+            ]),
+        )
+        .await
+        .unwrap();
+        wait_route(&env, &ns, "t29", "t29", &[("Accepted", "True", "Accepted"), ("ResolvedRefs", "True", "ResolvedRefs")]).await;
+        let front = Front::new(&env).await.unwrap();
+        let r = front
+            .wait("h2c backend answers", HTTP_PORT, host, "/h2c/x", &[], |r| r.status == 200)
+            .await;
+        let answer = r.json();
+        println!("[{T}] /h2c/x: proto {} pod {} path {}", answer["proto"], answer["pod"], answer["path"]);
+        assert_eq!(answer["proto"], "HTTP/2.0", "{}", r.short());
+        assert!(answer["pod"].as_str().is_some_and(|p| p.starts_with("t29-")), "{}", r.short());
+        let r = front
+            .wait("HTTP/1.1 backend answers", HTTP_PORT, host, "/h1/x", &[], |r| r.status == 200)
+            .await;
+        println!("[{T}] /h1/x: proto {}", r.json()["proto"]);
+        assert_eq!(r.json()["proto"], "HTTP/1.1", "{}", r.short());
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------------------
+// 30. Server groups
+// ---------------------------------------------------------------------------------------
+
+/// The server groups of tests/e2e/values.yaml: (Gateway, group address, Pingap server).
+const GROUPS: [(&str, &str, &str); 2] = [
+    ("t30-a", "pingap-k8s-pingap-gw-a.pingap-k8s.svc", "gw-a-80"),
+    ("t30-b", "pingap-k8s-pingap-gw-b.pingap-k8s.svc", "gw-b-80"),
+];
+
+/// Gateways `t30-a` and `t30-b` ask for the addresses of the server groups `a` and `b`
+/// and listen on port 80 without a hostname; route `t30-a` (no hostname, no match:
+/// everything) goes to echo, `t30-b` to httpbin. Each Gateway is programmed with its
+/// group's address, its route's locations are on its group's server only, and a request
+/// to each group's Service reaches that Gateway's backend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_30_server_groups() {
+    const T: &str = "e2e_30";
+    let Some(env) = Env::setup("e2e_30_server_groups").await else {
+        return;
+    };
+    let ns = env.app_namespace.clone();
+    let objs = [
+        obj(GATEWAYS, &ns, "t30-a"),
+        obj(GATEWAYS, &ns, "t30-b"),
+        obj(ROUTES, &ns, "t30-a"),
+        obj(ROUTES, &ns, "t30-b"),
+    ];
+    ready(&env).await;
+    with_objects(&env, &objs, async {
+        let mut items = Vec::new();
+        for ((name, address, _), backend_name) in GROUPS.iter().zip(["echo", "httpbin"]) {
+            let mut gw = gateway_of(
+                &ns,
+                name,
+                CLASS,
+                vec![json!({ "name": "http", "port": 80, "protocol": "HTTP" })],
+            );
+            gw["spec"]["addresses"] = json!([{ "type": "Hostname", "value": address }]);
+            items.push(gw);
+            items.push(route(
+                &ns,
+                name,
+                json!([{ "name": name }]),
+                &[],
+                json!([{ "backendRefs": [backend(backend_name, None)] }]),
+            ));
+        }
+        apply(&env, &list(items)).await.unwrap();
+
+        for (name, address, _) in GROUPS {
+            let gw = wait_gateway(
+                &env,
+                &ns,
+                name,
+                &format!("Gateway {name} programmed on its group"),
+                |g| {
+                    cond_is(
+                        &g["status"]["conditions"],
+                        "Programmed",
+                        "True",
+                        Some("Programmed"),
+                    ) && listener_cond_is(g, "http", "Programmed", "True", "Programmed")
+                        && attached(g, "http") == Some(1)
+                },
+            )
+            .await;
+            println!(
+                "[{T}] {name}: {} addresses {}",
+                show(&gw["status"]["conditions"]),
+                gw["status"]["addresses"]
+            );
+            assert_eq!(
+                gw["status"]["addresses"],
+                json!([{ "type": "Hostname", "value": address }])
+            );
+            wait_route(
+                &env,
+                &ns,
+                name,
+                name,
+                &[
+                    ("Accepted", "True", "Accepted"),
+                    ("ResolvedRefs", "True", "ResolvedRefs"),
+                ],
+            )
+            .await;
+        }
+
+        // Each route's locations are on its group's server, not on the other one.
+        let la = route_locations(&env, &ns, "t30-a").await.unwrap();
+        let lb = route_locations(&env, &ns, "t30-b").await.unwrap();
+        assert!(!la.is_empty() && !lb.is_empty(), "{la:?} {lb:?}");
+        wait_for(
+            "locations on the group servers",
+            STATUS_WAIT,
+            POLL,
+            || async {
+                let sa = server_locations(&env, GROUPS[0].2).await?;
+                let sb = server_locations(&env, GROUPS[1].2).await?;
+                let ok = la.iter().all(|l| sa.contains(l) && !sb.contains(l))
+                    && lb.iter().all(|l| sb.contains(l) && !sa.contains(l));
+                if ok {
+                    println!(
+                        "[{T}] servers: {} {sa:?}, {} {sb:?}",
+                        GROUPS[0].2, GROUPS[1].2
+                    );
+                    Ok(Some(()))
+                } else {
+                    anyhow::bail!("{}: {sa:?}, {}: {sb:?}", GROUPS[0].2, GROUPS[1].2)
+                }
+            },
+        )
+        .await
+        .unwrap();
+        let shared = server_locations(&env, HTTP_SERVER).await.unwrap();
+        assert!(
+            la.iter().chain(&lb).all(|l| !shared.contains(l)),
+            "group routes on {HTTP_SERVER}: {shared:?}"
+        );
+
+        // Through each group's Service.
+        for ((_, address, _), want) in GROUPS.iter().zip(["echo-", "go-httpbin"]) {
+            let url = format!("http://{address}/hostname");
+            let r = wait_for(
+                &format!("{url} answered by {want}"),
+                TRAFFIC_WAIT,
+                POLL,
+                || async {
+                    let r = env.pingap.get_url(&url).await?;
+                    if r.status == 200 && r.body.contains(want) {
+                        Ok(Some(r))
+                    } else {
+                        anyhow::bail!(
+                            "last response: {} {:?}",
+                            r.status,
+                            r.body.chars().take(120).collect::<String>()
+                        )
+                    }
+                },
+            )
+            .await
+            .unwrap();
+            println!(
+                "[{T}] {url}: {} {}",
+                r.status,
+                r.body.trim().replace('\n', "")
+            );
+        }
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------------------
+// 31. ListenerSet
+// ---------------------------------------------------------------------------------------
+
+/// ListenerSet `t31-ls` adds listener `extra` (`ls.t31.example.com`, port 8082) to
+/// Gateway `t31`; route `t31` attaches to the ListenerSet. While the Gateway has no
+/// `allowedListeners` the ListenerSet is not accepted (NotAllowed) and its host gets 404.
+/// With `allowedListeners` from Same, the ListenerSet and its listener are accepted and
+/// programmed, the route is accepted with the ListenerSet as parent and served on the
+/// ListenerSet's host, and not on the Gateway's own listener host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_31_listener_set() {
+    const T: &str = "e2e_31";
+    let Some(env) = Env::setup("e2e_31_listener_set").await else {
+        return;
+    };
+    let ns = env.app_namespace.clone();
+    let (own, extra) = ("t31.example.com", "ls.t31.example.com");
+    let objs = [
+        obj(GATEWAYS, &ns, "t31"),
+        obj(LISTENER_SETS, &ns, "t31-ls"),
+        obj(ROUTES, &ns, "t31"),
+    ];
+    ready(&env).await;
+    with_objects(&env, &objs, async {
+        let gw = |allowed: bool| {
+            let mut g = gateway(&ns, "t31", vec![http_listener("http", own)]);
+            if allowed {
+                g["spec"]["allowedListeners"] = json!({ "namespaces": { "from": "Same" } });
+            }
+            g
+        };
+        apply(
+            &env,
+            &list(vec![
+                gw(false),
+                json!({
+                    "apiVersion": API_VERSION, "kind": "ListenerSet",
+                    "metadata": { "name": "t31-ls", "namespace": ns },
+                    "spec": {
+                        "parentRef": { "name": "t31" },
+                        "listeners": [{ "name": "extra", "port": HTTP_PORT, "protocol": "HTTP", "hostname": extra }],
+                    },
+                }),
+                route(&ns, "t31", json!([{ "group": GROUP, "kind": "ListenerSet", "name": "t31-ls" }]), &[], json!([{ "backendRefs": [backend("echo", None)] }])),
+            ]),
+        )
+        .await
+        .unwrap();
+        let ls = wait_obj(&env, "ListenerSet t31-ls not allowed", LISTENER_SETS, Some(&ns), "t31-ls", |l| {
+            cond_is(&l["status"]["conditions"], "Accepted", "False", Some("NotAllowed"))
+        })
+        .await
+        .unwrap();
+        println!("[{T}] without allowedListeners: {}", show(&ls["status"]["conditions"]));
+        let front = Front::new(&env).await.unwrap();
+        let r = front.get(HTTP_PORT, extra, "/hostname", &[]).await.unwrap();
+        assert_eq!(r.status, 404, "{}", r.short());
+
+        apply(&env, &gw(true)).await.unwrap();
+        let ls = wait_obj(&env, "ListenerSet t31-ls accepted", LISTENER_SETS, Some(&ns), "t31-ls", |l| {
+            let c = &l["status"]["conditions"];
+            current(l, c)
+                && cond_is(c, "Accepted", "True", Some("Accepted"))
+                && cond_is(c, "Programmed", "True", Some("Programmed"))
+                && listener(l, "extra").is_some_and(|x| {
+                    cond_is(&x["conditions"], "Programmed", "True", Some("Programmed"))
+                        && x["attachedRoutes"] == 1
+                })
+        })
+        .await
+        .unwrap();
+        println!(
+            "[{T}] with allowedListeners: {}; listener extra: {}",
+            show(&ls["status"]["conditions"]),
+            show(&listener(&ls, "extra").unwrap()["conditions"])
+        );
+        let r = wait_route(&env, &ns, "t31", "t31-ls", &[("Accepted", "True", "Accepted"), ("ResolvedRefs", "True", "ResolvedRefs")]).await;
+        assert_eq!(our_parent(&r, "t31-ls").unwrap()["parentRef"]["kind"], "ListenerSet");
+        let r = front
+            .wait("route served on the ListenerSet host", HTTP_PORT, extra, "/hostname", &[], |r| r.status == 200)
+            .await;
+        assert!(r.body.starts_with("echo-"), "{}", r.short());
+        let r = front.get(HTTP_PORT, own, "/hostname", &[]).await.unwrap();
+        println!("[{T}] {extra}: 200 echo; {own}: {}", r.status);
+        assert_eq!(r.status, 404, "route on the Gateway's own listener: {}", r.short());
+        let g = get_obj(&env.kubectl, GATEWAYS, Some(&ns), "t31").await.unwrap().unwrap();
+        assert_eq!(attached(&g, "http"), Some(0), "{}", g["status"]);
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------------------
+// 32. BackendTLSPolicy
+// ---------------------------------------------------------------------------------------
+
+/// A test CA and a server certificate for `host` signed by it: (CA PEM, certificate PEM,
+/// key PEM).
+fn backend_certs(host: &str) -> (String, String, String) {
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose,
+        IsCa, KeyPair, KeyUsagePurpose,
+    };
+    let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca.distinguished_name
+        .push(DnType::CommonName, "pingap-k8s e2e backend CA");
+    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().unwrap()).unwrap();
+    let mut leaf = CertificateParams::new(vec![host.to_string()]).unwrap();
+    leaf.distinguished_name.push(DnType::CommonName, host);
+    leaf.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let key = KeyPair::generate().unwrap();
+    let cert = leaf.signed_by(&key, &ca).unwrap();
+    (ca.pem(), cert.pem(), key.serialize_pem())
+}
+
+/// The `status.ancestors` entry our controller wrote for Gateway `gateway`.
+fn our_ancestor<'a>(policy: &'a Value, gateway: &str) -> Option<&'a Value> {
+    policy["status"]["ancestors"]
+        .as_array()?
+        .iter()
+        .find(|a| a["controllerName"] == CONTROLLER_NAME && a["ancestorRef"]["name"] == gateway)
+}
+
+/// Deployment `t32-backend` (agnhost netexec) serves HTTPS only, with a certificate for
+/// `backend.t32.example.com` from a test CA (rcgen) whose certificate is in ConfigMap
+/// `t32-ca` (`ca.crt`). Route `t32` sends everything to it. Without a policy Pingap talks
+/// plain HTTP to it (400 from the backend). BackendTLSPolicy `t32` (that hostname, that
+/// CA) makes the request succeed over TLS, and the policy's `status.ancestors` has an
+/// accepted entry for Gateway `t32`. With a hostname the certificate does not match, the
+/// verification fails: 5xx.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_32_backend_tls_policy() {
+    const T: &str = "e2e_32";
+    let Some(env) = Env::setup("e2e_32_backend_tls_policy").await else {
+        return;
+    };
+    let ns = env.app_namespace.clone();
+    let host = "t32.example.com";
+    let backend_host = "backend.t32.example.com";
+    let objs = [
+        obj("secret", &ns, "t32-backend-tls"),
+        obj("configmap", &ns, "t32-ca"),
+        obj("deployment", &ns, "t32-backend"),
+        obj("service", &ns, "t32-backend"),
+        obj(GATEWAYS, &ns, "t32"),
+        obj(ROUTES, &ns, "t32"),
+        obj(BACKEND_TLS, &ns, "t32"),
+    ];
+    ready(&env).await;
+    with_objects(&env, &objs, async {
+        let (ca, cert, key) = backend_certs(backend_host);
+        let container = json!({
+            "name": "https", "image": "registry.k8s.io/e2e-test-images/agnhost:2.66.1",
+            "args": ["netexec", "--http-port=8443", "--udp-port=-1",
+                     "--tls-cert-file=/tls/tls.crt", "--tls-private-key-file=/tls/tls.key"],
+            "ports": [{ "containerPort": 8443 }],
+            "readinessProbe": { "httpGet": { "path": "/hostname", "port": 8443, "scheme": "HTTPS" }, "periodSeconds": 1 },
+            "volumeMounts": [{ "name": "tls", "mountPath": "/tls", "readOnly": true }],
+            "resources": { "requests": { "cpu": "10m", "memory": "16Mi" } },
+        });
+        apply(
+            &env,
+            &list(vec![
+                json!({
+                    "apiVersion": "v1", "kind": "Secret", "type": "kubernetes.io/tls",
+                    "metadata": { "name": "t32-backend-tls", "namespace": ns },
+                    "stringData": { "tls.crt": cert, "tls.key": key },
+                }),
+                json!({
+                    "apiVersion": "v1", "kind": "ConfigMap",
+                    "metadata": { "name": "t32-ca", "namespace": ns },
+                    "data": { "ca.crt": ca },
+                }),
+                deployment(&ns, "t32-backend", container, json!([{ "name": "tls", "secret": { "secretName": "t32-backend-tls" } }])),
+                service(&ns, "t32-backend", json!([{ "name": "https", "port": 443, "targetPort": 8443 }])),
+                gateway(&ns, "t32", vec![http_listener("http", host)]),
+                route(&ns, "t32", json!([{ "name": "t32" }]), &[host], json!([{ "backendRefs": [{ "name": "t32-backend", "port": 443 }] }])),
+            ]),
+        )
+        .await
+        .unwrap();
+        wait_route(&env, &ns, "t32", "t32", &[("Accepted", "True", "Accepted"), ("ResolvedRefs", "True", "ResolvedRefs")]).await;
+        let front = Front::new(&env).await.unwrap();
+        let r = front
+            .wait("plain HTTP to the TLS backend", HTTP_PORT, host, "/hostname", &[], |r| r.status == 400)
+            .await;
+        println!("[{T}] without a policy: {}", r.short());
+
+        let policy = |hostname: &str| {
+            json!({
+                "apiVersion": API_VERSION, "kind": "BackendTLSPolicy",
+                "metadata": { "name": "t32", "namespace": ns },
+                "spec": {
+                    "targetRefs": [{ "group": "", "kind": "Service", "name": "t32-backend" }],
+                    "validation": {
+                        "caCertificateRefs": [{ "group": "", "kind": "ConfigMap", "name": "t32-ca" }],
+                        "hostname": hostname,
+                    },
+                },
+            })
+        };
+        apply(&env, &policy(backend_host)).await.unwrap();
+        let p = wait_obj(&env, "BackendTLSPolicy t32 accepted for Gateway t32", BACKEND_TLS, Some(&ns), "t32", |p| {
+            our_ancestor(p, "t32").is_some_and(|a| {
+                current(p, &a["conditions"])
+                    && cond_is(&a["conditions"], "Accepted", "True", Some("Accepted"))
+                    && cond_is(&a["conditions"], "ResolvedRefs", "True", Some("ResolvedRefs"))
+            })
+        })
+        .await
+        .unwrap();
+        let ancestor = our_ancestor(&p, "t32").unwrap();
+        println!("[{T}] ancestor {}: {}", ancestor["ancestorRef"], show(&ancestor["conditions"]));
+        assert_eq!(ancestor["ancestorRef"]["kind"], "Gateway");
+        let r = front
+            .wait("request over TLS with the policy", HTTP_PORT, host, "/hostname", &[], |r| r.status == 200)
+            .await;
+        println!("[{T}] with the policy: {}", r.short());
+        assert!(r.body.starts_with("t32-backend-"), "{}", r.short());
+
+        // A hostname the backend certificate does not match.
+        apply(&env, &policy("wrong.t32.example.com")).await.unwrap();
+        let r = front
+            .wait("5xx with the wrong hostname", HTTP_PORT, host, "/hostname", &[], |r| (500..600).contains(&r.status))
+            .await;
+        println!("[{T}] wrong hostname: {}", r.short());
+    })
+    .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1710,5 +2357,24 @@ mod tests {
         ];
         let c = by_backend(&s);
         assert_eq!((c["echo"], c["httpbin"], c["500"]), (1, 1, 1));
+    }
+
+    #[test]
+    fn parses_grpc_call_output() {
+        let r = parse_grpc("200 2\ngrpc-status: 0\nBODY  podinfo-abc   x \n").unwrap();
+        assert_eq!((r.status, r.http_version.as_str()), (200, "2"));
+        assert_eq!(r.grpc_status.as_deref(), Some("0"));
+        assert_eq!(r.body, "podinfo-abc x");
+        let r = parse_grpc("404 2\nBODY \n").unwrap();
+        assert_eq!((r.status, r.grpc_status), (404, None));
+    }
+
+    #[test]
+    fn backend_certs_are_signed_by_the_ca() {
+        let (ca, cert, key) = backend_certs("backend.example.com");
+        assert!(ca.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(cert.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(key.contains("PRIVATE KEY"));
+        assert_ne!(ca, cert);
     }
 }
