@@ -1002,9 +1002,11 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
 /// The Service a resolve warning is about.
 fn warning_service(w: &ResolveWarning) -> &ServiceKey {
     match w {
-        ResolveWarning::ServiceMissing(key) => key,
+        ResolveWarning::ServiceMissing(key) | ResolveWarning::ExternalNameNotEnabled(key) => key,
         ResolveWarning::PortNotInService { service, .. }
-        | ResolveWarning::PortNotInSlices { service, .. } => service,
+        | ResolveWarning::PortNotInSlices { service, .. }
+        | ResolveWarning::ExternalNameInvalid { service, .. }
+        | ResolveWarning::TrafficPolicyIgnored { service, .. } => service,
     }
 }
 
@@ -1201,7 +1203,8 @@ mod tests {
             options: UpstreamOptions {
                 include_not_ready: false,
                 drain_terminating: true,
-                ipv4_only: false,
+                ip_family: crate::types::IpFamily::Primary,
+                external_name: false,
                 debounce: Duration::from_millis(500),
                 debounce_max: Duration::from_secs(2),
                 target: UpstreamTarget::Pods,

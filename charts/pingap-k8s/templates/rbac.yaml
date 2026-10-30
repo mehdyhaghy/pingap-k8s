@@ -8,7 +8,7 @@ With gateway.enabled: in each gateway.namespaces namespace, read secrets
 (limited to gateway.secretNames when set); and the only ClusterRole: read the
 Gateway API resources and namespaces, patch the status of GatewayClasses,
 Gateways and HTTPRoutes. GatewayClasses are cluster-scoped and routes attach
-across namespaces, so this part can not be namespaced.
+across namespaces, so this part cannot be namespaced.
 */ -}}
 {{- if .Values.rbac.create }}
 {{- $fullname := include "pingap-k8s.fullname" . }}

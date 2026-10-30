@@ -102,8 +102,8 @@ data:
     debounce = "500ms"
     debounce_max = "2s"
     drain_terminating = true
+    external_name = false
     include_not_ready = false
-    ipv4_only = false
     resync = "5m"
     target = "pods"
 
@@ -215,6 +215,8 @@ spec:
         app.kubernetes.io/name: pingap-k8s
         app.kubernetes.io/instance: pingap-k8s
         app.kubernetes.io/component: controller
+      annotations:
+        pingap-k8s/restart-checksum: 1778d3cd87e93a8e
     spec:
       serviceAccountName: pingap-k8s
       automountServiceAccountToken: true

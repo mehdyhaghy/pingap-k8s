@@ -25,6 +25,8 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- $annotations := .Values.podAnnotations | default dict }}
+      {{- /* Settings read at start only (gateway.enabled and the [gateway] ones that need a restart, events, [server]). */}}
+      {{- $annotations = merge (dict "pingap-k8s/restart-checksum" (include "pingap-k8s.restartChecksum" .)) $annotations }}
       {{- if .Values.status.enabled }}
       {{- /* Read by the kubectl plugin; also restarts the pods ([server] is not hot-reloaded). */}}
       {{- $annotations = merge (dict "pingap-k8s/status-port" (toString (int .Values.status.port))) $annotations }}

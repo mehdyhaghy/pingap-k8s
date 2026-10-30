@@ -54,7 +54,10 @@ pub struct ServiceRef {
 pub struct UpstreamOptions {
     pub include_not_ready: bool,
     pub drain_terminating: bool,
-    pub ipv4_only: bool,
+    /// Which address families of the endpoints are written.
+    pub ip_family: IpFamily,
+    /// `ExternalName` Services contribute `<externalName>:<port>` (Pingap DNS discovery).
+    pub external_name: bool,
     pub debounce: Duration,
     pub debounce_max: Duration,
     pub target: UpstreamTarget,
@@ -62,6 +65,42 @@ pub struct UpstreamOptions {
     /// addresses, and the weights are scaled to a small total (Gateway API `backendRefs`
     /// semantics). Off: the weight is written on every address as it is.
     pub spread_weights: bool,
+}
+
+/// Address families written for an upstream (`ip_family`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IpFamily {
+    /// One address per endpoint: the Service's primary family (`spec.ipFamilies[0]`),
+    /// the other family only for endpoints that have no address in the primary one.
+    #[default]
+    Primary,
+    /// IPv4 addresses only.
+    Ipv4,
+    /// IPv6 addresses only.
+    Ipv6,
+    /// Every family: a pod of a dual-stack Service is written once per family.
+    Both,
+}
+
+impl IpFamily {
+    /// The config value: `primary`, `ipv4`, `ipv6` or `both`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IpFamily::Primary => "primary",
+            IpFamily::Ipv4 => "ipv4",
+            IpFamily::Ipv6 => "ipv6",
+            IpFamily::Both => "both",
+        }
+    }
+
+    /// Whether addresses of a family (`ipv6` true for IPv6) may be written at all.
+    pub fn allows(self, ipv6: bool) -> bool {
+        match self {
+            IpFamily::Primary | IpFamily::Both => true,
+            IpFamily::Ipv4 => !ipv6,
+            IpFamily::Ipv6 => ipv6,
+        }
+    }
 }
 
 /// What an upstream's `addrs` point at.
