@@ -73,7 +73,10 @@
 //! the `redirect` plugin; URLRewrite -> the location's `rewrite` and a Host in
 //! `proxy_set_headers`; CORS -> the `cors` plugin; RequestMirror -> one `mirror` plugin
 //! each. Those two and a rule's `retry` and `timeouts` are in [`extended`] (a route
-//! with `retry.backoff` is not accepted). Header values that start with `$` or `:` are
+//! with `retry.backoff` is not accepted). Filters on backendRefs (RequestHeaderModifier
+//! and ResponseHeaderModifier only) are supported when every backendRef of the rule with
+//! a weight above zero has the same ones; they run after the filters of the rule, for
+//! the requests forwarded to a backend (see [`backend_filters`]). Header values that start with `$` or `:` are
 //! refused, because Pingap replaces them with variables (`$NAME` with environment variables of the Pingap
 //! process). A redirect keeps the query, except one that needs a whole URL as target
 //! (from HTTPS to HTTP, or to a port other than the one Pingap would pick for the
@@ -2278,6 +2281,9 @@ struct Rule {
     matches: Vec<Match>,
     /// Plugins in run order, before the 500 mock and the redirect.
     plugins: Vec<(String, PluginEntry)>,
+    /// Plugins of the filters of the backendRefs, after the 500 mock (see
+    /// [`backend_filters`]).
+    backend_plugins: Vec<(String, PluginEntry)>,
     host_header: Option<String>,
     rewrite: Option<PathModifier>,
     redirect: Option<Redirect>,
@@ -2412,14 +2418,7 @@ fn compile_rule(
     if prefix_modifier && matches.iter().any(|m| m.kind != PathKind::Prefix) {
         return Err("ReplacePrefixMatch needs PathPrefix matches only".into());
     }
-    if rule
-        .backend_refs
-        .iter()
-        .flatten()
-        .any(|b| b.filters.as_ref().is_some_and(|f| !f.is_empty()))
-    {
-        return Err("filters on backendRefs are not supported".into());
-    }
+    let backend_plugins = backend_filters(rule, &mut host_header)?;
 
     let mut backends = resolve_backends(input, policies, kind, route, rule);
     backends.issues.extend(mirror_issues);
@@ -2430,12 +2429,65 @@ fn compile_rule(
         host_header,
         rewrite,
         redirect,
+        backend_plugins,
         upstream: backends.upstream,
         invalid_percent: backends.invalid_percent,
         backend_issues: backends.issues,
         options,
         tls_targets: backends.tls_targets,
     })
+}
+
+/// The plugins of the filters of the backendRefs of a rule.
+///
+/// The backends of a rule share one location and one upstream, so Pingap cannot run
+/// filters for the requests of one backend only: a location has one upstream and its
+/// plugins run for every request it takes, and the first matching location takes the
+/// request (there is no random fall-through to the next one). Backend filters are
+/// therefore supported when every backendRef with a weight above zero has the same
+/// filters (a single backend, most of the time): they then run exactly for the requests
+/// forwarded to a backend, after the filters of the rule. Only RequestHeaderModifier and
+/// ResponseHeaderModifier are supported there; anything else drops the rule.
+fn backend_filters(
+    rule: &HttpRouteRules,
+    host_header: &mut Option<String>,
+) -> Result<Vec<(String, PluginEntry)>, String> {
+    let mut lists = rule
+        .backend_refs
+        .iter()
+        .flatten()
+        .filter(|b| b.weight.unwrap_or(1) > 0)
+        .map(|b| b.filters.as_deref().unwrap_or_default());
+    let Some(first) = lists.next() else {
+        return Ok(Vec::new());
+    };
+    if lists.any(|other| other != first) {
+        return Err(
+            "backendRefs with different filters are not supported (the backends \
+                    of a rule share one Pingap location)"
+                .into(),
+        );
+    }
+    let mut plugins = Vec::new();
+    for filter in first {
+        let filter: HttpRouteRulesFilters = serde_json::to_value(filter)
+            .and_then(serde_json::from_value)
+            .map_err(|_| "a filter of a backendRef could not be read".to_string())?;
+        match filter.r#type {
+            HttpRouteRulesFiltersType::RequestHeaderModifier
+            | HttpRouteRulesFiltersType::ResponseHeaderModifier => {
+                apply_filter(&filter, &mut plugins, host_header, &mut None, &mut None)?;
+            }
+            other => {
+                let name = serde_json::to_value(&other)
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_default();
+                return Err(format!("{name} filters on backendRefs are not supported"));
+            }
+        }
+    }
+    Ok(plugins)
 }
 
 /// A Gateway API path match in Pingap syntax: (kind, normalized value, Pingap path).
@@ -3188,6 +3240,7 @@ fn build_location(
             });
         }
         if rule.invalid_percent < 100 {
+            plugins.extend(rule.backend_plugins.iter().cloned());
             upstream = rule.upstream.as_ref().map(|(n, _)| n.clone());
         }
     }
@@ -4827,6 +4880,270 @@ mod tests {
             );
             assert!(d.locations.is_empty(), "{filters}");
         }
+    }
+
+    fn header_filter(kind: &str, name: &str, value: &str) -> Value {
+        let field = if kind == "RequestHeaderModifier" {
+            "requestHeaderModifier"
+        } else {
+            "responseHeaderModifier"
+        };
+        json!({"type": kind, field: {"set": [{"name": name, "value": value}]}})
+    }
+
+    fn categories<'d>(d: &'d Desired, l: &LocationEntry) -> Vec<&'d str> {
+        plugins_of(d, l)
+            .iter()
+            .map(|p| p.category.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn backend_filters_of_a_single_backend() {
+        let d = World::new()
+            .gw(basic_gateway())
+            .rt(route("ns", "r", 0, json!({"rules": [{
+                "filters": [header_filter("RequestHeaderModifier", "X-Both", "rule")],
+                "backendRefs": [{"name": "web", "port": 80, "filters": [
+                    {"type": "RequestHeaderModifier", "requestHeaderModifier": {
+                        "set": [{"name": "X-Both", "value": "backend"}, {"name": "Host", "value": "web.internal"}],
+                        "add": [{"name": "X-Add", "value": "a"}], "remove": ["X-Drop"]}},
+                    header_filter("ResponseHeaderModifier", "X-Resp", "1"),
+                ]}],
+            }]})))
+            .run();
+        let r = rkey("ns", "r");
+        assert_eq!(route_cond(&d, &r, "Accepted"), tf("True", "Accepted"));
+        assert_eq!(
+            route_cond(&d, &r, "ResolvedRefs"),
+            tf("True", "ResolvedRefs")
+        );
+        let l = locations(&d, "http")[0];
+        assert!(l.upstream.is_some());
+        assert_eq!(l.proxy_set_headers, vec!["host:web.internal"]);
+        // The rule's filters run first, so the backend's set wins.
+        assert_eq!(
+            categories(&d, l),
+            vec!["request_headers", "request_headers", "response_headers"]
+        );
+        let plugins = plugins_of(&d, l);
+        assert_eq!(
+            strings(&plugins[0].fields["set_headers"]),
+            vec!["X-Both:rule"]
+        );
+        assert_eq!(
+            strings(&plugins[1].fields["set_headers"]),
+            vec!["X-Both:backend"]
+        );
+        assert_eq!(strings(&plugins[1].fields["add_headers"]), vec!["X-Add:a"]);
+        assert_eq!(
+            strings(&plugins[1].fields["remove_headers"]),
+            vec!["X-Drop"]
+        );
+        assert_eq!(strings(&plugins[2].fields["set_headers"]), vec!["X-Resp:1"]);
+
+        // The location and its plugins are valid Pingap entries.
+        let name = &d.server_locations["http"][0];
+        let out = super::super::render::render_location(name, l);
+        let doc: toml::Table = toml::from_str(&out).unwrap();
+        let conf = doc["locations"][name.as_str()].as_table().unwrap();
+        assert_eq!(strings(&conf["plugins"]), l.plugins);
+        for plugin in &l.plugins {
+            let out = super::super::render::render_plugin(plugin, &d.plugins[plugin]);
+            let doc: toml::Table = toml::from_str(&out).unwrap();
+            let entry = doc["plugins"][plugin.as_str()].as_table().unwrap();
+            assert!(entry["category"].as_str().unwrap().ends_with("_headers"));
+            assert!(entry["set_headers"].as_array().is_some());
+        }
+    }
+
+    #[test]
+    fn same_backend_filters_on_every_weighted_backend() {
+        let f = json!([header_filter("RequestHeaderModifier", "X-Pool", "blue")]);
+        let other = json!([header_filter("RequestHeaderModifier", "X-Pool", "green")]);
+        let d = World::new()
+            .gw(basic_gateway())
+            .rt(route(
+                "ns",
+                "r",
+                0,
+                json!({"rules": [{"backendRefs": [
+                    {"name": "web", "port": 80, "weight": 3, "filters": f},
+                    {"name": "v2", "port": 80, "weight": 1, "filters": f},
+                    // Never forwarded to, so its filters do not matter.
+                    {"name": "api", "port": 80, "weight": 0, "filters": other},
+                ]}]}),
+            ))
+            .run();
+        assert_eq!(
+            route_cond(&d, &rkey("ns", "r"), "Accepted"),
+            tf("True", "Accepted")
+        );
+        let l = locations(&d, "http")[0];
+        assert!(l.upstream.as_ref().unwrap().contains("-split-"));
+        let plugins = plugins_of(&d, l);
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(
+            strings(&plugins[0].fields["set_headers"]),
+            vec!["X-Pool:blue"]
+        );
+    }
+
+    #[test]
+    fn different_backend_filters_drop_the_rule() {
+        // The manifest of the HTTPRouteRequestHeaderModifierBackendWeights test: Pingap
+        // cannot pick the plugins of a location by the backend a request goes to.
+        let d = World::new()
+            .gw(basic_gateway())
+            .rt(route(
+                "ns",
+                "r",
+                0,
+                json!({"rules": [
+                    {"matches": [{"path": {"value": "/ok"}}], "backendRefs": [backend("web", 80)]},
+                    {"backendRefs": [
+                        {"name": "web", "port": 80, "weight": 10,
+                         "filters": [header_filter("RequestHeaderModifier", "Backend", "web")]},
+                        {"name": "v2", "port": 80, "weight": 10,
+                         "filters": [header_filter("RequestHeaderModifier", "Backend", "v2")]},
+                    ]},
+                    {"matches": [{"path": {"value": "/some"}}], "backendRefs": [
+                        {"name": "web", "port": 80,
+                         "filters": [header_filter("RequestHeaderModifier", "Backend", "web")]},
+                        backend("v2", 80),
+                    ]},
+                ]}),
+            ))
+            .run();
+        let r = rkey("ns", "r");
+        assert_eq!(route_cond(&d, &r, "Accepted"), tf("True", "Accepted"));
+        let pi = condition(
+            &d.status.routes[&r].parents[0].conditions,
+            "PartiallyInvalid",
+        );
+        assert_eq!(pi.reason, "UnsupportedValue");
+        assert!(
+            pi.message
+                .contains("rule 1: backendRefs with different filters")
+                && pi
+                    .message
+                    .contains("rule 2: backendRefs with different filters"),
+            "{}",
+            pi.message
+        );
+        let locs = locations(&d, "http");
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].path, "~^/ok(/|$)");
+    }
+
+    #[test]
+    fn unsupported_backend_filters_drop_the_rule() {
+        for filter in [
+            json!({"type": "URLRewrite", "urlRewrite": {"hostname": "x.example.com"}}),
+            json!({"type": "RequestMirror", "requestMirror": {"backendRef": {"name": "v2", "port": 80}}}),
+            json!({"type": "CORS", "cors": {"allowOrigins": ["https://a.example.com"]}}),
+            json!({"type": "ExtensionRef", "extensionRef": {"group": "x", "kind": "y", "name": "z"}}),
+            json!({"type": "RequestHeaderModifier", "requestHeaderModifier": {"set": [{"name": "X", "value": "$HOME"}]}}),
+        ] {
+            let d = World::new()
+                .gw(basic_gateway())
+                .rt(route(
+                    "ns",
+                    "r",
+                    0,
+                    json!({"rules": [{"backendRefs": [
+                    {"name": "web", "port": 80, "filters": [filter]}]}]}),
+                ))
+                .run();
+            let r = rkey("ns", "r");
+            assert_eq!(
+                route_cond(&d, &r, "Accepted"),
+                tf("False", "UnsupportedValue"),
+                "{filter}"
+            );
+            assert!(d.locations.is_empty(), "{filter}");
+        }
+        let d = World::new()
+            .gw(basic_gateway())
+            .rt(route(
+                "ns",
+                "r",
+                0,
+                json!({"rules": [{"backendRefs": [
+                {"name": "web", "port": 80, "filters": [
+                    {"type": "URLRewrite", "urlRewrite": {"hostname": "x.example.com"}}]}]}]}),
+            ))
+            .run();
+        let message = &condition(
+            &d.status.routes[&rkey("ns", "r")].parents[0].conditions,
+            "Accepted",
+        )
+        .message;
+        assert!(
+            message.contains("URLRewrite filters on backendRefs are not supported"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn backend_filters_skip_the_500_share() {
+        let f = json!([header_filter("ResponseHeaderModifier", "X-Backend", "1")]);
+        let d = World::new()
+            .gw(basic_gateway())
+            .rt(route(
+                "ns",
+                "r",
+                0,
+                json!({"rules": [
+                    {"matches": [{"path": {"value": "/half"}}], "backendRefs": [
+                        {"name": "web", "port": 80, "filters": f},
+                        {"name": "gone", "port": 80, "filters": f}]},
+                    {"matches": [{"path": {"value": "/gone"}}], "backendRefs": [
+                        {"name": "gone", "port": 80, "filters": f}]},
+                ]}),
+            ))
+            .run();
+        let by_path: BTreeMap<&str, &LocationEntry> = locations(&d, "http")
+            .into_iter()
+            .map(|l| (l.path.as_str(), l))
+            .collect();
+        let half = by_path["~^/half(/|$)"];
+        assert!(half.upstream.is_some());
+        // Requests the mock answers stop before the backend's request plugins, and
+        // `response_headers` (without `always`) leaves the mock's response alone.
+        assert_eq!(categories(&d, half), vec!["mock", "response_headers"]);
+        let gone = by_path["~^/gone(/|$)"];
+        assert_eq!(gone.upstream, None);
+        assert_eq!(categories(&d, gone), vec!["mock"]);
+    }
+
+    #[test]
+    fn grpc_backend_filters() {
+        let w = World::h2().gw(basic_gateway()).grt(grpc_route(
+            "ns",
+            "g",
+            0,
+            json!({"rules": [{
+                "matches": [{"method": {"service": "pkg.Svc", "method": "Get"}}],
+                "backendRefs": [{"name": "grpc", "port": 9000, "filters": [
+                    header_filter("RequestHeaderModifier", "x-backend", "grpc"),
+                    header_filter("ResponseHeaderModifier", "x-resp", "1"),
+                ]}],
+            }]}),
+        ));
+        let d = w.run();
+        let key = rkey("ns", "g");
+        assert_eq!(grpc_cond(&d, &key, "Accepted"), tf("True", "Accepted"));
+        let l = locations(&d, "http")[0];
+        assert!(d.upstreams[l.upstream.as_ref().unwrap()].h2c);
+        assert_eq!(
+            categories(&d, l),
+            vec!["request_headers", "response_headers"]
+        );
+        assert_eq!(
+            strings(&plugins_of(&d, l)[0].fields["set_headers"]),
+            vec!["x-backend:grpc"]
+        );
     }
 
     #[test]

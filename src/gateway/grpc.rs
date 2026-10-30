@@ -22,7 +22,7 @@
 //! client, which an h2c gRPC backend does not accept) and method
 //! values that are not valid gRPC names. Everything else is left to the HTTPRoute
 //! translation, which refuses the same things for both kinds (regular expression header
-//! matches, `ExtensionRef` filters, filters on backendRefs).
+//! matches, `ExtensionRef` filters, backendRefs with different filters).
 
 use regex::Regex;
 use serde::Serialize;
