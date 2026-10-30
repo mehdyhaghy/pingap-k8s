@@ -410,7 +410,7 @@ the namespaces of backends, certificate Secrets and CA ConfigMaps in `gateway.na
 logs a warning, keeps syncing the configured upstreams, and starts the provider when the CRDs
 appear.
 
-Conformance (v1.7.0): GATEWAY-HTTP core 40/40 and extended 42/42; GATEWAY-GRPC core 17/17 and extended 9/9 (Standard channel, no failures).
+Conformance (v1.7.0): GATEWAY-HTTP core 40/40 and extended 46/46; GATEWAY-GRPC core 17/17 and extended 9/9 (Standard channel, no failures).
 
 `scripts/conformance.sh` runs the official suite on a kind cluster of its own (profiles from
 `CONF_PROFILES`, default `GATEWAY-HTTP,GATEWAY-GRPC`) and writes the report to
@@ -445,6 +445,12 @@ Details and limits:
   claimed as a supported feature.
 - **h2c backends**: HTTPRoute backends whose Service port has the `appProtocol`
   `kubernetes.io/h2c` (or `grpc`) are reached over HTTP/2 cleartext.
+- **Filters on backendRefs** (RequestHeaderModifier, ResponseHeaderModifier, URLRewrite) work
+  when every weighted backendRef of the rule has the same ones, e.g. a single backend: the
+  backends of a rule share one Pingap location. Different filters per backend drop the rule.
+- **Listener isolation**: listeners on one port of a Gateway are isolated; a request goes to the
+  listener with the most specific matching hostname and only its routes serve it (else 404).
+  Gateways that share Pingap servers are not isolated from each other.
 - A rule that uses an unsupported field is dropped and the route reports `PartiallyInvalid`.
   Header values that start with `$` or `:` are refused (Pingap would read them as variables).
 - Generated entries are named `k8s-...` and carry a `pingap-k8s` remark. The controller only
@@ -515,9 +521,10 @@ oldest first.
 `status.supportedFeatures` of the GatewayClass:
 
 `BackendTLSPolicy`, `GRPCRoute`, `GRPCRouteNamedRouteRule`, `GRPCRouteRequestHeaderModifier`,
-`Gateway`, `GatewayBackendClientCertificate`, `GatewayStaticAddresses`, `HTTPRoute`,
+`Gateway`, `GatewayBackendClientCertificate`, `GatewayHTTPListenerIsolation`, `GatewayPort8080`,
+`GatewayStaticAddresses`, `HTTPRoute`,
 `HTTPRoute303RedirectStatusCode`, `HTTPRoute307RedirectStatusCode`,
-`HTTPRoute308RedirectStatusCode`, `HTTPRouteBackendProtocolH2C`,
+`HTTPRoute308RedirectStatusCode`, `HTTPRouteBackendProtocolH2C`, `HTTPRouteBackendURLRewrite`,
 `HTTPRouteBackendProtocolWebSocket`, `HTTPRouteBackendTimeout`, `HTTPRouteHostRewrite`,
 `HTTPRouteNamedRouteRule`, `HTTPRouteParentRefPort`, `HTTPRoutePathRedirect`,
 `HTTPRoutePathRewrite`, `HTTPRoutePortRedirect`, `HTTPRouteQueryParamMatching`,
@@ -530,7 +537,8 @@ Not supported: TCPRoute, UDPRoute and TLSRoute (passthrough and terminate; Pinga
 HTTP-only L7 proxy, and L4 was declined upstream in
 [vicanso/pingap#159](https://github.com/vicanso/pingap/issues/159)), method matching and regex
 header or query matches, `HTTPRouteRetryCodes`, retry backoff, BackendTLSPolicy SAN validation,
-and session persistence.
+different filters per backendRef, 421 detection of misdirected requests (Pingap does not expose
+the TLS SNI to routing), and session persistence.
 
 ## Graceful shutdown of application pods (preStop)
 

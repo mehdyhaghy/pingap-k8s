@@ -30,6 +30,8 @@ Gateway API provider (off by default, `gateway.enabled`), Gateway API v1.7.0 Sta
   **Behavior change**: a Gateway asking (`spec.addresses`) for an address the controller does not
   serve is not programmed (`AddressNotUsable`).
 - ListenerSets attach to Gateways that allow them (`allowedListeners`).
+- Listener isolation per Gateway and port; GatewayPort8080; filters on backendRefs
+  (header modifiers and URLRewrite) when every weighted backend of the rule has the same ones.
 - Status for GatewayClasses (with `supportedFeatures`), Gateways, ListenerSets, routes and
   BackendTLSPolicies, written by the leader; conditions of other controllers are kept.
 - Chart: `gateway.*` values, a GatewayClass, and a ClusterRole that only reads the Gateway API
@@ -37,8 +39,9 @@ Gateway API provider (off by default, `gateway.enabled`), Gateway API v1.7.0 Sta
   (`gateway.secretNames`, `gateway.configMapNames`). `make exposure-check` allows only that
   ClusterRole.
 - Not supported: TCPRoute, UDPRoute, TLSRoute (Pingap is HTTP-only), retry codes and backoff,
-  BackendTLSPolicy SAN validation, session persistence.
-- Conformance (v1.7.0): GATEWAY-HTTP core 40/40 and extended 42/42; GATEWAY-GRPC core 17/17 and extended 9/9 (Standard channel, no failures).
+  BackendTLSPolicy SAN validation, different filters per backendRef, 421 misdirected-request
+  detection, session persistence.
+- Conformance (v1.7.0): GATEWAY-HTTP core 40/40 and extended 46/46; GATEWAY-GRPC core 17/17 and extended 9/9 (Standard channel, no failures).
 
 Upstreams:
 - `ip_family = "primary" | "ipv4" | "ipv6" | "both"` (default `primary`: one address per pod, in
