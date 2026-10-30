@@ -186,7 +186,8 @@ pub fn render_certificate(name: &str, certificate: &CertificateEntry) -> String 
 /// `[upstreams.<name>]` for an `ExternalName` backend: `addrs = ["host:port"]` with
 /// `discovery = "dns"` and `update_frequency`. An IP literal is written as a static
 /// address, and only when it passes the same filter as the pod addresses of phase 1 (no
-/// loopback, link-local, broadcast, multicast or unspecified address).
+/// loopback, link-local, broadcast, multicast or unspecified address). With TLS (a
+/// BackendTLSPolicy): `sni`, `verify_cert = true`, `ca`, `client_cert` and `client_key`.
 pub fn render_external_upstream(
     name: &str,
     upstream: &ExternalUpstream,
@@ -236,6 +237,17 @@ pub fn render_external_upstream(
     }
     if let Some(health_check) = &upstream.health_check {
         entry.insert("health_check", toml_edit::value(health_check.as_str()));
+    }
+    if let Some(tls) = &upstream.tls {
+        entry.insert("sni", toml_edit::value(tls.sni.as_str()));
+        entry.insert("verify_cert", toml_edit::value(true));
+        if let Some(ca) = &tls.ca {
+            entry.insert("ca", toml_edit::value(ca.as_str()));
+        }
+        if let Some((cert, key)) = &tls.client_cert {
+            entry.insert("client_cert", toml_edit::value(cert.as_str()));
+            entry.insert("client_key", toml_edit::value(key.as_str()));
+        }
     }
     entry.insert(
         "remark",
@@ -522,6 +534,11 @@ mod tests {
         discovery: Option<String>,
         update_frequency: Option<String>,
         health_check: Option<String>,
+        sni: Option<String>,
+        verify_cert: Option<bool>,
+        ca: Option<String>,
+        client_cert: Option<String>,
+        client_key: Option<String>,
         remark: Option<String>,
     }
 
@@ -660,6 +677,7 @@ mod tests {
             },
             addr: addr.into(),
             health_check: None,
+            tls: None,
         }
     }
 
@@ -689,6 +707,32 @@ mod tests {
             conf.health_check.as_deref(),
             Some("tcp://db?check_frequency=5s")
         );
+    }
+
+    #[test]
+    fn external_upstream_with_tls() {
+        let mut upstream = external("db.example.com:443");
+        upstream.tls = Some(crate::types::UpstreamTls {
+            sni: "db.example.com".into(),
+            ca: Some("CA PEM".into()),
+            client_cert: Some(("CERT PEM".into(), "KEY PEM".into())),
+        });
+        let out = render_external_upstream("k8s-x", &upstream, "5s").unwrap();
+        let conf = parse::<UpstreamConf>(&out, "upstreams")
+            .remove("k8s-x")
+            .unwrap();
+        assert_eq!(conf.sni.as_deref(), Some("db.example.com"));
+        assert_eq!(conf.verify_cert, Some(true));
+        assert_eq!(conf.ca.as_deref(), Some("CA PEM"));
+        assert_eq!(conf.client_cert.as_deref(), Some("CERT PEM"));
+        assert_eq!(conf.client_key.as_deref(), Some("KEY PEM"));
+
+        let plain =
+            render_external_upstream("k8s-x", &external("db.example.com:443"), "5s").unwrap();
+        let conf = parse::<UpstreamConf>(&plain, "upstreams")
+            .remove("k8s-x")
+            .unwrap();
+        assert_eq!((conf.sni, conf.verify_cert, conf.ca), (None, None, None));
     }
 
     #[test]

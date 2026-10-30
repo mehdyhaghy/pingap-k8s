@@ -5,15 +5,16 @@ use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 
-use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
 use tokio::sync::{broadcast, oneshot};
 
 use crate::config::UpstreamConfig;
+use crate::gateway::api::backendtlspolicies::{BackendTlsPolicy, BackendTlsPolicyStatus};
 use crate::gateway::api::gatewayclasses::{GatewayClass, GatewayClassStatus};
 use crate::gateway::api::gateways::{Gateway, GatewayStatus};
 use crate::gateway::api::httproutes::{HttpRoute, HttpRouteStatus};
 use crate::gateway::api::referencegrants::ReferenceGrant;
-use crate::types::{ServiceKey, UpstreamOptions};
+use crate::types::{ServiceKey, UpstreamOptions, UpstreamTls};
 
 /// Every entry the Gateway provider writes has a name starting with this; nothing else
 /// is ever changed or deleted by it.
@@ -53,6 +54,8 @@ impl fmt::Display for ObjectKey {
 pub type GatewayKey = ObjectKey;
 pub type RouteKey = ObjectKey;
 pub type SecretKey = ObjectKey;
+pub type ConfigMapKey = ObjectKey;
+pub type PolicyKey = ObjectKey;
 
 /// What a backend Service becomes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,8 +108,14 @@ pub struct TranslateInput<'a> {
     pub namespaces: &'a BTreeMap<String, Arc<Namespace>>,
     /// Backend Services; absent means missing or not listed yet.
     pub services: &'a BTreeMap<ServiceKey, Arc<Service>>,
-    /// Listener certificate Secrets; absent means missing or not listed yet.
+    /// Listener certificate and backend client certificate Secrets; absent means missing
+    /// or not listed yet.
     pub secrets: &'a BTreeMap<SecretKey, Arc<Secret>>,
+    /// Every BackendTLSPolicy.
+    pub policies: &'a [Arc<BackendTlsPolicy>],
+    /// CA certificate ConfigMaps of the BackendTLSPolicies of backend Services; absent
+    /// means missing or not listed yet.
+    pub config_maps: &'a BTreeMap<ConfigMapKey, Arc<ConfigMap>>,
     /// The Pingap servers stored in etcd.
     pub servers: &'a [ServerInfo],
     /// Plugin names stored in Pingap plus its built-ins.
@@ -119,6 +128,7 @@ pub struct TranslateInput<'a> {
 pub struct Referenced {
     pub services: BTreeSet<ServiceKey>,
     pub secrets: BTreeSet<SecretKey>,
+    pub config_maps: BTreeSet<ConfigMapKey>,
 }
 
 /// A generated Pingap location. One per (server, host, route match): the weight orders
@@ -167,6 +177,8 @@ pub struct ExternalUpstream {
     pub addr: String,
     /// Pingap `health_check`, validated.
     pub health_check: Option<String>,
+    /// TLS to the backend (BackendTLSPolicy).
+    pub tls: Option<UpstreamTls>,
 }
 
 /// A certificate from a `kubernetes.io/tls` Secret named by an HTTPS listener.
@@ -193,6 +205,10 @@ pub struct DesiredStatus {
     /// Routes with at least one parent of ours: only the `parents` entries with our
     /// `controllerName` are set; entries of other controllers are left as they are.
     pub routes: BTreeMap<RouteKey, HttpRouteStatus>,
+    /// BackendTLSPolicies that apply to backends of our routes, or that hold entries of
+    /// ours: only the `ancestors` entries with our `controllerName` are set (none: ours
+    /// are removed); entries of other controllers are left as they are.
+    pub policies: BTreeMap<PolicyKey, BackendTlsPolicyStatus>,
 }
 
 /// Everything the handled Gateways and routes want stored.
@@ -303,16 +319,22 @@ pub trait GatewaySource: Send + Sync + 'static {
     fn gateways(&self) -> Vec<Arc<Gateway>>;
     fn routes(&self) -> Vec<Arc<HttpRoute>>;
     fn grants(&self) -> Vec<Arc<ReferenceGrant>>;
+    fn backend_tls_policies(&self) -> Vec<Arc<BackendTlsPolicy>>;
     fn namespaces(&self) -> BTreeMap<String, Arc<Namespace>>;
     /// Every watch listed once.
     fn is_synced(&self) -> bool;
     fn changes(&self) -> broadcast::Receiver<()>;
 }
 
-/// The Secrets named by listener `certificateRefs`, watched one by one.
+/// The Secrets named by listener `certificateRefs` and Gateway backend client
+/// certificates, and the ConfigMaps named by BackendTLSPolicy `caCertificateRefs`,
+/// watched one by one.
 pub trait SecretSource: Send + Sync + 'static {
     fn set_secrets(&self, keys: BTreeSet<SecretKey>);
     fn secrets(&self) -> BTreeMap<SecretKey, Arc<Secret>>;
+    fn set_config_maps(&self, keys: BTreeSet<ConfigMapKey>);
+    fn config_maps(&self) -> BTreeMap<ConfigMapKey, Arc<ConfigMap>>;
+    /// Every Secret and ConfigMap watch listed once.
     fn is_synced(&self) -> bool;
     fn changes(&self) -> broadcast::Receiver<()>;
 }
@@ -341,6 +363,12 @@ pub trait StatusPublisher: Send + Sync + 'static {
         route: &HttpRoute,
         status: &HttpRouteStatus,
     ) -> impl Future<Output = anyhow::Result<bool>> + Send;
+    /// `status.ancestors` entries of other controllers are kept.
+    fn publish_backend_tls_policy(
+        &self,
+        policy: &BackendTlsPolicy,
+        status: &BackendTlsPolicyStatus,
+    ) -> impl Future<Output = anyhow::Result<bool>> + Send;
 }
 
 /// Shared handle: an `Arc` of a source is a source.
@@ -356,6 +384,9 @@ impl<T: GatewaySource> GatewaySource for Arc<T> {
     }
     fn grants(&self) -> Vec<Arc<ReferenceGrant>> {
         (**self).grants()
+    }
+    fn backend_tls_policies(&self) -> Vec<Arc<BackendTlsPolicy>> {
+        (**self).backend_tls_policies()
     }
     fn namespaces(&self) -> BTreeMap<String, Arc<Namespace>> {
         (**self).namespaces()

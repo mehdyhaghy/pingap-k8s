@@ -52,6 +52,21 @@
 //! request on an HTTPS listener takes the request authority as the client sent it, so
 //! on a listener port other than 443 it may carry that port.
 //!
+//! **Backend TLS.** A BackendTLSPolicy that applies to a backend Service port (see
+//! [`super::backendtls`]) makes its upstream a TLS one (`sni`, `verify_cert`, `ca`): the
+//! TLS variant of the upstream name ([`names::tls_upstream_name`]), never shared with
+//! the plain upstream of the same port. Service `appProtocol` `https`, `wss` and
+//! `kubernetes.io/wss` are accepted when a policy applies, `UnsupportedProtocol`
+//! otherwise. The backends of a rule share one upstream, so they share its TLS
+//! settings: backends whose settings differ from those of the largest weight are
+//! invalid (`UnsupportedProtocol`). A backend whose policy is not accepted gets a 500
+//! without a route condition (the policy status says why). The Gateway's
+//! `spec.tls.backend.clientCertificateRef` (a `kubernetes.io/tls` Secret, cross-namespace
+//! with a ReferenceGrant) is presented to TLS backends (`client_cert`, `client_key`):
+//! upstreams of routes of that Gateway get their own variant. When one location (same
+//! server, host and match) is reached through Gateways with different client
+//! certificates, the Gateway of the first such parentRef of the route applies.
+//!
 //! Listener isolation is not implemented: a request for `a.example.com` that matches no
 //! route of an `a.example.com` listener can match a route of a `*.example.com` listener
 //! on the same server.
@@ -60,13 +75,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 
-use k8s_openapi::api::core::v1::Service;
+use k8s_openapi::api::core::v1::{Service, ServicePort};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use k8s_openapi::jiff::Timestamp;
 use regex::Regex;
 
 use crate::config::UpstreamConfig;
-use crate::types::{PortRef, ServiceKey, ServiceRef, UpstreamTarget};
+use crate::types::{PortRef, ServiceKey, ServiceRef, UpstreamTarget, UpstreamTls};
 
 use super::api::gatewayclasses::{
     GatewayClass, GatewayClassStatus, GatewayClassStatusSupportedFeatures,
@@ -75,6 +90,7 @@ use super::api::gateways::{
     Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespacesFrom,
     GatewayListenersAllowedRoutesNamespacesSelector, GatewayListenersTlsMode, GatewayStatus,
     GatewayStatusAddresses, GatewayStatusListeners, GatewayStatusListenersSupportedKinds,
+    GatewayTlsBackendClientCertificateRef,
 };
 use super::api::httproutes::{
     HttpRoute, HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesFilters,
@@ -85,6 +101,7 @@ use super::api::httproutes::{
     HttpRouteStatusParentsParentRef,
 };
 use super::api::referencegrants::ReferenceGrant;
+use super::backendtls::{BackendTlsPolicies, PortTls, Target, referenced_config_maps};
 use super::model::{
     BackendKind, CertificateEntry, Desired, ExternalUpstream, GATEWAY_GROUP, GatewayKey,
     LocationEntry, ObjectKey, PluginEntry, Referenced, RouteKey, SecretKey, ServerInfo,
@@ -105,8 +122,10 @@ pub const KIND_SECRET: &str = "Secret";
 
 /// The features of the Gateway API conformance suite this provider implements, sorted
 /// as `status.supportedFeatures` must be.
-pub const SUPPORTED_FEATURES: [&str; 15] = [
+pub const SUPPORTED_FEATURES: [&str; 17] = [
+    "BackendTLSPolicy",
     "Gateway",
+    "GatewayBackendClientCertificate",
     "HTTPRoute",
     "HTTPRoute303RedirectStatusCode",
     "HTTPRoute307RedirectStatusCode",
@@ -126,6 +145,9 @@ pub const SUPPORTED_FEATURES: [&str; 15] = [
 /// Service `appProtocol` values the generated (HTTP/1.1, plain text) upstreams can
 /// speak; anything else is `UnsupportedProtocol`.
 const APP_PROTOCOLS: [&str; 4] = ["http", "kubernetes.io/http", "ws", "kubernetes.io/ws"];
+/// Service `appProtocol` values of HTTP/1.1 over TLS: accepted on a port a
+/// BackendTLSPolicy applies to.
+const TLS_APP_PROTOCOLS: [&str; 3] = ["https", "wss", "kubernetes.io/wss"];
 
 /// A lowercase DNS name, optionally with a leading `*.` label: labels of 1 to 63
 /// `[a-z0-9-]` not starting or ending with `-`, at most 253 characters.
@@ -155,13 +177,23 @@ pub fn valid_host(host: &str) -> Result<(), String> {
 }
 
 /// The Services named by the backendRefs of every route with a parent of ours (allowed
-/// or not) and the Secrets named by the HTTPS listeners of our Gateways.
+/// or not), the Secrets named by the HTTPS listeners and the backend client certificates
+/// of our Gateways, and the CA ConfigMaps of the BackendTLSPolicies of those Services.
 pub fn referenced(input: &TranslateInput<'_>) -> Referenced {
     let mut out = Referenced::default();
     let gateways = our_gateways(input);
     let keys: BTreeSet<GatewayKey> = gateways.iter().map(|g| object_key(&g.metadata)).collect();
     for gateway in &gateways {
         let namespace = gateway.metadata.namespace.clone().unwrap_or_default();
+        if let Some(r) = client_certificate_ref(gateway)
+            && r.group.as_deref().unwrap_or("").is_empty()
+            && r.kind.as_deref().unwrap_or(KIND_SECRET) == KIND_SECRET
+        {
+            out.secrets.insert(SecretKey::new(
+                r.namespace.clone().unwrap_or_else(|| namespace.clone()),
+                r.name.clone(),
+            ));
+        }
         for listener in &gateway.spec.listeners {
             if listener.protocol != "HTTPS" {
                 continue;
@@ -203,6 +235,7 @@ pub fn referenced(input: &TranslateInput<'_>) -> Referenced {
             }
         }
     }
+    out.config_maps = referenced_config_maps(input.policies, &out.services);
     out
 }
 
@@ -239,6 +272,18 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
             .or_default();
     }
 
+    let policies = BackendTlsPolicies::new(input.policies, input.config_maps);
+    // Gateway -> its backend client certificate, or why it is not usable.
+    let client_certs: BTreeMap<GatewayKey, ClientCertificate> = gateways
+        .iter()
+        .map(|g| {
+            (
+                object_key(&g.metadata),
+                backend_client_certificate(input, g),
+            )
+        })
+        .collect();
+
     let mut listeners: Vec<Listener<'_>> = Vec::new();
     let mut gateway_listeners: Vec<Vec<usize>> = Vec::new();
     for gateway in &gateways {
@@ -260,8 +305,10 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
     let mut routes: Vec<&Arc<HttpRoute>> = input.routes.iter().collect();
     routes.sort_by_cached_key(|r| age_key(&r.metadata));
 
-    // Upstream name -> what it is, for every rule that has one.
+    // Upstream name -> what it is, for every location that has one.
     let mut upstreams: BTreeMap<String, UpstreamKind> = BTreeMap::new();
+    // BackendTLSPolicy target -> the Gateways whose attached routes use it.
+    let mut policy_uses: BTreeMap<Target, BTreeSet<GatewayKey>> = BTreeMap::new();
     // Server -> location candidates, before weights.
     let mut candidates: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
     for (age, route) in routes.iter().enumerate() {
@@ -288,7 +335,7 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
             .iter()
             .flatten()
             .enumerate()
-            .map(|(i, rule)| compile_rule(input, &key, i, rule))
+            .map(|(i, rule)| compile_rule(input, &policies, &key, i, rule))
             .collect();
         let mut issues: Vec<(&'static str, String)> = Vec::new();
         for rule in compiled.iter().flatten() {
@@ -297,7 +344,7 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
         // A rule that is dropped still has its backends reported.
         for (i, rule) in route.spec.rules.iter().flatten().enumerate() {
             if compiled[i].is_err() {
-                issues.extend(resolve_backends(input, &key, rule).issues);
+                issues.extend(resolve_backends(input, &policies, &key, rule).issues);
             }
         }
         let dropped: Vec<String> = compiled
@@ -374,15 +421,31 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
             for attachment in attachments {
                 listeners[attachment.listener].attached.insert(key.clone());
                 let listener = &listeners[attachment.listener];
+                for rule in compiled.iter().flatten() {
+                    for target in &rule.tls_targets {
+                        policy_uses
+                            .entry(target.clone())
+                            .or_default()
+                            .insert(listener.gateway_key.clone());
+                    }
+                }
                 if !listener.programmed() {
                     continue;
                 }
+                let client_cert = client_certs
+                    .get(&listener.gateway_key)
+                    .and_then(|c| c.as_ref().ok())
+                    .and_then(Option::as_ref);
                 let hosts = intersect_hostnames(listener.hostname.as_deref(), &hostnames);
-                for server in &listener.servers {
-                    for host in &hosts {
-                        for rule in compiled.iter().flatten() {
+                for rule in compiled.iter().flatten() {
+                    let upstream = rule
+                        .upstream
+                        .as_ref()
+                        .map(|(name, kind)| upstream_variant(name, kind, client_cert));
+                    for server in &listener.servers {
+                        for host in &hosts {
                             for m in &rule.matches {
-                                let candidate = build_location(
+                                let mut candidate = build_location(
                                     &key,
                                     age,
                                     rule,
@@ -391,6 +454,14 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
                                     host.as_deref(),
                                     listener,
                                 );
+                                if candidate.entry.upstream.is_some()
+                                    && let Some((name, kind)) = &upstream
+                                {
+                                    candidate.entry.upstream = Some(name.clone());
+                                    upstreams
+                                        .entry(name.clone())
+                                        .or_insert_with(|| kind.clone());
+                                }
                                 candidates
                                     .entry(server.clone())
                                     .or_default()
@@ -399,13 +470,6 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
                         }
                     }
                 }
-            }
-        }
-        for rule in compiled.iter().flatten() {
-            if let Some((name, kind)) = &rule.upstream {
-                upstreams
-                    .entry(name.clone())
-                    .or_insert_with(|| kind.clone());
             }
         }
     }
@@ -476,13 +540,118 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
         );
     }
     for (gi, gateway) in gateways.iter().enumerate() {
-        let status = gateway_status(input, gateway, &gateway_listeners[gi], &listeners);
-        desired
-            .status
-            .gateways
-            .insert(object_key(&gateway.metadata), status);
+        let key = object_key(&gateway.metadata);
+        let client_cert = client_certs.get(&key).cloned().unwrap_or(Ok(None));
+        let status = gateway_status(
+            input,
+            gateway,
+            &gateway_listeners[gi],
+            &listeners,
+            &client_cert,
+        );
+        desired.status.gateways.insert(key, status);
     }
+    desired.status.policies = policies.statuses(&policy_uses, &options.controller_name);
     desired
+}
+
+/// A Gateway's backend client certificate (`tls.crt`, `tls.key`): `Ok(None)` when it has
+/// none, `Err((reason, message))` when the reference is not usable.
+type ClientCertificate = Result<Option<(String, String)>, (&'static str, String)>;
+
+fn client_certificate_ref(gateway: &Gateway) -> Option<&GatewayTlsBackendClientCertificateRef> {
+    gateway
+        .spec
+        .tls
+        .as_ref()?
+        .backend
+        .as_ref()?
+        .client_certificate_ref
+        .as_ref()
+}
+
+/// Resolves `spec.tls.backend.clientCertificateRef`: a core Secret with `tls.crt` and
+/// `tls.key`, in another namespace only with a ReferenceGrant.
+fn backend_client_certificate(input: &TranslateInput<'_>, gateway: &Gateway) -> ClientCertificate {
+    let Some(r) = client_certificate_ref(gateway) else {
+        return Ok(None);
+    };
+    let gateway_key = object_key(&gateway.metadata);
+    let group = r.group.as_deref().unwrap_or("");
+    let kind = r.kind.as_deref().unwrap_or(KIND_SECRET);
+    if !group.is_empty() || kind != KIND_SECRET {
+        return Err((
+            "InvalidClientCertificateRef",
+            format!(
+                "clientCertificateRef {group}/{kind} {} is not a Secret",
+                r.name
+            ),
+        ));
+    }
+    let secret = SecretKey::new(
+        r.namespace
+            .clone()
+            .unwrap_or_else(|| gateway_key.namespace.clone()),
+        r.name.clone(),
+    );
+    if secret.namespace != gateway_key.namespace
+        && !granted(
+            input.grants,
+            &gateway_key.namespace,
+            KIND_GATEWAY,
+            &secret.namespace,
+            KIND_SECRET,
+            &secret.name,
+        )
+    {
+        return Err((
+            "RefNotPermitted",
+            format!("no ReferenceGrant allows a reference to Secret {secret}"),
+        ));
+    }
+    let Some(object) = input.secrets.get(&secret) else {
+        return Err((
+            "InvalidClientCertificateRef",
+            format!("Secret {secret} does not exist"),
+        ));
+    };
+    tls::certificate_from_secret(object)
+        .map(Some)
+        .map_err(|reason| {
+            (
+                "InvalidClientCertificateRef",
+                format!("Secret {secret}: {reason}"),
+            )
+        })
+}
+
+/// The upstream a location of a Gateway uses: `name` and `kind` as the rule resolved
+/// them, or for a TLS upstream with the Gateway's client certificate (`None`: none) its
+/// own TLS variant.
+fn upstream_variant(
+    name: &str,
+    kind: &UpstreamKind,
+    client_cert: Option<&(String, String)>,
+) -> (String, UpstreamKind) {
+    let Some(tls) = kind.tls() else {
+        return (name.to_string(), kind.clone());
+    };
+    let tls = UpstreamTls {
+        client_cert: client_cert.cloned(),
+        ..tls.clone()
+    };
+    let variant = names::tls_upstream_name(name, &tls);
+    let kind = match kind {
+        UpstreamKind::Generated(config) => UpstreamKind::Generated(UpstreamConfig {
+            tls: Some(tls),
+            ..config.clone()
+        }),
+        UpstreamKind::External(external) => UpstreamKind::External(ExternalUpstream {
+            tls: Some(tls),
+            ..external.clone()
+        }),
+    };
+    (variant, kind)
 }
 
 // ---- classes and Gateways ----
@@ -813,6 +982,7 @@ fn gateway_status(
     gateway: &Gateway,
     indices: &[usize],
     listeners: &[Listener<'_>],
+    client_cert: &ClientCertificate,
 ) -> GatewayStatus {
     let generation = gateway.metadata.generation;
     let ours: Vec<&Listener<'_>> = indices.iter().map(|&i| &listeners[i]).collect();
@@ -900,6 +1070,26 @@ fn gateway_status(
         )
     };
 
+    // References outside the listeners (the backend client certificate), and a summary
+    // of the listeners' ResolvedRefs.
+    let resolved = match client_cert {
+        Err((reason, message)) => cond("ResolvedRefs", false, reason, message, generation),
+        Ok(_) if ours.iter().any(|l| l.resolved.is_err()) => cond(
+            "ResolvedRefs",
+            false,
+            "ListenersNotResolved",
+            "A listener has unresolved references",
+            generation,
+        ),
+        Ok(_) => cond(
+            "ResolvedRefs",
+            true,
+            "ResolvedRefs",
+            "All references are resolved",
+            generation,
+        ),
+    };
+
     let listener_statuses = ours
         .iter()
         .map(|l| {
@@ -984,7 +1174,7 @@ fn gateway_status(
     GatewayStatus {
         addresses,
         attached_listener_sets: None,
-        conditions: Some(vec![accepted, programmed]),
+        conditions: Some(vec![accepted, programmed, resolved]),
         listeners: Some(listener_statuses),
     }
 }
@@ -1217,12 +1407,23 @@ struct Backends {
     /// Share of the requests that get a 500, in percent.
     invalid_percent: u8,
     issues: Vec<(&'static str, String)>,
+    /// The BackendTLSPolicy targets of the backends, for the policy statuses.
+    tls_targets: Vec<Target>,
 }
 
 #[derive(Clone)]
 enum UpstreamKind {
     Generated(UpstreamConfig),
     External(ExternalUpstream),
+}
+
+impl UpstreamKind {
+    fn tls(&self) -> Option<&UpstreamTls> {
+        match self {
+            UpstreamKind::Generated(config) => config.tls.as_ref(),
+            UpstreamKind::External(external) => external.tls.as_ref(),
+        }
+    }
 }
 
 /// A rule of a route that is supported, ready to become locations.
@@ -1234,13 +1435,16 @@ struct Rule {
     host_header: Option<String>,
     rewrite: Option<PathModifier>,
     redirect: Option<Redirect>,
+    /// The upstream name before the Gateway's TLS variant ([`upstream_variant`]).
     upstream: Option<(String, UpstreamKind)>,
     invalid_percent: u8,
     backend_issues: Vec<(&'static str, String)>,
+    tls_targets: Vec<Target>,
 }
 
 fn compile_rule(
     input: &TranslateInput<'_>,
+    policies: &BackendTlsPolicies<'_>,
     route: &RouteKey,
     index: usize,
     rule: &HttpRouteRules,
@@ -1342,7 +1546,7 @@ fn compile_rule(
         return Err("filters on backendRefs are not supported".into());
     }
 
-    let backends = resolve_backends(input, route, rule);
+    let backends = resolve_backends(input, policies, route, rule);
     Ok(Rule {
         index,
         matches,
@@ -1353,6 +1557,7 @@ fn compile_rule(
         upstream: backends.upstream,
         invalid_percent: backends.invalid_percent,
         backend_issues: backends.issues,
+        tls_targets: backends.tls_targets,
     })
 }
 
@@ -1670,18 +1875,41 @@ fn mock_500(percent: u8) -> (String, PluginEntry) {
     plugin("mock", fields)
 }
 
+/// How Pingap reaches port `port` of a backend Service: plain text (`Ok(None)`), TLS, or
+/// not at all (`Err`: a BackendTLSPolicy applies but is not accepted). The target is
+/// recorded for the policy status.
+fn backend_tls(
+    policies: &BackendTlsPolicies<'_>,
+    key: &ServiceKey,
+    port: &ServicePort,
+    targets: &mut Vec<Target>,
+) -> Result<Option<UpstreamTls>, String> {
+    let Some((target, tls)) = policies.lookup(key, port) else {
+        return Ok(None);
+    };
+    if !targets.contains(&target) {
+        targets.push(target);
+    }
+    match tls {
+        PortTls::Tls(tls) => Ok(Some(tls)),
+        PortTls::Invalid(message) => Err(message),
+    }
+}
+
 /// Resolves the backendRefs of a rule into an upstream, the share of the requests that
 /// get a 500 and the problems for `ResolvedRefs`.
 fn resolve_backends(
     input: &TranslateInput<'_>,
+    policies: &BackendTlsPolicies<'_>,
     route: &RouteKey,
     rule: &HttpRouteRules,
 ) -> Backends {
     let options = input.options;
     let mut out = Backends::default();
     let refs = rule.backend_refs.as_deref().unwrap_or_default();
-    // (Service key, port number, weight, external host).
-    let mut valid: Vec<(ServiceKey, i32, u32, Option<String>)> = Vec::new();
+    // (Service key, port number, weight, external host, TLS).
+    #[allow(clippy::type_complexity)]
+    let mut valid: Vec<(ServiceKey, i32, u32, Option<String>, Option<UpstreamTls>)> = Vec::new();
     let mut total: u64 = 0;
     let mut invalid: u64 = 0;
     for b in refs {
@@ -1697,17 +1925,19 @@ fn resolve_backends(
             namespace: namespace.clone(),
             name: b.name.clone(),
         };
-        let problem: Option<(&'static str, String)> = (|| {
+        // `Err(None)`: invalid without a route condition (a BackendTLSPolicy that is not
+        // accepted; its status says why).
+        let checked: Result<(), Option<(&'static str, String)>> = (|| {
             if !group.is_empty() || kind != KIND_SERVICE {
                 let shown = if group.is_empty() {
                     kind.to_string()
                 } else {
                     format!("{group}/{kind}")
                 };
-                return Some((
+                return Err(Some((
                     "InvalidKind",
                     format!("backend {} has the unsupported kind {shown}", b.name),
-                ));
+                )));
             }
             if namespace != route.namespace
                 && !granted(
@@ -1719,67 +1949,90 @@ fn resolve_backends(
                     &b.name,
                 )
             {
-                return Some((
+                return Err(Some((
                     "RefNotPermitted",
                     format!("no ReferenceGrant allows a reference to Service {key}"),
-                ));
+                )));
             }
             let Some(port) = b.port else {
-                return Some((
+                return Err(Some((
                     "BackendNotFound",
                     format!("backend Service {key} has no port"),
-                ));
+                )));
             };
             let Some(service) = input.services.get(&key) else {
-                return Some(("BackendNotFound", format!("Service {key} does not exist")));
+                return Err(Some((
+                    "BackendNotFound",
+                    format!("Service {key} does not exist"),
+                )));
             };
             let spec = service.spec.as_ref();
             if spec.and_then(|s| s.type_.as_deref()) == Some("ExternalName") {
                 if !options.external_name {
-                    return Some((
+                    return Err(Some((
                         "InvalidKind",
                         format!("Service {key} is of type ExternalName, which is not enabled"),
-                    ));
+                    )));
                 }
                 let host = spec
                     .and_then(|s| s.external_name.as_deref())
                     .map(|h| h.trim().trim_end_matches('.'))
                     .filter(|h| !h.is_empty());
                 let Some(host) = host else {
-                    return Some((
+                    return Err(Some((
                         "BackendNotFound",
                         format!("ExternalName Service {key} has no externalName"),
-                    ));
+                    )));
                 };
                 if !(1..=65535).contains(&port) {
-                    return Some((
+                    return Err(Some((
                         "BackendNotFound",
                         format!("port {port} of Service {key} is not valid"),
-                    ));
+                    )));
                 }
-                valid.push((key.clone(), port, weight, Some(host.to_string())));
-                return None;
+                let named = service_port(service, port).cloned().unwrap_or(ServicePort {
+                    port,
+                    ..ServicePort::default()
+                });
+                let tls =
+                    backend_tls(policies, &key, &named, &mut out.tls_targets).map_err(|_| None)?;
+                valid.push((key.clone(), port, weight, Some(host.to_string()), tls));
+                return Ok(());
             }
             let Some(service_port) = service_port(service, port) else {
-                return Some((
+                return Err(Some((
                     "BackendNotFound",
                     format!("Service {key} has no port {port}"),
-                ));
+                )));
             };
-            if let Some(protocol) = service_port.app_protocol.as_deref()
-                && !APP_PROTOCOLS.contains(&protocol.to_ascii_lowercase().as_str())
-            {
-                return Some((
-                    "UnsupportedProtocol",
-                    format!("appProtocol {protocol} of Service {key} port {port} is not supported"),
-                ));
+            let tls = backend_tls(policies, &key, service_port, &mut out.tls_targets);
+            if let Some(protocol) = service_port.app_protocol.as_deref() {
+                let lower = protocol.to_ascii_lowercase();
+                let tls_protocol = TLS_APP_PROTOCOLS.contains(&lower.as_str());
+                if tls_protocol && matches!(tls, Ok(None)) {
+                    return Err(Some((
+                        "UnsupportedProtocol",
+                        format!(
+                            "appProtocol {protocol} of Service {key} port {port} needs a BackendTLSPolicy"
+                        ),
+                    )));
+                }
+                if !tls_protocol && !APP_PROTOCOLS.contains(&lower.as_str()) {
+                    return Err(Some((
+                        "UnsupportedProtocol",
+                        format!(
+                            "appProtocol {protocol} of Service {key} port {port} is not supported"
+                        ),
+                    )));
+                }
             }
-            valid.push((key.clone(), port, weight, None));
-            None
+            let tls = tls.map_err(|_| None)?;
+            valid.push((key.clone(), port, weight, None, tls));
+            Ok(())
         })();
-        if let Some(problem) = problem {
+        if let Err(problem) = checked {
             invalid += u64::from(weight);
-            out.issues.push(problem);
+            out.issues.extend(problem);
         }
     }
     valid.retain(|v| v.2 > 0);
@@ -1796,6 +2049,34 @@ fn resolve_backends(
             ));
         }
         valid.retain(|v| v.3.is_none());
+    }
+    // The backends of a rule share one upstream, so one TLS setting: the one with the most
+    // weight (the first on a tie) is kept.
+    let mut settings: Vec<(&Option<UpstreamTls>, u64)> = Vec::new();
+    for v in &valid {
+        match settings.iter_mut().find(|(tls, _)| *tls == &v.4) {
+            Some((_, w)) => *w += u64::from(v.2),
+            None => settings.push((&v.4, u64::from(v.2))),
+        }
+    }
+    let chosen = settings
+        .iter()
+        .rev()
+        .max_by_key(|(_, w)| *w)
+        .map(|(tls, _)| (*tls).clone());
+    if let Some(chosen) = chosen {
+        for v in valid.iter().filter(|v| v.4 != chosen) {
+            invalid += u64::from(v.2);
+            out.issues.push((
+                "UnsupportedProtocol",
+                format!(
+                    "Service {} port {} needs other TLS settings (BackendTLSPolicy) than the \
+                     other backends of the rule, which share one upstream",
+                    v.0, v.1
+                ),
+            ));
+        }
+        valid.retain(|v| v.4 == chosen);
     }
     if valid.is_empty() {
         out.invalid_percent = 100;
@@ -1814,7 +2095,8 @@ fn resolve_backends(
         UpstreamTarget::Service { .. } => BackendKind::Service,
     };
     let health_check = options.health_check.as_deref();
-    if let [(key, port, _, Some(host))] = valid.as_slice() {
+    let tls = valid[0].4.clone();
+    if let [(key, port, _, Some(host), _)] = valid.as_slice() {
         let name = names::upstream_name(
             &key.namespace,
             &key.name,
@@ -1833,12 +2115,13 @@ fn resolve_backends(
                 service: key.clone(),
                 addr,
                 health_check: health_check.map(String::from),
+                tls,
             }),
         ));
         return out;
     }
     let mut upstream_options = options.upstream_defaults.clone();
-    let (name, services) = if let [(key, port, _, _)] = valid.as_slice() {
+    let (name, services) = if let [(key, port, _, _, _)] = valid.as_slice() {
         upstream_options.spread_weights = false;
         (
             names::upstream_name(
@@ -1858,7 +2141,7 @@ fn resolve_backends(
         upstream_options.spread_weights = true;
         let services: Vec<ServiceRef> = valid
             .iter()
-            .map(|(key, port, weight, _)| ServiceRef {
+            .map(|(key, port, weight, _, _)| ServiceRef {
                 key: key.clone(),
                 port: PortRef::Number(*port),
                 weight: Some(*weight),
@@ -1875,6 +2158,7 @@ fn resolve_backends(
             services,
             options: upstream_options,
             health_check: health_check.map(String::from),
+            tls,
         }),
     ));
     out
@@ -2111,7 +2395,13 @@ fn redirect_plugin(
 
 // ---- helpers ----
 
-fn cond(type_: &str, ok: bool, reason: &str, message: &str, generation: Option<i64>) -> Condition {
+pub(super) fn cond(
+    type_: &str,
+    ok: bool,
+    reason: &str,
+    message: &str,
+    generation: Option<i64>,
+) -> Condition {
     Condition {
         last_transition_time: Time(Timestamp::UNIX_EPOCH),
         message: message.to_string(),
@@ -2122,7 +2412,9 @@ fn cond(type_: &str, ok: bool, reason: &str, message: &str, generation: Option<i
     }
 }
 
-fn object_key(meta: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta) -> ObjectKey {
+pub(super) fn object_key(
+    meta: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta,
+) -> ObjectKey {
     ObjectKey::new(
         meta.namespace.clone().unwrap_or_default(),
         meta.name.clone().unwrap_or_default(),
@@ -2130,7 +2422,7 @@ fn object_key(meta: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta)
 }
 
 /// Oldest first; a missing timestamp counts as newest; then namespace/name.
-fn age_key(
+pub(super) fn age_key(
     meta: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta,
 ) -> (bool, Option<Time>, ObjectKey) {
     (
@@ -2155,8 +2447,10 @@ fn dedup<T: PartialEq>(items: impl IntoIterator<Item = T>) -> Vec<T> {
 mod tests {
     use std::time::Duration;
 
-    use k8s_openapi::api::core::v1::{Namespace, Secret};
+    use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret};
     use serde_json::{Value, json};
+
+    use crate::gateway::api::backendtlspolicies::BackendTlsPolicy;
 
     use super::*;
     use crate::gateway::model::TranslateOptions;
@@ -2302,6 +2596,8 @@ mod tests {
         namespaces: BTreeMap<String, Arc<Namespace>>,
         services: BTreeMap<ServiceKey, Arc<Service>>,
         secrets: BTreeMap<SecretKey, Arc<Secret>>,
+        policies: Vec<Arc<BackendTlsPolicy>>,
+        config_maps: BTreeMap<ObjectKey, Arc<ConfigMap>>,
         servers: Vec<ServerInfo>,
         plugins: BTreeSet<String>,
         options: TranslateOptions,
@@ -2322,6 +2618,8 @@ mod tests {
                 namespaces: BTreeMap::new(),
                 services: BTreeMap::new(),
                 secrets: BTreeMap::new(),
+                policies: Vec::new(),
+                config_maps: BTreeMap::new(),
                 servers: vec![
                     server("http", &[80, 8080], false),
                     server("https", &[443], true),
@@ -2376,6 +2674,8 @@ mod tests {
                 namespaces: &self.namespaces,
                 services: &self.services,
                 secrets: &self.secrets,
+                policies: &self.policies,
+                config_maps: &self.config_maps,
                 servers: &self.servers,
                 plugins: &self.plugins,
                 options: &self.options,
@@ -2383,6 +2683,22 @@ mod tests {
         }
         fn run(&self) -> Desired {
             translate(&self.input())
+        }
+        fn clone_world(&self) -> World {
+            World {
+                classes: self.classes.clone(),
+                gateways: self.gateways.clone(),
+                routes: self.routes.clone(),
+                grants: self.grants.clone(),
+                namespaces: self.namespaces.clone(),
+                services: self.services.clone(),
+                secrets: self.secrets.clone(),
+                policies: self.policies.clone(),
+                config_maps: self.config_maps.clone(),
+                servers: self.servers.clone(),
+                plugins: self.plugins.clone(),
+                options: self.options.clone(),
+            }
         }
     }
 
@@ -3750,6 +4066,374 @@ mod tests {
     }
 
     // ---- whole-output properties ----
+
+    // ---- BackendTLSPolicy ----
+
+    /// A BackendTLSPolicy in `ns` for Service `svc` (port `section` when set), CA from
+    /// ConfigMap `ca`.
+    fn btls_policy(
+        name: &str,
+        age: i64,
+        svc: &str,
+        section: Option<&str>,
+        host: &str,
+    ) -> BackendTlsPolicy {
+        let mut target = json!({"group": "", "kind": "Service", "name": svc});
+        if let Some(s) = section {
+            target["sectionName"] = json!(s);
+        }
+        serde_json::from_value(json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "BackendTLSPolicy",
+            "metadata": {"namespace": "ns", "name": name, "generation": 2, "creationTimestamp": ts(age)},
+            "spec": {
+                "targetRefs": [target],
+                "validation": {
+                    "hostname": host,
+                    "caCertificateRefs": [{"group": "", "kind": "ConfigMap", "name": "ca"}],
+                },
+            },
+        }))
+        .unwrap()
+    }
+
+    fn tls_service(name: &str, app_protocol: Option<&str>) -> Service {
+        let mut port = json!({"name": "btls", "port": 443, "targetPort": 8443});
+        if let Some(p) = app_protocol {
+            port["appProtocol"] = json!(p);
+        }
+        serde_json::from_value(json!({
+            "metadata": {"namespace": "ns", "name": name},
+            "spec": {"ports": [port]},
+        }))
+        .unwrap()
+    }
+
+    impl World {
+        fn ca_config_map(&mut self, data: Option<&str>) {
+            let mut cm = json!({"metadata": {"namespace": "ns", "name": "ca"}});
+            if let Some(d) = data {
+                cm["data"] = json!({"ca.crt": d});
+            }
+            self.config_maps.insert(
+                ObjectKey::new("ns", "ca"),
+                Arc::new(serde_json::from_value(cm).unwrap()),
+            );
+        }
+    }
+
+    fn policy_cond(d: &Desired, policy: &str, type_: &str) -> (String, String) {
+        let status = &d.status.policies[&ObjectKey::new("ns", policy)];
+        let c = condition(&status.ancestors[0].conditions, type_);
+        (c.status.clone(), c.reason.clone())
+    }
+
+    /// Gateway `ns/gw` with HTTP on 80, a route `r` to `secure:443`, a policy for it and
+    /// the CA ConfigMap.
+    fn btls_world(app_protocol: Option<&str>) -> World {
+        let mut w = World::new().gw(basic_gateway()).rt(route(
+            "ns",
+            "r",
+            0,
+            json!({"rules": [{"backendRefs": [backend("secure", 443)]}]}),
+        ));
+        w.service(tls_service("secure", app_protocol));
+        w.policies.push(Arc::new(btls_policy(
+            "p",
+            0,
+            "secure",
+            Some("btls"),
+            "secure.example.com",
+        )));
+        w.ca_config_map(Some(cert_pem()));
+        w
+    }
+
+    #[test]
+    fn backend_tls_policy_makes_a_tls_upstream() {
+        for app_protocol in [None, Some("HTTPS"), Some("kubernetes.io/wss")] {
+            let w = btls_world(app_protocol);
+            let d = w.run();
+            let l = locations(&d, "http")[0];
+            let name = l.upstream.clone().unwrap();
+            let base = names::upstream_name(
+                "ns",
+                "secure",
+                &PortRef::Number(443),
+                BackendKind::Pods,
+                None,
+            );
+            let tls = UpstreamTls {
+                sni: "secure.example.com".into(),
+                ca: Some(cert_pem().to_string()),
+                client_cert: None,
+            };
+            assert_eq!(
+                name,
+                names::tls_upstream_name(&base, &tls),
+                "{app_protocol:?}"
+            );
+            assert_eq!(d.upstreams[&name].tls, Some(tls));
+            assert!(l.plugins.is_empty());
+            assert_eq!(
+                route_cond(&d, &rkey("ns", "r"), "ResolvedRefs"),
+                tf("True", "ResolvedRefs")
+            );
+            assert_eq!(policy_cond(&d, "p", "Accepted"), tf("True", "Accepted"));
+            assert_eq!(
+                policy_cond(&d, "p", "ResolvedRefs"),
+                tf("True", "ResolvedRefs")
+            );
+            let ancestors = &d.status.policies[&ObjectKey::new("ns", "p")].ancestors;
+            assert_eq!(ancestors.len(), 1);
+            assert_eq!(ancestors[0].ancestor_ref.name, "gw");
+            assert_eq!(ancestors[0].controller_name, CONTROLLER);
+            assert_eq!(
+                gateway_cond(&d, "gw", "ResolvedRefs"),
+                tf("True", "ResolvedRefs")
+            );
+        }
+    }
+
+    #[test]
+    fn tls_app_protocol_needs_a_policy() {
+        let mut w = btls_world(Some("https"));
+        w.policies.clear();
+        let d = w.run();
+        assert_eq!(
+            route_cond(&d, &rkey("ns", "r"), "ResolvedRefs"),
+            tf("False", "UnsupportedProtocol")
+        );
+        assert!(d.upstreams.is_empty());
+        assert!(d.status.policies.is_empty());
+    }
+
+    #[test]
+    fn invalid_policy_fails_requests_without_a_route_condition() {
+        for data in [None, Some("")] {
+            let mut w = btls_world(Some("HTTPS"));
+            w.config_maps.clear();
+            if data.is_some() {
+                w.ca_config_map(data);
+            }
+            let d = w.run();
+            let l = locations(&d, "http")[0];
+            assert_eq!(l.upstream, None);
+            let mock = plugins_of(&d, l);
+            assert_eq!(mock[0].category, "mock");
+            assert_eq!(mock[0].fields["status"], toml::Value::Integer(500));
+            assert!(d.upstreams.is_empty());
+            assert_eq!(
+                route_cond(&d, &rkey("ns", "r"), "ResolvedRefs"),
+                tf("True", "ResolvedRefs")
+            );
+            assert_eq!(
+                route_cond(&d, &rkey("ns", "r"), "Accepted"),
+                tf("True", "Accepted")
+            );
+            assert_eq!(
+                policy_cond(&d, "p", "Accepted"),
+                tf("False", "NoValidCACertificate")
+            );
+            assert_eq!(
+                policy_cond(&d, "p", "ResolvedRefs"),
+                tf("False", "InvalidCACertificateRef")
+            );
+        }
+    }
+
+    #[test]
+    fn conflicting_policies_oldest_applies() {
+        let mut w = btls_world(None);
+        w.policies.push(Arc::new(btls_policy(
+            "newer",
+            9,
+            "secure",
+            Some("btls"),
+            "other.example.com",
+        )));
+        let d = w.run();
+        let name = locations(&d, "http")[0].upstream.clone().unwrap();
+        assert_eq!(
+            d.upstreams[&name].tls.as_ref().unwrap().sni,
+            "secure.example.com"
+        );
+        assert_eq!(policy_cond(&d, "p", "Accepted"), tf("True", "Accepted"));
+        assert_eq!(
+            policy_cond(&d, "newer", "Accepted"),
+            tf("False", "Conflicted")
+        );
+    }
+
+    #[test]
+    fn backends_of_a_rule_share_tls_settings() {
+        let mut w = btls_world(None).rt(route(
+            "ns",
+            "mixed",
+            1,
+            json!({"rules": [{"matches": [{"path": {"value": "/m"}}], "backendRefs": [
+                {"name": "secure", "port": 443, "weight": 3},
+                {"name": "web", "port": 80, "weight": 1},
+            ]}]}),
+        ));
+        w.options.upstream_defaults.spread_weights = false;
+        let d = w.run();
+        assert_eq!(
+            route_cond(&d, &rkey("ns", "mixed"), "ResolvedRefs"),
+            tf("False", "UnsupportedProtocol")
+        );
+        let l = locations(&d, "http")
+            .into_iter()
+            .find(|l| l.owner == rkey("ns", "mixed"))
+            .unwrap();
+        let name = l.upstream.clone().unwrap();
+        // The TLS backend carries most of the weight: it stays, the other gets a 500 share.
+        assert!(d.upstreams[&name].tls.is_some());
+        assert_eq!(d.upstreams[&name].services.len(), 1);
+        assert_eq!(
+            plugins_of(&d, l)[0].fields["percentage"],
+            toml::Value::Integer(25)
+        );
+    }
+
+    #[test]
+    fn gateway_backend_client_certificate() {
+        let mut gw = basic_gateway();
+        gw.spec.tls = Some(serde_json::from_value(json!({
+            "backend": {"clientCertificateRef": {"group": "", "kind": "Secret", "name": "client"}}
+        })).unwrap());
+        let mut w = btls_world(None);
+        w.gateways = vec![Arc::new(gw.clone())];
+        // The plain route of another Gateway without a client certificate shares the
+        // backend: it gets its own upstream.
+        w = w
+            .gw(gateway(
+                "ns",
+                "gw2",
+                1,
+                json!([http_listener("alt", 8080, None)]),
+            ))
+            .rt(route(
+                "ns",
+                "r2",
+                1,
+                json!({
+                    "parentRefs": [{"name": "gw2"}],
+                    "rules": [{"backendRefs": [backend("secure", 443)]}],
+                }),
+            ));
+
+        // Missing Secret: the Gateway says so; no client certificate.
+        let d = w.run();
+        assert!(
+            d.referenced
+                .secrets
+                .contains(&SecretKey::new("ns", "client"))
+        );
+        assert_eq!(
+            gateway_cond(&d, "gw", "ResolvedRefs"),
+            tf("False", "InvalidClientCertificateRef")
+        );
+        assert_eq!(
+            gateway_cond(&d, "gw2", "ResolvedRefs"),
+            tf("True", "ResolvedRefs")
+        );
+        assert_eq!(d.upstreams.len(), 1);
+
+        w.secret("ns", "client");
+        let d = w.run();
+        assert_eq!(
+            gateway_cond(&d, "gw", "ResolvedRefs"),
+            tf("True", "ResolvedRefs")
+        );
+        assert_eq!(d.upstreams.len(), 2);
+        let by_owner = |owner: &str| {
+            let loc = d
+                .locations
+                .values()
+                .find(|l| l.owner == rkey("ns", owner))
+                .unwrap();
+            d.upstreams[loc.upstream.as_ref().unwrap()]
+                .tls
+                .clone()
+                .unwrap()
+        };
+        assert_eq!(
+            by_owner("r").client_cert,
+            Some((cert_pem().to_string(), key_pem().to_string()))
+        );
+        assert_eq!(by_owner("r2").client_cert, None);
+        assert_eq!(by_owner("r").sni, by_owner("r2").sni);
+        // One ancestor per Gateway.
+        assert_eq!(
+            d.status.policies[&ObjectKey::new("ns", "p")]
+                .ancestors
+                .len(),
+            2
+        );
+
+        // A plain backend gets no client certificate.
+        let mut plain = w.clone_world();
+        plain.policies.clear();
+        let d = plain.run();
+        assert!(d.upstreams.values().all(|u| u.tls.is_none()));
+
+        // Another namespace needs a ReferenceGrant.
+        gw.spec.tls = Some(
+            serde_json::from_value(json!({
+                "backend": {"clientCertificateRef": {"name": "client", "namespace": "other"}}
+            }))
+            .unwrap(),
+        );
+        w.gateways[0] = Arc::new(gw);
+        w.secret("other", "client");
+        let d = w.run();
+        assert_eq!(
+            gateway_cond(&d, "gw", "ResolvedRefs"),
+            tf("False", "RefNotPermitted")
+        );
+        w.grants.push(Arc::new(grant(
+            "other",
+            "Gateway",
+            "ns",
+            "Secret",
+            Some("client"),
+        )));
+        let d = w.run();
+        assert_eq!(
+            gateway_cond(&d, "gw", "ResolvedRefs"),
+            tf("True", "ResolvedRefs")
+        );
+    }
+
+    #[test]
+    fn gateway_resolved_refs_summarizes_listeners() {
+        let w = World::new().gw(gateway(
+            "ns",
+            "gw",
+            0,
+            json!([https_listener("https", None, "missing")]),
+        ));
+        let d = w.run();
+        assert_eq!(
+            gateway_cond(&d, "gw", "ResolvedRefs"),
+            tf("False", "ListenersNotResolved")
+        );
+    }
+
+    #[test]
+    fn referenced_ca_config_maps() {
+        let w = btls_world(None);
+        let d = w.run();
+        assert_eq!(
+            d.referenced.config_maps,
+            BTreeSet::from([ObjectKey::new("ns", "ca")])
+        );
+        // Not referenced when no route uses the Service.
+        let mut w = w;
+        w.routes.clear();
+        assert!(w.run().referenced.config_maps.is_empty());
+    }
 
     fn busy_world() -> World {
         let mut w = World::new()
