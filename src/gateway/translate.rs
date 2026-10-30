@@ -72,7 +72,9 @@
 //! the location's `proxy_set_headers`, as the plugin refuses Host); RequestRedirect ->
 //! the `redirect` plugin; URLRewrite -> the location's `rewrite` and a Host in
 //! `proxy_set_headers`; CORS -> the `cors` plugin; RequestMirror -> one `mirror` plugin
-//! each. Those two and a rule's `retry` and `timeouts` are in [`extended`] (a route
+//! each. A URLRewrite on backendRefs works as one of the rule when every backendRef of
+//! the rule has the same one (they share one location) and the rule has no URLRewrite
+//! or RequestRedirect; other filters on backendRefs are not supported. Those two and a rule's `retry` and `timeouts` are in [`extended`] (a route
 //! with `retry.backoff` is not accepted). Header values that start with `$` or `:` are
 //! refused, because Pingap replaces them with variables (`$NAME` with environment variables of the Pingap
 //! process). A redirect keeps the query, except one that needs a whole URL as target
@@ -127,7 +129,8 @@ use super::api::gateways::{
     GatewayTlsBackendClientCertificateRef,
 };
 use super::api::httproutes::{
-    HttpRoute, HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesFilters,
+    HttpRoute, HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefsFilters,
+    HttpRouteRulesBackendRefsFiltersType, HttpRouteRulesFilters,
     HttpRouteRulesFiltersRequestRedirectPathType, HttpRouteRulesFiltersRequestRedirectScheme,
     HttpRouteRulesFiltersType, HttpRouteRulesFiltersUrlRewritePathType,
     HttpRouteRulesMatchesHeadersType, HttpRouteRulesMatchesPathType,
@@ -164,7 +167,7 @@ pub const KIND_SECRET: &str = "Secret";
 
 /// The features of the Gateway API conformance suite this provider implements, sorted
 /// as `status.supportedFeatures` must be.
-pub const SUPPORTED_FEATURES: [&str; 32] = [
+pub const SUPPORTED_FEATURES: [&str; 33] = [
     "BackendTLSPolicy",
     "GRPCRoute",
     "GRPCRouteNamedRouteRule",
@@ -181,6 +184,7 @@ pub const SUPPORTED_FEATURES: [&str; 32] = [
     "HTTPRouteBackendProtocolH2C",
     "HTTPRouteBackendProtocolWebSocket",
     "HTTPRouteBackendTimeout",
+    "HTTPRouteBackendURLRewrite",
     "HTTPRouteHostRewrite",
     "HTTPRouteNamedRouteRule",
     "HTTPRouteParentRefPort",
@@ -2495,6 +2499,22 @@ fn compile_rule(
             &mut redirect,
         )?;
     }
+    if let Some(filter) = backend_url_rewrite(rule)? {
+        if rewrite.is_some() || redirect.is_some() {
+            return Err(
+                "a URLRewrite on backendRefs can not be combined with a URLRewrite or \
+                 RequestRedirect of the rule"
+                    .into(),
+            );
+        }
+        apply_filter(
+            &filter,
+            &mut plugins,
+            &mut host_header,
+            &mut rewrite,
+            &mut redirect,
+        )?;
+    }
     let prefix_modifier = matches!(rewrite, Some(PathModifier::Prefix(_)))
         || matches!(
             redirect.as_ref().and_then(|r: &Redirect| r.path.as_ref()),
@@ -2502,14 +2522,6 @@ fn compile_rule(
         );
     if prefix_modifier && matches.iter().any(|m| m.kind != PathKind::Prefix) {
         return Err("ReplacePrefixMatch needs PathPrefix matches only".into());
-    }
-    if rule
-        .backend_refs
-        .iter()
-        .flatten()
-        .any(|b| b.filters.as_ref().is_some_and(|f| !f.is_empty()))
-    {
-        return Err("filters on backendRefs are not supported".into());
     }
 
     let mut backends = resolve_backends(input, policies, kind, route, rule);
@@ -2760,6 +2772,37 @@ fn apply_filter(
         }
     }
     Ok(())
+}
+
+/// The URLRewrite filter of the backendRefs of a rule, as a rule filter: the backends
+/// of a rule share one location, so it must be the same on every backendRef (a filter
+/// on a backend applies to the requests sent to that backend only). Other filters on
+/// backendRefs are not supported.
+fn backend_url_rewrite(rule: &HttpRouteRules) -> Result<Option<HttpRouteRulesFilters>, String> {
+    let lists: Vec<&[HttpRouteRulesBackendRefsFilters]> = rule
+        .backend_refs
+        .iter()
+        .flatten()
+        .map(|b| b.filters.as_deref().unwrap_or_default())
+        .collect();
+    if lists.iter().all(|f| f.is_empty()) {
+        return Ok(None);
+    }
+    if lists
+        .iter()
+        .flat_map(|f| f.iter())
+        .any(|f| f.r#type != HttpRouteRulesBackendRefsFiltersType::UrlRewrite)
+    {
+        return Err("filters on backendRefs other than URLRewrite are not supported".into());
+    }
+    if lists.windows(2).any(|w| w[0] != w[1]) || lists[0].len() != 1 {
+        return Err("a URLRewrite on backendRefs must be the same on every backendRef".into());
+    }
+    // Same schema as a rule filter.
+    serde_json::to_value(&lists[0][0])
+        .and_then(serde_json::from_value)
+        .map(Some)
+        .map_err(|e| format!("urlRewrite on backendRefs: {e}"))
 }
 
 /// A `request_headers` or `response_headers` plugin. For requests, Host goes to
@@ -5214,6 +5257,66 @@ mod tests {
                 apply(&rule.unwrap(), path),
                 want,
                 "{path} {prefix} {replace}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_url_rewrite() {
+        let full = json!({"type": "URLRewrite", "urlRewrite": {"path": {"type": "ReplaceFullPath", "replaceFullPath": "/rewritten-full"}}});
+        let prefix = json!({"type": "URLRewrite", "urlRewrite": {"hostname": "B.example.com",
+            "path": {"type": "ReplacePrefixMatch", "replacePrefixMatch": "/rewritten-prefix"}}});
+        let header = json!({"type": "RequestHeaderModifier", "requestHeaderModifier": {"set": [{"name": "x", "value": "1"}]}});
+        let with = |name: &str, filters: Value| {
+            let mut b = backend(name, 80);
+            b["filters"] = filters;
+            b
+        };
+        let run = |rule_filters: Value, backends: Value| {
+            let w = World::new().gw(basic_gateway()).rt(route(
+                "ns",
+                "r",
+                0,
+                json!({"rules": [{"matches": [{"path": {"type": "PathPrefix", "value": "/p"}}],
+                                  "filters": rule_filters, "backendRefs": backends}]}),
+            ));
+            w.run()
+        };
+        // One backend, or the same filter on every backend: the rule's rewrite.
+        for backends in [
+            json!([with("web", json!([full]))]),
+            json!([with("web", json!([full])), with("v2", json!([full]))]),
+        ] {
+            let d = run(json!([]), backends);
+            let l = locations(&d, "http")[0];
+            assert_eq!(l.rewrite.as_deref(), Some(".* /rewritten-full"));
+            assert!(l.upstream.is_some());
+        }
+        let d = run(json!([header]), json!([with("web", json!([prefix]))]));
+        let l = locations(&d, "http")[0];
+        assert_eq!(l.rewrite.as_deref(), Some("^/p /rewritten-prefix"));
+        assert_eq!(l.proxy_set_headers, vec!["host:b.example.com".to_string()]);
+        assert_eq!(plugins_of(&d, l)[0].category, "request_headers");
+        // Different filters per backend, other backend filters, or a rewrite of the rule
+        // too: the rule is dropped.
+        for (rule_filters, backends) in [
+            (
+                json!([]),
+                json!([with("web", json!([full])), backend("v2", 80)]),
+            ),
+            (
+                json!([]),
+                json!([with("web", json!([full])), with("v2", json!([prefix]))]),
+            ),
+            (json!([]), json!([with("web", json!([header]))])),
+            (json!([full]), json!([with("web", json!([prefix]))])),
+        ] {
+            let d = run(rule_filters.clone(), backends.clone());
+            assert!(d.locations.is_empty(), "{rule_filters} {backends}");
+            assert_eq!(
+                route_cond(&d, &rkey("ns", "r"), "Accepted"),
+                tf("False", "UnsupportedValue"),
+                "{rule_filters} {backends}"
             );
         }
     }
