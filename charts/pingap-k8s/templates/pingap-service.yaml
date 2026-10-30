@@ -38,6 +38,40 @@ spec:
       {{- if and (has $svc.type (list "LoadBalancer" "NodePort")) $svc.nodePort }}
       nodePort: {{ $svc.nodePort }}
       {{- end }}
+{{- range (include "pingap-k8s.gatewayGroups" . | fromJsonArray) }}
+---
+# Gateway server group {{ .name }}: the address of the Gateway that has the group.
+# Same type and annotations as the proxy Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .service }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "pingap-k8s.pingap.labels" $ | nindent 4 }}
+  {{- with $svc.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $svc.type }}
+  {{- if and (eq $svc.type "LoadBalancer") $svc.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml $svc.loadBalancerSourceRanges | nindent 4 }}
+  {{- end }}
+  {{- if and (has $svc.type (list "LoadBalancer" "NodePort")) $svc.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ $svc.externalTrafficPolicy }}
+  {{- end }}
+  selector:
+    {{- include "pingap-k8s.pingap.selectorLabels" $ | nindent 4 }}
+  ports:
+    {{- range .ports }}
+    - name: {{ ternary "https" "http" .tls }}-{{ int .port }}
+      port: {{ int .port }}
+      targetPort: {{ int .targetPort }}
+      protocol: TCP
+    {{- end }}
+{{- end }}
 ---
 # Pingap's admin UI. Always ClusterIP: reach it with kubectl port-forward.
 apiVersion: v1

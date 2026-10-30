@@ -10,6 +10,13 @@ gateway:
   externalName: true
   addresses: ["203.0.113.10", "2001:db8::10", "lb.example.com"]
   healthCheck: "http://k8s/healthz?connection_timeout=1s&check_frequency=5s"
+  # A server group with its own address (no Service: pingap.deploy is off).
+  groups:
+    - name: edge
+      addresses: ["edge.example.com"]
+      ports:
+        - { port: 80, targetPort: 9080 }
+        - { port: 443, targetPort: 9443, tls: true }
 config:
   upstreams:
     api:

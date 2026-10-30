@@ -1,5 +1,5 @@
-//! Gateway provider: the cluster-wide watches of GatewayClasses, Gateways, HTTPRoutes,
-//! GRPCRoutes, ReferenceGrants, BackendTLSPolicies and Namespaces.
+//! Gateway provider: the cluster-wide watches of GatewayClasses, Gateways, ListenerSets,
+//! HTTPRoutes, GRPCRoutes, ReferenceGrants, BackendTLSPolicies and Namespaces.
 //!
 //! Each kind has one watcher feeding a [`reflector::Store`](kube::runtime::reflector::Store).
 //! Every object is kept, whatever its class: the controller decides what it handles, so a
@@ -40,6 +40,7 @@ use super::api::gatewayclasses::GatewayClass;
 use super::api::gateways::Gateway;
 use super::api::grpcroutes::GrpcRoute;
 use super::api::httproutes::HttpRoute;
+use super::api::listenersets::ListenerSet;
 use super::api::referencegrants::ReferenceGrant;
 use super::model::GatewaySource;
 use crate::watch::classify_error;
@@ -63,6 +64,7 @@ pub const GATEWAY_API_VERSION: &str = "v1.7.0";
 pub enum WatchedKind {
     GatewayClass,
     Gateway,
+    ListenerSet,
     HttpRoute,
     GrpcRoute,
     ReferenceGrant,
@@ -71,9 +73,10 @@ pub enum WatchedKind {
 }
 
 impl WatchedKind {
-    pub const ALL: [WatchedKind; 7] = [
+    pub const ALL: [WatchedKind; 8] = [
         WatchedKind::GatewayClass,
         WatchedKind::Gateway,
+        WatchedKind::ListenerSet,
         WatchedKind::HttpRoute,
         WatchedKind::GrpcRoute,
         WatchedKind::ReferenceGrant,
@@ -86,6 +89,7 @@ impl WatchedKind {
         match self {
             WatchedKind::GatewayClass => "GatewayClasses",
             WatchedKind::Gateway => "Gateways",
+            WatchedKind::ListenerSet => "ListenerSets",
             WatchedKind::HttpRoute => "HTTPRoutes",
             WatchedKind::GrpcRoute => "GRPCRoutes",
             WatchedKind::ReferenceGrant => "ReferenceGrants",
@@ -99,6 +103,7 @@ impl WatchedKind {
         match self {
             WatchedKind::GatewayClass => Some("gatewayclasses.gateway.networking.k8s.io"),
             WatchedKind::Gateway => Some("gateways.gateway.networking.k8s.io"),
+            WatchedKind::ListenerSet => Some("listenersets.gateway.networking.k8s.io"),
             WatchedKind::HttpRoute => Some("httproutes.gateway.networking.k8s.io"),
             WatchedKind::GrpcRoute => Some("grpcroutes.gateway.networking.k8s.io"),
             WatchedKind::ReferenceGrant => Some("referencegrants.gateway.networking.k8s.io"),
@@ -113,6 +118,7 @@ pub fn rbac_hint(kind: WatchedKind) -> &'static str {
     match kind {
         WatchedKind::GatewayClass => "get/list/watch on gatewayclasses.gateway.networking.k8s.io",
         WatchedKind::Gateway => "get/list/watch on gateways.gateway.networking.k8s.io",
+        WatchedKind::ListenerSet => "get/list/watch on listenersets.gateway.networking.k8s.io",
         WatchedKind::HttpRoute => "get/list/watch on httproutes.gateway.networking.k8s.io",
         WatchedKind::GrpcRoute => "get/list/watch on grpcroutes.gateway.networking.k8s.io",
         WatchedKind::ReferenceGrant => {
@@ -444,6 +450,7 @@ struct Inner {
     changes: broadcast::Sender<()>,
     classes: ResourceWatch<GatewayClass>,
     gateways: ResourceWatch<Gateway>,
+    listener_sets: ResourceWatch<ListenerSet>,
     routes: ResourceWatch<HttpRoute>,
     grpc_routes: ResourceWatch<GrpcRoute>,
     grants: ResourceWatch<ReferenceGrant>,
@@ -453,7 +460,7 @@ struct Inner {
 
 impl Inner {
     /// (kind, synced, up, missing) of every watch.
-    fn flags(&self) -> [(WatchedKind, bool, bool, bool); 7] {
+    fn flags(&self) -> [(WatchedKind, bool, bool, bool); 8] {
         fn f<K>(kind: WatchedKind, w: &ResourceWatch<K>) -> (WatchedKind, bool, bool, bool)
         where
             K: Resource + ResourceExt + Clone + DeserializeOwned + Debug + Send + Sync,
@@ -464,6 +471,7 @@ impl Inner {
         [
             f(WatchedKind::GatewayClass, &self.classes),
             f(WatchedKind::Gateway, &self.gateways),
+            f(WatchedKind::ListenerSet, &self.listener_sets),
             f(WatchedKind::HttpRoute, &self.routes),
             f(WatchedKind::GrpcRoute, &self.grpc_routes),
             f(WatchedKind::ReferenceGrant, &self.grants),
@@ -506,12 +514,18 @@ pub struct GatewayWatch {
 }
 
 impl GatewayWatch {
-    /// Starts the seven watches. Must be called inside a Tokio runtime.
+    /// Starts the eight watches. Must be called inside a Tokio runtime.
     pub fn new(client: Client) -> Self {
         let (changes, _) = broadcast::channel(CHANGE_CHANNEL_CAPACITY);
         let inner = Inner {
             classes: start_cluster(&client, WatchedKind::GatewayClass, strip_metadata, &changes),
             gateways: start_cluster(&client, WatchedKind::Gateway, strip_metadata, &changes),
+            listener_sets: start_cluster(
+                &client,
+                WatchedKind::ListenerSet,
+                strip_metadata,
+                &changes,
+            ),
             routes: start_cluster(&client, WatchedKind::HttpRoute, strip_metadata, &changes),
             grpc_routes: start_cluster(&client, WatchedKind::GrpcRoute, strip_metadata, &changes),
             grants: start_cluster(
@@ -530,7 +544,8 @@ impl GatewayWatch {
             changes,
         };
         info!(
-            "watching GatewayClasses, Gateways, HTTPRoutes, GRPCRoutes, ReferenceGrants, \
+            "watching GatewayClasses, Gateways, ListenerSets, HTTPRoutes, GRPCRoutes, \
+             ReferenceGrants, \
              BackendTLSPolicies and Namespaces"
         );
         GatewayWatch {
@@ -594,6 +609,10 @@ impl GatewaySource for GatewayWatch {
 
     fn grpc_routes(&self) -> Vec<Arc<GrpcRoute>> {
         self.inner.grpc_routes.store().state()
+    }
+
+    fn listener_sets(&self) -> Vec<Arc<ListenerSet>> {
+        self.inner.listener_sets.store().state()
     }
 
     fn grants(&self) -> Vec<Arc<ReferenceGrant>> {
@@ -777,12 +796,13 @@ mod tests {
         assert!(watch.gateways().is_empty());
         assert!(watch.routes().is_empty());
         assert!(watch.grpc_routes().is_empty());
+        assert!(watch.listener_sets().is_empty());
         assert!(watch.grants().is_empty());
         assert!(watch.backend_tls_policies().is_empty());
         assert!(watch.namespaces().is_empty());
         assert!(watch.missing_crds().is_empty());
         let states = watch.watch_states();
-        assert_eq!(states.len(), 7);
+        assert_eq!(states.len(), 8);
         assert!(states.iter().all(|s| !s.synced && !s.up && !s.crd_missing));
     }
 }

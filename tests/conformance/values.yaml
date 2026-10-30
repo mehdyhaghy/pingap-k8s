@@ -12,9 +12,19 @@ logLevel: "info,pingap_k8s=debug"
 
 # Gateway API provider: the GatewayClass "pingap". Backends and listener Secrets
 # live in the namespaces of conformance/base/manifests.yaml (created by the script
-# before the install, so the Roles can go there). The addresses are the
+# before the install, so the Roles can go there). The shared addresses are the
 # pingap-k8s-gateway Service the script creates (ports 80, 443, 8080, 8090), the
-# address the in-cluster suite sends its requests to.
+# address the in-cluster suite sends its requests to (and the usable address of
+# GatewayStaticAddresses).
+#
+# Server groups: one per Gateway of conformance/base/manifests.yaml (same-namespace,
+# same-namespace-with-https-listener, all-namespaces, backend-namespaces; created
+# first, so they are the oldest and take them), each with a plain HTTP server for
+# port 80 and a TLS server for port 443 and a Service of its own
+# (pingap-k8s-pingap-gw-<name>), so routes of different base Gateways never mix
+# (HTTPRouteMultipleGateways, GRPCRouteMultipleGateways). The Gateways the tests
+# create share the seed's servers below. The plain group servers set enabled_h2
+# (h2c), which the GRPCRoute tests and HTTPRouteBackendProtocolH2C need.
 gateway:
   enabled: true
   namespaces:
@@ -22,6 +32,23 @@ gateway:
     - gateway-conformance-app-backend
     - gateway-conformance-web-backend
   addresses: ["pingap-k8s-gateway.pingap-k8s.svc"]
+  groups:
+    - name: g1
+      ports:
+        - { port: 80, targetPort: 9101, settings: { enabled_h2: true } }
+        - { port: 443, targetPort: 9401, tls: true }
+    - name: g2
+      ports:
+        - { port: 80, targetPort: 9102, settings: { enabled_h2: true } }
+        - { port: 443, targetPort: 9402, tls: true }
+    - name: g3
+      ports:
+        - { port: 80, targetPort: 9103, settings: { enabled_h2: true } }
+        - { port: 443, targetPort: 9403, tls: true }
+    - name: g4
+      ports:
+        - { port: 80, targetPort: 9104, settings: { enabled_h2: true } }
+        - { port: 443, targetPort: 9404, tls: true }
 
 etcd:
   deploy: true
@@ -53,9 +80,10 @@ pingap:
     enabled: true
     # One server per listener port of the conformance Gateways: 80, 8080 and 8090
     # plain HTTP, 443 HTTPS with the certificates the controller stores. The
-    # controller lists its generated locations on them. The plain servers also
-    # speak HTTP/2 with prior knowledge (enabled_h2: h2c), which GRPCRoutes
-    # (profile GATEWAY-HTTP and GATEWAY-GRPC) and HTTPRouteBackendProtocolH2C need.
+    # controller lists its generated locations on them. The chart adds the
+    # servers of gateway.groups (ports 9101-9104 and 9401-9404). The plain servers
+    # also speak HTTP/2 with prior knowledge (enabled_h2: h2c), which GRPCRoutes
+    # (profile GATEWAY-GRPC) and HTTPRouteBackendProtocolH2C need.
     config: |
       [basic]
       grace_period = "30s"

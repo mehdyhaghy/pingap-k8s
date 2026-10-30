@@ -1,5 +1,5 @@
-//! Gateway API provider: Gateways of the GatewayClasses with our `controllerName`, and
-//! the HTTPRoutes and GRPCRoutes attached to them, become Pingap locations,
+//! Gateway API provider: Gateways of the GatewayClasses with our `controllerName`, their
+//! ListenerSets and the HTTPRoutes and GRPCRoutes attached to them, become Pingap locations,
 //! certificates, plugins and upstreams in the same etcd prefix.
 //!
 //! - [`api`]: the generated Gateway API types.

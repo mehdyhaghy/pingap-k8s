@@ -9,6 +9,7 @@ metadata:
 data:
   pingap.toml: |
     {{- .Values.pingap.seed.config | nindent 4 }}
+    {{- include "pingap-k8s.gatewayGroupServers" . | nindent 4 }}
   # Writes pingap.toml into the etcd prefix, only when the prefix has no
   # server yet. "--sync" replaces the whole prefix, so it never runs on a
   # prefix that is already in use.

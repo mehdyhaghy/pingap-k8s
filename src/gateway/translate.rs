@@ -1,15 +1,15 @@
-//! Gateways, HTTPRoutes and GRPCRoutes into the Pingap entries they want and the
-//! statuses they get (pure, no I/O).
+//! Gateways, ListenerSets, HTTPRoutes and GRPCRoutes into the Pingap entries they want
+//! and the statuses they get (pure, no I/O).
 //!
 //! **GRPCRoutes** are converted to HTTPRoutes first ([`grpc`]: a method match is a path
 //! match on `/<service>/<method>`) and translated like them, ordered together by age.
-//! Their backends become HTTP/2 cleartext upstreams (`alpn = "H2"`, with their own
-//! names, so a Service used by both kinds gets two entries). Their invalid backends get
-//! 503 (`UNAVAILABLE` for gRPC clients) where HTTPRoutes get 500. A listener takes
-//! GRPCRoutes when every Pingap server it is programmed on sets `enabled_h2` (HTTP/2 by
-//! ALPN on TLS, h2c with prior knowledge on plain text); otherwise GRPCRoute is left out
-//! of its `supportedKinds` (and is an invalid route kind when listed in
-//! `allowedRoutes.kinds`).
+//! Their backends become HTTP/2 upstreams (`alpn = "H2"`: h2c, or ALPN h2 with a
+//! BackendTLSPolicy; with their own names, so a Service used by both kinds gets two
+//! entries). Their invalid backends get 503 (`UNAVAILABLE` for gRPC clients) where
+//! HTTPRoutes get 500. A listener takes GRPCRoutes when every Pingap server it is
+//! programmed on sets `enabled_h2` (HTTP/2 by ALPN on TLS, h2c with prior knowledge on
+//! plain text); otherwise GRPCRoute is left out of its `supportedKinds` (and is an
+//! invalid route kind when listed in `allowedRoutes.kinds`).
 //! An HTTPRoute and a GRPCRoute attached to the same listener with intersecting
 //! hostnames are never mixed: the older one is accepted there, the newer one gets
 //! `Accepted: False` (`NotAllowedByListeners`), as `GRPCRouteSpec.hostnames` allows.
@@ -17,15 +17,27 @@
 //! `grpc`) also get an h2c upstream.
 //!
 //! **Servers.** Pingap servers cannot be created without a restart, so a listener is
-//! programmed on every stored server (limited to `servers` of the options when set)
-//! whose ports contain the listener port and whose TLS mode matches its protocol (HTTPS
-//! on `global_certificates` servers, HTTP on the others). Gateways of our classes share
-//! those servers: they are merged onto them, so listeners of different Gateways with
-//! the same port and hostname are all programmed and their routes served side by side
-//! (precedence across them as across routes of one Gateway). Inside one Gateway,
-//! listeners that are not distinct are all conflicted. HTTPS listeners of different
-//! Gateways with the same hostname and different certificates leave the choice of the
-//! certificate to Pingap.
+//! programmed on the stored servers of its Gateway's server group whose ports contain
+//! the listener port (mapped by the group's `ports`) and whose TLS mode matches its
+//! protocol (HTTPS on `global_certificates` servers, HTTP on the others). Each
+//! configured group goes to one Gateway (see [`assign_groups`]), whose status addresses
+//! are the group's; the other Gateways share the shared group (`servers` of the options,
+//! every stored server in no group when empty). Gateways sharing servers are merged
+//! onto them, so listeners of different Gateways with the same port and hostname are
+//! all programmed and their routes served side by side (precedence across them as
+//! across routes of one Gateway). Inside one Gateway, listeners that are not distinct
+//! are all conflicted. HTTPS listeners of different Gateways with the same hostname and
+//! different certificates leave the choice of the certificate to Pingap.
+//!
+//! **ListenerSets.** A ListenerSet whose parent Gateway allows it (`allowedListeners`,
+//! none by default) adds its listeners to that Gateway's servers: the Gateway's own
+//! listeners first, then the ListenerSets oldest first; a listener that is not distinct
+//! from an earlier one in use is conflicted (the earlier one keeps working). Routes
+//! attach to a ListenerSet's listeners only through a ListenerSet parentRef, and to a
+//! Gateway's own listeners only through a Gateway parentRef. A ListenerSet is accepted
+//! when at least one of its listeners is valid (accepted, not conflicted, references
+//! resolved); its ReferenceGrants are its own (`from` kind ListenerSet), and
+//! `allowedRoutes` namespace `Same` is the ListenerSet's namespace.
 //!
 //! **Locations.** Every (server, host, route match) becomes one location with one host.
 //! Gateway API matching maps onto Pingap's matchers:
@@ -104,8 +116,8 @@ use super::api::gatewayclasses::{
     GatewayClass, GatewayClassStatus, GatewayClassStatusSupportedFeatures,
 };
 use super::api::gateways::{
-    Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespacesFrom,
-    GatewayListenersAllowedRoutesNamespacesSelector, GatewayListenersTlsMode, GatewayStatus,
+    Gateway, GatewayAllowedListenersNamespacesFrom, GatewayListeners,
+    GatewayListenersAllowedRoutesNamespacesFrom, GatewayListenersTlsMode, GatewayStatus,
     GatewayStatusAddresses, GatewayStatusListeners, GatewayStatusListenersSupportedKinds,
     GatewayTlsBackendClientCertificateRef,
 };
@@ -117,14 +129,18 @@ use super::api::httproutes::{
     HttpRouteRulesMatchesQueryParamsType, HttpRouteStatus, HttpRouteStatusParents,
     HttpRouteStatusParentsParentRef,
 };
+use super::api::listenersets::{
+    ListenerSet, ListenerSetListeners, ListenerSetStatus, ListenerSetStatusListeners,
+    ListenerSetStatusListenersSupportedKinds,
+};
 use super::api::referencegrants::ReferenceGrant;
 use super::backendtls::{BackendTlsPolicies, PortTls, Target, referenced_config_maps};
 use super::extended;
 use super::grpc;
 use super::model::{
     BackendKind, CertificateEntry, Desired, ExternalUpstream, GATEWAY_GROUP, GatewayKey,
-    LocationEntry, LocationOptions, ObjectKey, PluginEntry, Referenced, RouteKey, RouteKind,
-    SecretKey, ServerInfo, TranslateInput,
+    ListenerSetKey, LocationEntry, LocationOptions, ObjectKey, PluginEntry, Referenced, RouteKey,
+    RouteKind, SecretKey, ServerInfo, TranslateInput, TranslateOptions,
 };
 use super::names;
 use super::tls;
@@ -135,6 +151,7 @@ pub const WEIGHT_TOP: u16 = 65000;
 pub const WEIGHT_FLOOR: u16 = 2048;
 
 pub const KIND_GATEWAY: &str = "Gateway";
+pub const KIND_LISTENER_SET: &str = "ListenerSet";
 pub const KIND_HTTP_ROUTE: &str = "HTTPRoute";
 pub const KIND_GRPC_ROUTE: &str = "GRPCRoute";
 pub const KIND_SERVICE: &str = "Service";
@@ -142,13 +159,14 @@ pub const KIND_SECRET: &str = "Secret";
 
 /// The features of the Gateway API conformance suite this provider implements, sorted
 /// as `status.supportedFeatures` must be.
-pub const SUPPORTED_FEATURES: [&str; 27] = [
+pub const SUPPORTED_FEATURES: [&str; 29] = [
     "BackendTLSPolicy",
     "GRPCRoute",
     "GRPCRouteNamedRouteRule",
     "GRPCRouteRequestHeaderModifier",
     "Gateway",
     "GatewayBackendClientCertificate",
+    "GatewayStaticAddresses",
     "HTTPRoute",
     "HTTPRoute303RedirectStatusCode",
     "HTTPRoute307RedirectStatusCode",
@@ -169,6 +187,7 @@ pub const SUPPORTED_FEATURES: [&str; 27] = [
     "HTTPRouteResponseHeaderModification",
     "HTTPRouteRetryConnectionError",
     "HTTPRouteSchemeRedirect",
+    "ListenerSet",
     "ReferenceGrant",
 ];
 
@@ -214,6 +233,28 @@ pub fn referenced(input: &TranslateInput<'_>) -> Referenced {
     let mut out = Referenced::default();
     let gateways = our_gateways(input);
     let keys: BTreeSet<GatewayKey> = gateways.iter().map(|g| object_key(&g.metadata)).collect();
+    let sets = our_listener_sets(input, &keys);
+    let set_keys: BTreeSet<ListenerSetKey> = sets.iter().map(|s| object_key(&s.metadata)).collect();
+    let add_secrets =
+        |secrets: &mut BTreeSet<SecretKey>, namespace: &str, listener: &GatewayListeners| {
+            if listener.protocol != "HTTPS" {
+                return;
+            }
+            let refs = listener
+                .tls
+                .as_ref()
+                .and_then(|t| t.certificate_refs.as_ref());
+            for r in refs.into_iter().flatten() {
+                if r.group.as_deref().unwrap_or("").is_empty()
+                    && r.kind.as_deref().unwrap_or(KIND_SECRET) == KIND_SECRET
+                {
+                    secrets.insert(SecretKey::new(
+                        r.namespace.clone().unwrap_or_else(|| namespace.to_string()),
+                        r.name.clone(),
+                    ));
+                }
+            }
+        };
     for gateway in &gateways {
         let namespace = gateway.metadata.namespace.clone().unwrap_or_default();
         if let Some(r) = client_certificate_ref(gateway)
@@ -226,23 +267,22 @@ pub fn referenced(input: &TranslateInput<'_>) -> Referenced {
             ));
         }
         for listener in &gateway.spec.listeners {
-            if listener.protocol != "HTTPS" {
-                continue;
-            }
-            let refs = listener
-                .tls
-                .as_ref()
-                .and_then(|t| t.certificate_refs.as_ref());
-            for r in refs.into_iter().flatten() {
-                if r.group.as_deref().unwrap_or("").is_empty()
-                    && r.kind.as_deref().unwrap_or(KIND_SECRET) == KIND_SECRET
-                {
-                    out.secrets.insert(SecretKey::new(
-                        r.namespace.clone().unwrap_or_else(|| namespace.clone()),
-                        r.name.clone(),
-                    ));
-                }
-            }
+            add_secrets(&mut out.secrets, &namespace, listener);
+        }
+    }
+    // Only the ListenerSets their Gateway allows.
+    for set in &sets {
+        let namespace = set.metadata.namespace.clone().unwrap_or_default();
+        let parent = parent_gateway_key(set);
+        let allowed = gateways
+            .iter()
+            .find(|g| object_key(&g.metadata) == parent)
+            .is_some_and(|g| listener_sets_allowed(input, g, &namespace));
+        if !allowed {
+            continue;
+        }
+        for listener in &set.spec.listeners {
+            add_secrets(&mut out.secrets, &namespace, &gateway_listener(listener));
         }
     }
     let converted: Vec<HttpRoute> = input
@@ -254,7 +294,11 @@ pub fn referenced(input: &TranslateInput<'_>) -> Referenced {
         let namespace = route.metadata.namespace.clone().unwrap_or_default();
         let ours = parent_refs(route)
             .iter()
-            .any(|p| gateway_ref_key(p, &namespace).is_some_and(|k| keys.contains(&k)));
+            .any(|p| match parent_target(p, &namespace) {
+                Some(ParentTarget::Gateway(k)) => keys.contains(&k),
+                Some(ParentTarget::ListenerSet(k)) => set_keys.contains(&k),
+                None => false,
+            });
         if !ours {
             continue;
         }
@@ -307,21 +351,10 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
         desired.status.classes.insert(name, class_status(class));
     }
 
-    // ---- Gateways and listeners ----
+    // ---- Gateways, their server groups, listeners and ListenerSets ----
     let mut gateways = our_gateways(input);
     gateways.sort_by_cached_key(|g| age_key(&g.metadata));
-    let eligible: Vec<&ServerInfo> = input
-        .servers
-        .iter()
-        .filter(|s| options.servers.is_empty() || options.servers.contains(&s.name))
-        .collect();
-    for server in &eligible {
-        desired
-            .server_locations
-            .entry(server.name.clone())
-            .or_default();
-    }
-
+    let assigned = assign_groups(options, &gateways);
     let policies = BackendTlsPolicies::new(input.policies, input.config_maps);
     // Gateway -> its backend client certificate, or why it is not usable.
     let client_certs: BTreeMap<GatewayKey, ClientCertificate> = gateways
@@ -333,25 +366,118 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
             )
         })
         .collect();
-
-    let mut listeners: Vec<Listener<'_>> = Vec::new();
-    let mut gateway_listeners: Vec<Vec<usize>> = Vec::new();
-    for gateway in &gateways {
-        let mut indices = Vec::new();
-        for spec in &gateway.spec.listeners {
-            indices.push(listeners.len());
-            listeners.push(evaluate_listener(input, gateway, spec, &eligible));
+    for server in input.servers.iter() {
+        if shared_server(options, &server.name)
+            || options
+                .groups
+                .iter()
+                .any(|g| g.servers.contains(&server.name))
+        {
+            desired
+                .server_locations
+                .entry(server.name.clone())
+                .or_default();
         }
-        mark_conflicts(&mut listeners, &indices);
-        gateway_listeners.push(indices);
     }
-
-    // ---- Routes ----
     let gateway_index: BTreeMap<GatewayKey, usize> = gateways
         .iter()
         .enumerate()
         .map(|(i, g)| (object_key(&g.metadata), i))
         .collect();
+    let keys: BTreeSet<GatewayKey> = gateway_index.keys().cloned().collect();
+    let sets = our_listener_sets(input, &keys);
+    let set_index: BTreeMap<ListenerSetKey, usize> = sets
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (object_key(&s.metadata), i))
+        .collect();
+    // The listeners of each ListenerSet as Gateway listeners (the same fields).
+    let set_specs: Vec<Vec<GatewayListeners>> = sets
+        .iter()
+        .map(|s| s.spec.listeners.iter().map(gateway_listener).collect())
+        .collect();
+
+    let mut listeners: Vec<Listener<'_>> = Vec::new();
+    let mut gateway_listeners: Vec<Vec<usize>> = Vec::new();
+    let mut attached_sets: Vec<usize> = vec![0; gateways.len()];
+    let mut set_states: Vec<SetState> = vec![SetState::NotAllowed; sets.len()];
+    for (gi, gateway) in gateways.iter().enumerate() {
+        let place = placement_servers(input, &assigned[gi].placement);
+        let gateway_key = object_key(&gateway.metadata);
+        let owner = Owner {
+            gateway: gateway_key.clone(),
+            namespace: gateway_key.namespace.clone(),
+            kind: KIND_GATEWAY,
+        };
+        let mut indices = Vec::new();
+        for spec in &gateway.spec.listeners {
+            indices.push(listeners.len());
+            listeners.push(evaluate_listener(
+                input,
+                owner.clone(),
+                gateway,
+                spec,
+                place.as_ref(),
+            ));
+        }
+        mark_conflicts(&mut listeners, &indices);
+        let accepted = gateway_accepts(&assigned[gi].placement, &indices, &listeners);
+
+        // Its ListenerSets, oldest first, after its own listeners: a listener that is
+        // not distinct from an earlier valid one is conflicted.
+        let mut earlier = indices.clone();
+        for (si, set) in sets.iter().enumerate() {
+            if parent_gateway_key(set) != gateway_key {
+                continue;
+            }
+            let namespace = set.metadata.namespace.clone().unwrap_or_default();
+            if !listener_sets_allowed(input, gateway, &namespace) {
+                set_states[si] = SetState::NotAllowed;
+                continue;
+            }
+            if !accepted {
+                set_states[si] = SetState::ParentNotAccepted;
+                continue;
+            }
+            let owner = Owner {
+                gateway: gateway_key.clone(),
+                namespace,
+                kind: KIND_LISTENER_SET,
+            };
+            let mut set_indices = Vec::new();
+            for spec in &set_specs[si] {
+                set_indices.push(listeners.len());
+                listeners.push(evaluate_listener(
+                    input,
+                    owner.clone(),
+                    gateway,
+                    spec,
+                    place.as_ref(),
+                ));
+            }
+            mark_conflicts(&mut listeners, &set_indices);
+            mark_precedence_conflicts(&mut listeners, &earlier, &set_indices);
+            let valid = set_indices
+                .iter()
+                .filter(|&&i| listeners[i].valid())
+                .count();
+            if valid == 0 {
+                for &i in &set_indices {
+                    listeners[i].active = false;
+                }
+            } else {
+                attached_sets[gi] += 1;
+                earlier.extend(set_indices.iter().copied());
+            }
+            set_states[si] = SetState::Evaluated {
+                indices: set_indices,
+                valid,
+            };
+        }
+        gateway_listeners.push(indices);
+    }
+
+    // ---- Routes ----
     // HTTPRoutes and GRPCRoutes (converted) in one list, oldest first.
     let converted: Vec<grpc::Converted> = input
         .grpc_routes
@@ -382,20 +508,36 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
         let hostnames = route_hostnames(route);
         let mut parents: Vec<(HttpRouteStatusParentsParentRef, Attached)> = Vec::new();
         for parent in parent_refs(route) {
-            let Some(gw_key) = gateway_ref_key(parent, &key.namespace) else {
-                continue;
+            let outcome = match parent_target(parent, &key.namespace) {
+                Some(ParentTarget::Gateway(gw_key)) => {
+                    let Some(&gi) = gateway_index.get(&gw_key) else {
+                        continue;
+                    };
+                    attach(
+                        input,
+                        route,
+                        kind,
+                        parent,
+                        &gateway_listeners[gi],
+                        &listeners,
+                    )
+                }
+                Some(ParentTarget::ListenerSet(set_key)) => {
+                    let Some(&si) = set_index.get(&set_key) else {
+                        continue;
+                    };
+                    match &set_states[si] {
+                        SetState::Evaluated { indices, valid } if *valid > 0 => {
+                            attach(input, route, kind, parent, indices, &listeners)
+                        }
+                        _ => Err((
+                            "NotAllowedByListeners",
+                            format!("ListenerSet {set_key} is not accepted by its Gateway"),
+                        )),
+                    }
+                }
+                None => continue,
             };
-            let Some(&gi) = gateway_index.get(&gw_key) else {
-                continue;
-            };
-            let outcome = attach(
-                input,
-                route,
-                kind,
-                parent,
-                &gateway_listeners[gi],
-                &listeners,
-            );
             let outcome = exclude_other_kind(outcome, kind, &hostnames, &listeners);
             parents.push((status_parent_ref(parent), outcome));
         }
@@ -517,14 +659,14 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
                         policy_uses
                             .entry(target.clone())
                             .or_default()
-                            .insert(listener.gateway_key.clone());
+                            .insert(listener.owner.gateway.clone());
                     }
                 }
                 if !listener.programmed() {
                     continue;
                 }
                 let client_cert = client_certs
-                    .get(&listener.gateway_key)
+                    .get(&listener.owner.gateway)
                     .and_then(|c| c.as_ref().ok())
                     .and_then(Option::as_ref);
                 for rule in compiled.iter().flatten() {
@@ -634,13 +776,29 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
         let key = object_key(&gateway.metadata);
         let client_cert = client_certs.get(&key).cloned().unwrap_or(Ok(None));
         let status = gateway_status(
-            input,
+            options,
             gateway,
+            &assigned[gi],
             &gateway_listeners[gi],
             &listeners,
+            attached_sets[gi],
             &client_cert,
         );
         desired.status.gateways.insert(key, status);
+    }
+    for (si, set) in sets.iter().enumerate() {
+        let parent_programmed = desired
+            .status
+            .gateways
+            .get(&parent_gateway_key(set))
+            .and_then(|s| s.conditions.as_ref())
+            .and_then(|c| c.iter().find(|c| c.type_ == "Programmed"))
+            .is_some_and(|c| c.status == "True");
+        let status = listener_set_status(set, &set_states[si], &listeners, parent_programmed);
+        desired
+            .status
+            .listener_sets
+            .insert(object_key(&set.metadata), status);
     }
     desired.status.policies = policies.statuses(&policy_uses, &options.controller_name);
     desired
@@ -773,7 +931,7 @@ fn class_status(class: &GatewayClass) -> GatewayClassStatus {
                 "SupportedVersion",
                 true,
                 "SupportedVersion",
-                "Gateway API v1.6 is supported",
+                "Gateway API v1.7 is supported",
                 generation,
             ),
         ]),
@@ -806,15 +964,316 @@ fn our_gateways<'a>(input: &TranslateInput<'a>) -> Vec<&'a Arc<Gateway>> {
         .collect()
 }
 
-/// One listener of one of our Gateways, evaluated.
+/// The ListenerSets whose `parentRef` names one of `gateways`, oldest first.
+fn our_listener_sets<'a>(
+    input: &TranslateInput<'a>,
+    gateways: &BTreeSet<GatewayKey>,
+) -> Vec<&'a Arc<ListenerSet>> {
+    let mut sets: Vec<&Arc<ListenerSet>> = input
+        .listener_sets
+        .iter()
+        .filter(|s| {
+            let parent = &s.spec.parent_ref;
+            parent.group.as_deref().unwrap_or(GATEWAY_GROUP) == GATEWAY_GROUP
+                && parent.kind.as_deref().unwrap_or(KIND_GATEWAY) == KIND_GATEWAY
+                && gateways.contains(&parent_gateway_key(s))
+        })
+        .collect();
+    sets.sort_by_cached_key(|s| age_key(&s.metadata));
+    sets
+}
+
+/// The Gateway a ListenerSet's `parentRef` names (its own namespace by default).
+fn parent_gateway_key(set: &ListenerSet) -> GatewayKey {
+    let parent = &set.spec.parent_ref;
+    ObjectKey::new(
+        parent
+            .namespace
+            .clone()
+            .or_else(|| set.metadata.namespace.clone())
+            .unwrap_or_default(),
+        parent.name.clone(),
+    )
+}
+
+/// A ListenerSet listener as a Gateway listener: the fields are the same.
+fn gateway_listener(entry: &ListenerSetListeners) -> GatewayListeners {
+    serde_json::to_value(entry)
+        .ok()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_else(|| GatewayListeners {
+            name: entry.name.clone(),
+            port: entry.port,
+            protocol: entry.protocol.clone(),
+            ..Default::default()
+        })
+}
+
+/// Whether the Gateway's `allowedListeners` lets ListenerSets of `namespace` attach
+/// (by default none may).
+fn listener_sets_allowed(input: &TranslateInput<'_>, gateway: &Gateway, namespace: &str) -> bool {
+    let namespaces = gateway
+        .spec
+        .allowed_listeners
+        .as_ref()
+        .and_then(|a| a.namespaces.as_ref());
+    let from = namespaces
+        .and_then(|n| n.from.clone())
+        .unwrap_or(GatewayAllowedListenersNamespacesFrom::None);
+    match from {
+        GatewayAllowedListenersNamespacesFrom::All => true,
+        GatewayAllowedListenersNamespacesFrom::Same => {
+            gateway.metadata.namespace.as_deref() == Some(namespace)
+        }
+        GatewayAllowedListenersNamespacesFrom::Selector => {
+            let Some(selector) = namespaces.and_then(|n| n.selector.as_ref()) else {
+                return false;
+            };
+            let expressions = selector.match_expressions.iter().flatten().map(|e| {
+                (
+                    e.key.as_str(),
+                    e.operator.as_str(),
+                    e.values.as_deref().unwrap_or_default(),
+                )
+            });
+            namespace_labels_match(
+                input,
+                namespace,
+                selector.match_labels.as_ref(),
+                expressions,
+            )
+        }
+        GatewayAllowedListenersNamespacesFrom::None => false,
+    }
+}
+
+/// What became of a ListenerSet of one of our Gateways.
+#[derive(Clone, Debug)]
+enum SetState {
+    /// The Gateway's `allowedListeners` does not select its namespace.
+    NotAllowed,
+    /// The Gateway is not accepted.
+    ParentNotAccepted,
+    /// Its listeners were evaluated: their indices and how many are valid. With none
+    /// valid the ListenerSet is not accepted and routes do not attach to it.
+    Evaluated { indices: Vec<usize>, valid: usize },
+}
+
+// ---- server groups ----
+
+/// Where the listeners of a Gateway are programmed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Placement {
+    /// On the servers of `options.groups[i]`, which no other Gateway has.
+    Group(usize),
+    /// On the servers of the shared group, merged with the other Gateways there.
+    Shared,
+    /// Nowhere: the reason and message of the Gateway's `Programmed` condition.
+    Unplaced(&'static str, String),
+    /// `spec.addresses` has a type that is not supported: the Gateway is not accepted.
+    Unsupported(String),
+}
+
+#[derive(Clone, Debug)]
+struct Assigned {
+    placement: Placement,
+    /// The addresses `spec.addresses` asks for; `None` when it asks for none.
+    requested: Option<Vec<String>>,
+}
+
+/// The values of `spec.addresses` (each `IPAddress` or `Hostname`), or why the
+/// Gateway can not be accepted. Entries without a value ask for no particular address.
+fn requested_addresses(gateway: &Gateway) -> Result<Vec<String>, String> {
+    let mut values = Vec::new();
+    for address in gateway.spec.addresses.iter().flatten() {
+        let kind = address.r#type.as_deref().unwrap_or("IPAddress");
+        if kind != "IPAddress" && kind != "Hostname" {
+            return Err(format!("address type {kind} is not supported"));
+        }
+        if let Some(value) = address.value.as_deref().filter(|v| !v.is_empty()) {
+            values.push(value.to_string());
+        }
+    }
+    Ok(dedup(values))
+}
+
+/// The placement of every Gateway (`gateways` oldest first):
+///
+/// 1. A Gateway whose `spec.addresses` are all addresses of one group gets that group
+///    (shared with other Gateways asking for it), or the shared group when they are
+///    all shared addresses; otherwise it is not programmed (`AddressNotUsable`).
+///    Groups asked for this way are given to no other Gateway.
+/// 2. A Gateway whose `status.addresses` are the addresses of a group keeps it, so a
+///    restart or a new leader does not move Gateways.
+/// 3. The other Gateways, oldest first, take the free groups in config order.
+/// 4. The rest go to the shared group; with groups configured and no shared address,
+///    they are not programmed (`AddressNotAssigned`).
+fn assign_groups(options: &TranslateOptions, gateways: &[&Arc<Gateway>]) -> Vec<Assigned> {
+    let groups = &options.groups;
+    let shared = groups.is_empty() || !options.addresses.is_empty();
+    let mut taken = vec![false; groups.len()];
+    let mut out: Vec<Option<Assigned>> = Vec::with_capacity(gateways.len());
+    for gateway in gateways {
+        let assigned = match requested_addresses(gateway) {
+            Err(message) => Some(Assigned {
+                placement: Placement::Unsupported(message),
+                requested: None,
+            }),
+            Ok(requested) if requested.is_empty() => None,
+            Ok(requested) => {
+                let within = |list: &[String]| requested.iter().all(|a| list.contains(a));
+                let placement = if let Some(gi) = groups.iter().position(|g| within(&g.addresses)) {
+                    taken[gi] = true;
+                    Placement::Group(gi)
+                } else if shared && within(&options.addresses) {
+                    Placement::Shared
+                } else {
+                    let known = |a: &&String| {
+                        options.addresses.contains(a)
+                            || groups.iter().any(|g| g.addresses.contains(a))
+                    };
+                    let message = match requested.iter().find(|a| !known(a)) {
+                        Some(a) => format!(
+                            "address {a} is not one of the addresses this controller serves on"
+                        ),
+                        None => format!(
+                            "addresses {} are not addresses of one server group",
+                            requested.join(", ")
+                        ),
+                    };
+                    Placement::Unplaced("AddressNotUsable", message)
+                };
+                Some(Assigned {
+                    placement,
+                    requested: Some(requested),
+                })
+            }
+        };
+        out.push(assigned);
+    }
+    // Sticky: the group the Gateway's published addresses belong to.
+    for (i, gateway) in gateways.iter().enumerate() {
+        if out[i].is_some() {
+            continue;
+        }
+        let current: BTreeSet<&str> = gateway
+            .status
+            .as_ref()
+            .and_then(|s| s.addresses.as_ref())
+            .into_iter()
+            .flatten()
+            .map(|a| a.value.as_str())
+            .collect();
+        if current.is_empty() {
+            continue;
+        }
+        let sticky = (0..groups.len()).find(|&gi| {
+            !taken[gi]
+                && groups[gi]
+                    .addresses
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>()
+                    == current
+        });
+        if let Some(gi) = sticky {
+            taken[gi] = true;
+            out[i] = Some(Assigned {
+                placement: Placement::Group(gi),
+                requested: None,
+            });
+        }
+    }
+    out.into_iter()
+        .map(|assigned| {
+            assigned.unwrap_or_else(|| {
+                let placement = match taken.iter().position(|t| !t) {
+                    Some(gi) => {
+                        taken[gi] = true;
+                        Placement::Group(gi)
+                    }
+                    None if shared => Placement::Shared,
+                    None => Placement::Unplaced(
+                        "AddressNotAssigned",
+                        format!(
+                            "all {} server groups are in use by older Gateways and no shared address is configured",
+                            groups.len()
+                        ),
+                    ),
+                };
+                Assigned {
+                    placement,
+                    requested: None,
+                }
+            })
+        })
+        .collect()
+}
+
+/// Whether a stored server belongs to the shared group: listed in `servers` (every
+/// server when empty) and in no group.
+fn shared_server(options: &TranslateOptions, name: &str) -> bool {
+    (options.servers.is_empty() || options.servers.iter().any(|s| s == name))
+        && !options
+            .groups
+            .iter()
+            .any(|g| g.servers.iter().any(|s| s == name))
+}
+
+/// The servers a placement programs listeners on.
+struct Place<'s> {
+    servers: Vec<&'s ServerInfo>,
+    /// Listener port -> server port (groups only).
+    ports: Option<&'s BTreeMap<u16, u16>>,
+}
+
+fn placement_servers<'s>(input: &TranslateInput<'s>, placement: &Placement) -> Option<Place<'s>> {
+    let options = input.options;
+    match placement {
+        Placement::Group(gi) => {
+            let group = options.groups.get(*gi)?;
+            Some(Place {
+                servers: input
+                    .servers
+                    .iter()
+                    .filter(|s| group.servers.contains(&s.name))
+                    .collect(),
+                ports: Some(&group.ports),
+            })
+        }
+        Placement::Shared => Some(Place {
+            servers: input
+                .servers
+                .iter()
+                .filter(|s| shared_server(options, &s.name))
+                .collect(),
+            ports: None,
+        }),
+        Placement::Unplaced(..) | Placement::Unsupported(_) => None,
+    }
+}
+
+/// The object that defines a listener: a Gateway or a ListenerSet.
+#[derive(Clone, Debug)]
+struct Owner {
+    /// The Gateway the listener belongs to (a ListenerSet's parent).
+    gateway: GatewayKey,
+    namespace: String,
+    /// [`KIND_GATEWAY`] or [`KIND_LISTENER_SET`] (ReferenceGrants name it).
+    kind: &'static str,
+}
+
+/// One listener of one of our Gateways or of one of their ListenerSets, evaluated.
 struct Listener<'a> {
-    gateway_key: GatewayKey,
+    owner: Owner,
     spec: &'a GatewayListeners,
     /// Lowercase; `None` for any host.
     hostname: Option<String>,
     tls: bool,
     /// HTTP or HTTPS.
     supported_protocol: bool,
+    /// The Gateway has servers, and a ListenerSet listener's ListenerSet is accepted.
+    active: bool,
     servers: Vec<String>,
     supported_kinds: Vec<GatewayStatusListenersSupportedKinds>,
     /// `Err((reason, message))`: not accepted.
@@ -836,7 +1295,19 @@ impl Listener<'_> {
 
     /// Its routes become locations.
     fn programmed(&self) -> bool {
-        self.attachable() && (!self.tls || !self.certs.is_empty())
+        self.attachable() && self.active && (!self.tls || !self.certs.is_empty())
+    }
+
+    /// Accepted, not conflicted and every reference resolved (what a ListenerSet
+    /// needs at least one of to be accepted).
+    fn valid(&self) -> bool {
+        self.accepted.is_ok() && self.conflicted.is_none() && self.resolved.is_ok()
+    }
+
+    /// In use, so a later listener of a ListenerSet that is not distinct from it is
+    /// conflicted.
+    fn claims_port(&self) -> bool {
+        self.supported_protocol && self.accepted.is_ok() && self.conflicted.is_none()
     }
 
     /// Routes of `kind` may attach to it.
@@ -845,13 +1316,15 @@ impl Listener<'_> {
     }
 }
 
+/// `place`: the servers of the Gateway; `None` when it has none (the listener is
+/// checked but not programmed).
 fn evaluate_listener<'a>(
     input: &TranslateInput<'_>,
+    owner: Owner,
     gateway: &Gateway,
     spec: &'a GatewayListeners,
-    servers: &[&ServerInfo],
+    place: Option<&Place<'_>>,
 ) -> Listener<'a> {
-    let gateway_key = object_key(&gateway.metadata);
     let hostname = spec
         .hostname
         .as_deref()
@@ -860,11 +1333,12 @@ fn evaluate_listener<'a>(
     let tls = spec.protocol == "HTTPS";
     let supported_protocol = tls || spec.protocol == "HTTP";
     let mut listener = Listener {
-        gateway_key: gateway_key.clone(),
+        owner,
         spec,
         hostname,
         tls,
         supported_protocol,
+        active: place.is_some(),
         servers: Vec::new(),
         supported_kinds: Vec::new(),
         accepted: Ok(()),
@@ -879,14 +1353,34 @@ fn evaluate_listener<'a>(
             "UnsupportedProtocol",
             format!("protocol {} is not supported", spec.protocol),
         ));
+        let kinds = spec.allowed_routes.as_ref().and_then(|a| a.kinds.as_ref());
+        if let Some(kinds) = kinds.filter(|k| !k.is_empty()) {
+            let invalid: Vec<String> = kinds
+                .iter()
+                .map(|k| format!("{}/{}", k.group.as_deref().unwrap_or(GATEWAY_GROUP), k.kind))
+                .collect();
+            listener.resolved = Err((
+                "InvalidRouteKinds",
+                format!(
+                    "route kinds {} are not supported on protocol {}",
+                    invalid.join(", "),
+                    spec.protocol
+                ),
+            ));
+        }
         return listener;
     }
 
     // Route kinds. GRPCRoutes need HTTP/2 from the client: every server the listener
     // is programmed on must set `enabled_h2`.
-    let port = u16::try_from(spec.port).ok();
-    let matching: Vec<&&ServerInfo> = servers
+    let port = u16::try_from(spec.port)
+        .ok()
+        .map(|p| place.and_then(|pl| pl.ports?.get(&p).copied()).unwrap_or(p));
+    let matching: Vec<&ServerInfo> = place
+        .map(|pl| pl.servers.as_slice())
+        .unwrap_or_default()
         .iter()
+        .copied()
         .filter(|s| port.is_some_and(|p| s.ports.contains(&p)) && s.tls == tls)
         .collect();
     let without_h2: Vec<&str> = matching
@@ -945,13 +1439,13 @@ fn evaluate_listener<'a>(
     }
 
     listener.servers = matching.iter().map(|s| s.name.clone()).collect();
-    if listener.servers.is_empty() {
+    if place.is_some() && listener.servers.is_empty() {
         listener.accepted = Err((
             "PortUnavailable",
             format!(
                 "no Pingap {} server listens on port {}",
                 if tls { "TLS" } else { "plain HTTP" },
-                spec.port
+                port.map_or_else(|| spec.port.to_string(), |p| p.to_string())
             ),
         ));
         return listener;
@@ -1002,17 +1496,18 @@ fn evaluate_listener<'a>(
                 );
                 continue;
             }
+            let owner = &listener.owner;
             let secret = SecretKey::new(
                 r.namespace
                     .clone()
-                    .unwrap_or_else(|| gateway_key.namespace.clone()),
+                    .unwrap_or_else(|| owner.namespace.clone()),
                 r.name.clone(),
             );
-            if secret.namespace != gateway_key.namespace
+            if secret.namespace != owner.namespace
                 && !granted(
                     input.grants,
-                    &gateway_key.namespace,
-                    KIND_GATEWAY,
+                    &owner.namespace,
+                    owner.kind,
                     &secret.namespace,
                     KIND_SECRET,
                     &secret.name,
@@ -1055,10 +1550,11 @@ fn route_kind(kind: &str) -> GatewayStatusListenersSupportedKinds {
     }
 }
 
-/// Marks the listeners `indices` (one Gateway) that are not distinct among themselves.
-/// Listeners of different Gateways are never conflicted: Gateways sharing a server are
-/// merged onto it (the `GatewaySpec.listeners` "MAY merge separate Gateways" case), and
-/// their routes are served side by side.
+/// Marks the listeners `indices` (one Gateway or one ListenerSet) that are not distinct
+/// among themselves: all of them, none wins. Listeners of different Gateways are never
+/// conflicted: Gateways sharing a server are merged onto it (the
+/// `GatewaySpec.listeners` "MAY merge separate Gateways" case), and their routes are
+/// served side by side.
 fn mark_conflicts(listeners: &mut [Listener<'_>], indices: &[usize]) {
     let candidates = |l: &Listener<'_>| l.supported_protocol && l.accepted.is_ok();
     let mut found: Vec<(usize, &'static str, String)> = Vec::new();
@@ -1101,11 +1597,61 @@ fn mark_conflicts(listeners: &mut [Listener<'_>], indices: &[usize]) {
     }
 }
 
+/// Marks the listeners `later` (one ListenerSet) that are not distinct from a listener
+/// in use among `earlier` (the Gateway's own, then those of older ListenerSets): the
+/// earlier one has precedence. A listener of a protocol this controller does not
+/// support is conflicted too when it shares a port with one in use.
+fn mark_precedence_conflicts(listeners: &mut [Listener<'_>], earlier: &[usize], later: &[usize]) {
+    for &i in later {
+        let l = &listeners[i];
+        if l.conflicted.is_some() || (l.accepted.is_err() && l.supported_protocol) {
+            continue;
+        }
+        let found = earlier.iter().find_map(|&j| {
+            let o = &listeners[j];
+            if !o.claims_port() || o.spec.port != l.spec.port {
+                return None;
+            }
+            if o.spec.protocol != l.spec.protocol {
+                return Some((
+                    "ProtocolConflict",
+                    format!(
+                        "listener {} uses port {} with protocol {}",
+                        o.spec.name, o.spec.port, o.spec.protocol
+                    ),
+                ));
+            }
+            (o.hostname == l.hostname).then(|| {
+                (
+                    "HostnameConflict",
+                    format!(
+                        "listener {} of the Gateway or an older ListenerSet uses the same port and hostname",
+                        o.spec.name
+                    ),
+                )
+            })
+        });
+        if found.is_some() {
+            listeners[i].conflicted = found;
+        }
+    }
+}
+
+/// Whether the Gateway is accepted: a supported address type and a usable listener.
+fn gateway_accepts(placement: &Placement, indices: &[usize], listeners: &[Listener<'_>]) -> bool {
+    !matches!(placement, Placement::Unsupported(_))
+        && indices
+            .iter()
+            .any(|&i| listeners[i].accepted.is_ok() && listeners[i].conflicted.is_none())
+}
+
 fn gateway_status(
-    input: &TranslateInput<'_>,
+    options: &TranslateOptions,
     gateway: &Gateway,
+    assigned: &Assigned,
     indices: &[usize],
     listeners: &[Listener<'_>],
+    attached_sets: usize,
     client_cert: &ClientCertificate,
 ) -> GatewayStatus {
     let generation = gateway.metadata.generation;
@@ -1115,25 +1661,7 @@ fn gateway_status(
         .filter(|l| l.accepted.is_ok() && l.conflicted.is_none())
         .count();
 
-    // Requested addresses: only those we already serve on can be honored.
-    let mut unsupported_address = None;
-    let mut unusable_address = None;
-    for address in gateway.spec.addresses.iter().flatten() {
-        let kind = address.r#type.as_deref().unwrap_or("IPAddress");
-        if kind != "IPAddress" && kind != "Hostname" {
-            unsupported_address.get_or_insert(format!("address type {kind} is not supported"));
-            continue;
-        }
-        if let Some(value) = address.value.as_deref().filter(|v| !v.is_empty())
-            && !input.options.addresses.iter().any(|a| a == value)
-        {
-            unusable_address.get_or_insert(format!(
-                "address {value} is not one of the addresses this controller serves on"
-            ));
-        }
-    }
-
-    let accepted = if let Some(message) = &unsupported_address {
+    let accepted = if let Placement::Unsupported(message) = &assigned.placement {
         cond("Accepted", false, "UnsupportedAddress", message, generation)
     } else if usable == 0 {
         cond(
@@ -1174,9 +1702,9 @@ fn gateway_status(
             "Gateway is not accepted",
             generation,
         )
-    } else if let Some(message) = &unusable_address {
-        cond("Programmed", false, "AddressNotUsable", message, generation)
-    } else if input.options.addresses.is_empty() {
+    } else if let Placement::Unplaced(reason, message) = &assigned.placement {
+        cond("Programmed", false, reason, message, generation)
+    } else if assigned.placement == Placement::Shared && options.addresses.is_empty() {
         cond(
             "Programmed",
             false,
@@ -1216,71 +1744,24 @@ fn gateway_status(
 
     let listener_statuses = ours
         .iter()
-        .map(|l| {
-            let mut conditions = Vec::new();
-            conditions.push(match &l.accepted {
-                Ok(()) => match &l.conflicted {
-                    None => cond(
-                        "Accepted",
-                        true,
-                        "Accepted",
-                        "Listener is accepted",
-                        generation,
-                    ),
-                    Some((reason, message)) => cond("Accepted", false, reason, message, generation),
-                },
-                Err((reason, message)) => cond("Accepted", false, reason, message, generation),
-            });
-            conditions.push(match &l.conflicted {
-                None => cond(
-                    "Conflicted",
-                    false,
-                    "NoConflicts",
-                    "No conflicts",
-                    generation,
-                ),
-                Some((reason, message)) => cond("Conflicted", true, reason, message, generation),
-            });
-            conditions.push(match &l.resolved {
-                Ok(()) => cond(
-                    "ResolvedRefs",
-                    true,
-                    "ResolvedRefs",
-                    "All references are resolved",
-                    generation,
-                ),
-                Err((reason, message)) => cond("ResolvedRefs", false, reason, message, generation),
-            });
-            conditions.push(if l.programmed() {
-                cond(
-                    "Programmed",
-                    true,
-                    "Programmed",
-                    "Listener is programmed",
-                    generation,
-                )
-            } else {
-                let why = match (&l.accepted, &l.conflicted) {
-                    (Err((_, m)), _) => m.clone(),
-                    (_, Some((_, m))) => m.clone(),
-                    _ if l.supported_kinds.is_empty() => "no supported route kind".into(),
-                    _ => "no usable certificate".into(),
-                };
-                cond("Programmed", false, "Invalid", &why, generation)
-            });
-            GatewayStatusListeners {
-                attached_routes: i32::try_from(l.attached.len()).unwrap_or(i32::MAX),
-                conditions,
-                name: l.spec.name.clone(),
-                supported_kinds: Some(l.supported_kinds.clone()),
-            }
+        .map(|l| GatewayStatusListeners {
+            attached_routes: i32::try_from(l.attached.len()).unwrap_or(i32::MAX),
+            conditions: listener_conditions(l, generation),
+            name: l.spec.name.clone(),
+            supported_kinds: Some(l.supported_kinds.clone()),
         })
         .collect();
 
-    let addresses = is_accepted.then(|| {
-        input
-            .options
-            .addresses
+    let served = match &assigned.placement {
+        Placement::Group(gi) => options.groups.get(*gi).map(|g| g.addresses.as_slice()),
+        Placement::Shared => Some(options.addresses.as_slice()),
+        Placement::Unplaced(..) | Placement::Unsupported(_) => None,
+    };
+    let addresses = served.filter(|_| is_accepted).map(|served| {
+        assigned
+            .requested
+            .as_deref()
+            .unwrap_or(served)
             .iter()
             .map(|a| GatewayStatusAddresses {
                 r#type: Some(
@@ -1297,9 +1778,162 @@ fn gateway_status(
     });
     GatewayStatus {
         addresses,
-        attached_listener_sets: None,
+        attached_listener_sets: Some(i32::try_from(attached_sets).unwrap_or(i32::MAX)),
         conditions: Some(vec![accepted, programmed, resolved]),
         listeners: Some(listener_statuses),
+    }
+}
+
+/// The conditions of one listener, for `generation` of the object that defines it.
+fn listener_conditions(l: &Listener<'_>, generation: Option<i64>) -> Vec<Condition> {
+    let mut conditions = Vec::new();
+    conditions.push(match (&l.conflicted, &l.accepted) {
+        (Some((reason, message)), _) | (None, Err((reason, message))) => {
+            cond("Accepted", false, reason, message, generation)
+        }
+        (None, Ok(())) => cond(
+            "Accepted",
+            true,
+            "Accepted",
+            "Listener is accepted",
+            generation,
+        ),
+    });
+    conditions.push(match &l.conflicted {
+        None => cond(
+            "Conflicted",
+            false,
+            "NoConflicts",
+            "No conflicts",
+            generation,
+        ),
+        Some((reason, message)) => cond("Conflicted", true, reason, message, generation),
+    });
+    conditions.push(match &l.resolved {
+        Ok(()) => cond(
+            "ResolvedRefs",
+            true,
+            "ResolvedRefs",
+            "All references are resolved",
+            generation,
+        ),
+        Err((reason, message)) => cond("ResolvedRefs", false, reason, message, generation),
+    });
+    conditions.push(if l.programmed() {
+        cond(
+            "Programmed",
+            true,
+            "Programmed",
+            "Listener is programmed",
+            generation,
+        )
+    } else {
+        let (reason, why) = match (&l.conflicted, &l.accepted) {
+            (Some((reason, m)), _) => (*reason, m.clone()),
+            (None, Err((_, m))) => ("Invalid", m.clone()),
+            _ if l.supported_kinds.is_empty() => ("Invalid", "no supported route kind".into()),
+            _ if !l.active => ("Invalid", "not served: no address".into()),
+            _ => ("Invalid", "no usable certificate".into()),
+        };
+        cond("Programmed", false, reason, &why, generation)
+    });
+    conditions
+}
+
+/// The status of a ListenerSet of one of our Gateways.
+fn listener_set_status(
+    set: &ListenerSet,
+    state: &SetState,
+    listeners: &[Listener<'_>],
+    parent_programmed: bool,
+) -> ListenerSetStatus {
+    let generation = set.metadata.generation;
+    let both = |reason: &str, message: &str| {
+        Some(vec![
+            cond("Accepted", false, reason, message, generation),
+            cond("Programmed", false, reason, message, generation),
+        ])
+    };
+    match state {
+        SetState::NotAllowed => ListenerSetStatus {
+            conditions: both(
+                "NotAllowed",
+                "the allowedListeners of the parent Gateway do not select this namespace",
+            ),
+            listeners: None,
+        },
+        SetState::ParentNotAccepted => ListenerSetStatus {
+            conditions: both("ParentNotAccepted", "the parent Gateway is not accepted"),
+            listeners: None,
+        },
+        SetState::Evaluated { indices, valid } => {
+            let ours: Vec<&Listener<'_>> = indices.iter().map(|&i| &listeners[i]).collect();
+            let invalid: Vec<&str> = ours
+                .iter()
+                .filter(|l| !l.valid())
+                .map(|l| l.spec.name.as_str())
+                .collect();
+            let conditions = if *valid == 0 {
+                both("ListenersNotValid", "No listener is valid")
+            } else {
+                let accepted = if invalid.is_empty() {
+                    cond(
+                        "Accepted",
+                        true,
+                        "Accepted",
+                        "ListenerSet is accepted",
+                        generation,
+                    )
+                } else {
+                    cond(
+                        "Accepted",
+                        true,
+                        "ListenersNotValid",
+                        &format!("Listeners not valid: {}", invalid.join(", ")),
+                        generation,
+                    )
+                };
+                let programmed = if parent_programmed {
+                    cond(
+                        "Programmed",
+                        true,
+                        "Programmed",
+                        "ListenerSet is programmed",
+                        generation,
+                    )
+                } else {
+                    cond(
+                        "Programmed",
+                        false,
+                        "ParentNotProgrammed",
+                        "the parent Gateway is not programmed",
+                        generation,
+                    )
+                };
+                Some(vec![accepted, programmed])
+            };
+            let statuses = ours
+                .iter()
+                .map(|l| ListenerSetStatusListeners {
+                    attached_routes: i32::try_from(l.attached.len()).unwrap_or(i32::MAX),
+                    conditions: listener_conditions(l, generation),
+                    name: l.spec.name.clone(),
+                    supported_kinds: Some(
+                        l.supported_kinds
+                            .iter()
+                            .map(|k| ListenerSetStatusListenersSupportedKinds {
+                                group: k.group.clone(),
+                                kind: k.kind.clone(),
+                            })
+                            .collect(),
+                    ),
+                })
+                .collect();
+            ListenerSetStatus {
+                conditions,
+                listeners: Some(statuses),
+            }
+        }
     }
 }
 
@@ -1317,19 +1951,31 @@ fn parent_refs(route: &HttpRoute) -> &[HttpRouteParentRefs] {
     route.spec.parent_refs.as_deref().unwrap_or_default()
 }
 
-/// The Gateway a parentRef names, when it names one.
-fn gateway_ref_key(parent: &HttpRouteParentRefs, route_namespace: &str) -> Option<GatewayKey> {
+/// What a route parentRef names.
+enum ParentTarget {
+    Gateway(GatewayKey),
+    ListenerSet(ListenerSetKey),
+}
+
+/// The Gateway or ListenerSet a parentRef names, when it names one.
+fn parent_target(parent: &HttpRouteParentRefs, route_namespace: &str) -> Option<ParentTarget> {
     let group = parent.group.as_deref().unwrap_or(GATEWAY_GROUP);
     let kind = parent.kind.as_deref().unwrap_or(KIND_GATEWAY);
-    (group == GATEWAY_GROUP && kind == KIND_GATEWAY).then(|| {
-        ObjectKey::new(
-            parent
-                .namespace
-                .clone()
-                .unwrap_or_else(|| route_namespace.to_string()),
-            parent.name.clone(),
-        )
-    })
+    if group != GATEWAY_GROUP {
+        return None;
+    }
+    let key = ObjectKey::new(
+        parent
+            .namespace
+            .clone()
+            .unwrap_or_else(|| route_namespace.to_string()),
+        parent.name.clone(),
+    );
+    match kind {
+        KIND_GATEWAY => Some(ParentTarget::Gateway(key)),
+        KIND_LISTENER_SET => Some(ParentTarget::ListenerSet(key)),
+        _ => None,
+    }
 }
 
 fn status_parent_ref(parent: &HttpRouteParentRefs) -> HttpRouteStatusParentsParentRef {
@@ -1343,8 +1989,8 @@ fn status_parent_ref(parent: &HttpRouteParentRefs) -> HttpRouteStatusParentsPare
     }
 }
 
-/// The listeners of one Gateway (`indices`) a parentRef attaches the route to, or the
-/// reason it attaches to none.
+/// The listeners of one Gateway or ListenerSet (`indices`) a parentRef attaches the
+/// route to, or the reason it attaches to none.
 fn attach(
     input: &TranslateInput<'_>,
     route: &HttpRoute,
@@ -1468,36 +2114,49 @@ fn namespace_allowed(input: &TranslateInput<'_>, listener: &Listener<'_>, namesp
         .unwrap_or(GatewayListenersAllowedRoutesNamespacesFrom::Same);
     match from {
         GatewayListenersAllowedRoutesNamespacesFrom::All => true,
-        GatewayListenersAllowedRoutesNamespacesFrom::Same => {
-            namespace == listener.gateway_key.namespace
-        }
+        GatewayListenersAllowedRoutesNamespacesFrom::Same => namespace == listener.owner.namespace,
         GatewayListenersAllowedRoutesNamespacesFrom::Selector => {
             let Some(selector) = namespaces.and_then(|n| n.selector.as_ref()) else {
                 return false;
             };
-            let Some(object) = input.namespaces.get(namespace) else {
-                return false;
-            };
-            let empty = BTreeMap::new();
-            selector_matches(selector, object.metadata.labels.as_ref().unwrap_or(&empty))
+            let expressions = selector.match_expressions.iter().flatten().map(|e| {
+                (
+                    e.key.as_str(),
+                    e.operator.as_str(),
+                    e.values.as_deref().unwrap_or_default(),
+                )
+            });
+            namespace_labels_match(
+                input,
+                namespace,
+                selector.match_labels.as_ref(),
+                expressions,
+            )
         }
     }
 }
 
-/// A Kubernetes label selector: every `matchLabels` entry and every expression holds.
-fn selector_matches(
-    selector: &GatewayListenersAllowedRoutesNamespacesSelector,
-    labels: &BTreeMap<String, String>,
+/// A Kubernetes label selector on the labels of a namespace: every `matchLabels` entry
+/// and every expression (key, operator, values) holds. A namespace that is not known
+/// matches nothing.
+fn namespace_labels_match<'e>(
+    input: &TranslateInput<'_>,
+    namespace: &str,
+    match_labels: Option<&BTreeMap<String, String>>,
+    expressions: impl IntoIterator<Item = (&'e str, &'e str, &'e [String])>,
 ) -> bool {
-    let match_labels = selector
-        .match_labels
-        .iter()
+    let Some(object) = input.namespaces.get(namespace) else {
+        return false;
+    };
+    let empty = BTreeMap::new();
+    let labels = object.metadata.labels.as_ref().unwrap_or(&empty);
+    let match_labels = match_labels
+        .into_iter()
         .flatten()
         .all(|(k, v)| labels.get(k) == Some(v));
-    let expressions = selector.match_expressions.iter().flatten().all(|e| {
-        let values = e.values.as_deref().unwrap_or_default();
-        let value = labels.get(&e.key);
-        match e.operator.as_str() {
+    let expressions = expressions.into_iter().all(|(key, operator, values)| {
+        let value = labels.get(key);
+        match operator {
             "In" => value.is_some_and(|v| values.contains(v)),
             "NotIn" => value.is_none_or(|v| !values.contains(v)),
             "Exists" => value.is_some(),
@@ -2741,6 +3400,8 @@ mod tests {
     use crate::gateway::api::backendtlspolicies::BackendTlsPolicy;
 
     use super::*;
+    use crate::config::GatewayGroup;
+    use crate::gateway::api::gateways::GatewayListenersAllowedRoutesNamespacesSelector;
     use crate::gateway::api::grpcroutes::GrpcRoute;
     use crate::gateway::model::TranslateOptions;
     use crate::gateway::tls::tests::{cert_pem, key_pem, tls_secret};
@@ -2766,6 +3427,7 @@ mod tests {
             cluster_domain: "cluster.local".into(),
             servers: Vec::new(),
             addresses: vec!["192.0.2.1".into()],
+            groups: Vec::new(),
         }
     }
 
@@ -2884,6 +3546,7 @@ mod tests {
         gateways: Vec<Arc<Gateway>>,
         routes: Vec<Arc<HttpRoute>>,
         grpc_routes: Vec<Arc<GrpcRoute>>,
+        listener_sets: Vec<Arc<ListenerSet>>,
         grants: Vec<Arc<ReferenceGrant>>,
         namespaces: BTreeMap<String, Arc<Namespace>>,
         services: BTreeMap<ServiceKey, Arc<Service>>,
@@ -2907,6 +3570,7 @@ mod tests {
                 gateways: Vec::new(),
                 routes: Vec::new(),
                 grpc_routes: Vec::new(),
+                listener_sets: Vec::new(),
                 grants: Vec::new(),
                 namespaces: BTreeMap::new(),
                 services: BTreeMap::new(),
@@ -2933,6 +3597,10 @@ mod tests {
         }
         fn rt(mut self, r: HttpRoute) -> Self {
             self.routes.push(Arc::new(r));
+            self
+        }
+        fn ls(mut self, s: ListenerSet) -> Self {
+            self.listener_sets.push(Arc::new(s));
             self
         }
         fn service(&mut self, s: Service) {
@@ -2964,6 +3632,7 @@ mod tests {
                 gateways: &self.gateways,
                 routes: &self.routes,
                 grpc_routes: &self.grpc_routes,
+                listener_sets: &self.listener_sets,
                 grants: &self.grants,
                 namespaces: &self.namespaces,
                 services: &self.services,
@@ -2984,6 +3653,7 @@ mod tests {
                 gateways: self.gateways.clone(),
                 routes: self.routes.clone(),
                 grpc_routes: self.grpc_routes.clone(),
+                listener_sets: self.listener_sets.clone(),
                 grants: self.grants.clone(),
                 namespaces: self.namespaces.clone(),
                 services: self.services.clone(),
@@ -3367,28 +4037,35 @@ mod tests {
 
     #[test]
     fn selector_operators() {
-        let labels = BTreeMap::from([("a".to_string(), "1".to_string())]);
-        let sel = |v: Value| -> GatewayListenersAllowedRoutesNamespacesSelector {
-            serde_json::from_value(v).unwrap()
+        let mut w = World::new();
+        w.namespace("sel", &[("a", "1")]);
+        let input = w.input();
+        let matches_in = |namespace: &str, v: Value| {
+            let sel: GatewayListenersAllowedRoutesNamespacesSelector =
+                serde_json::from_value(v).unwrap();
+            let expressions = sel.match_expressions.iter().flatten().map(|e| {
+                (
+                    e.key.as_str(),
+                    e.operator.as_str(),
+                    e.values.as_deref().unwrap_or_default(),
+                )
+            });
+            namespace_labels_match(&input, namespace, sel.match_labels.as_ref(), expressions)
         };
-        assert!(selector_matches(&sel(json!({})), &labels));
-        assert!(selector_matches(
-            &sel(json!({"matchLabels": {"a": "1"}})),
-            &labels
-        ));
-        assert!(!selector_matches(
-            &sel(json!({"matchLabels": {"a": "2"}})),
-            &labels
-        ));
+        let matches = |v: Value| matches_in("sel", v);
+        assert!(matches(json!({})));
+        assert!(!matches_in("unknown", json!({})));
+        assert!(matches(json!({"matchLabels": {"a": "1"}})));
+        assert!(!matches(json!({"matchLabels": {"a": "2"}})));
         let expr = |op: &str, values: Value| {
-            sel(json!({"matchExpressions": [{"key": "a", "operator": op, "values": values}]}))
+            matches(json!({"matchExpressions": [{"key": "a", "operator": op, "values": values}]}))
         };
-        assert!(selector_matches(&expr("In", json!(["1", "2"])), &labels));
-        assert!(!selector_matches(&expr("NotIn", json!(["1"])), &labels));
-        assert!(selector_matches(&expr("NotIn", json!(["2"])), &labels));
-        assert!(selector_matches(&expr("Exists", json!([])), &labels));
-        assert!(!selector_matches(&expr("DoesNotExist", json!([])), &labels));
-        assert!(!selector_matches(&expr("Bogus", json!([])), &labels));
+        assert!(expr("In", json!(["1", "2"])));
+        assert!(!expr("NotIn", json!(["1"])));
+        assert!(expr("NotIn", json!(["2"])));
+        assert!(expr("Exists", json!([])));
+        assert!(!expr("DoesNotExist", json!([])));
+        assert!(!expr("Bogus", json!([])));
     }
 
     #[test]
@@ -5108,6 +5785,893 @@ mod tests {
         assert_eq!(a.referenced, referenced(&w.input()));
     }
 
+    // ---- server groups ----
+
+    fn group(name: &str, servers: &[&str], address: &str, ports: &[(u16, u16)]) -> GatewayGroup {
+        GatewayGroup {
+            name: name.into(),
+            servers: servers.iter().map(|s| s.to_string()).collect(),
+            addresses: vec![address.into()],
+            ports: ports.iter().copied().collect(),
+        }
+    }
+
+    /// Group `a` (server `gw-a` on 9080 for listener port 80, `gw-a-tls` on 9443 for
+    /// 443) next to the shared `http`/`https` servers.
+    fn grouped_world() -> World {
+        let mut w = World::new();
+        w.servers.push(server("gw-a", &[9080], false));
+        w.servers.push(server("gw-a-tls", &[9443], true));
+        w.options.groups = vec![group(
+            "a",
+            &["gw-a", "gw-a-tls"],
+            "a.example.com",
+            &[(80, 9080), (443, 9443)],
+        )];
+        w
+    }
+
+    /// A route `name` in `ns` on Gateway `gw` for every path, to Service `backend`.
+    fn catch_all(name: &str, gw: &str, age: i64, backend_name: &str) -> HttpRoute {
+        route(
+            "ns",
+            name,
+            age,
+            json!({"parentRefs": [{"name": gw}], "rules": [{"backendRefs": [backend(backend_name, 80)]}]}),
+        )
+    }
+
+    fn upstream_services(d: &Desired, server: &str) -> Vec<String> {
+        locations(d, server)
+            .iter()
+            .map(|l| {
+                let upstream = l.upstream.clone().unwrap_or_default();
+                ["web", "api", "v2"]
+                    .into_iter()
+                    .find(|s| upstream.contains(&format!("-{s}-")))
+                    .unwrap_or("?")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn status_addresses(d: &Desired, gw: &str) -> Vec<String> {
+        d.status.gateways[&ObjectKey::new("ns", gw)]
+            .addresses
+            .iter()
+            .flatten()
+            .map(|a| a.value.clone())
+            .collect()
+    }
+
+    fn with_status_addresses(mut g: Gateway, addresses: &[&str]) -> Gateway {
+        g.status = Some(GatewayStatus {
+            addresses: Some(
+                addresses
+                    .iter()
+                    .map(|a| GatewayStatusAddresses {
+                        r#type: Some("Hostname".into()),
+                        value: a.to_string(),
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        });
+        g
+    }
+
+    fn with_spec_addresses(mut g: Gateway, addresses: Value) -> Gateway {
+        g.spec.addresses = Some(serde_json::from_value(addresses).unwrap());
+        g
+    }
+
+    fn port_80(name: &str, age: i64) -> Gateway {
+        gateway("ns", name, age, json!([http_listener("http", 80, None)]))
+    }
+
+    #[test]
+    fn gateways_with_a_group_do_not_share_routes() {
+        let d = grouped_world()
+            .gw(port_80("old", 0))
+            .gw(port_80("young", 1))
+            .rt(catch_all("to-old", "old", 0, "web"))
+            .rt(catch_all("to-young", "young", 1, "api"))
+            .run();
+        // The older Gateway has the group (its port 80 is server port 9080), the other
+        // the shared servers; group servers are never shared.
+        assert_eq!(upstream_services(&d, "gw-a"), vec!["web"]);
+        assert_eq!(upstream_services(&d, "http"), vec!["api"]);
+        assert!(d.server_locations["gw-a-tls"].is_empty());
+        assert!(d.server_locations["https"].is_empty());
+        assert_eq!(status_addresses(&d, "old"), vec!["a.example.com"]);
+        assert_eq!(status_addresses(&d, "young"), vec!["192.0.2.1"]);
+        for gw in ["old", "young"] {
+            assert_eq!(gateway_cond(&d, gw, "Programmed"), tf("True", "Programmed"));
+            assert_eq!(
+                listener_cond(&d, gw, "http", "Programmed"),
+                tf("True", "Programmed")
+            );
+        }
+    }
+
+    #[test]
+    fn group_assignment_is_sticky() {
+        // The younger Gateway published the group's address: it keeps the group.
+        let young = with_status_addresses(port_80("young", 1), &["a.example.com"]);
+        let d = grouped_world()
+            .gw(port_80("old", 0))
+            .gw(young)
+            .rt(catch_all("to-old", "old", 0, "web"))
+            .rt(catch_all("to-young", "young", 1, "api"))
+            .run();
+        assert_eq!(upstream_services(&d, "gw-a"), vec!["api"]);
+        assert_eq!(upstream_services(&d, "http"), vec!["web"]);
+        assert_eq!(status_addresses(&d, "young"), vec!["a.example.com"]);
+        // Shared addresses in the status do not hold a group.
+        let old = with_status_addresses(port_80("old", 0), &["192.0.2.1"]);
+        let d = grouped_world().gw(old).run();
+        assert_eq!(status_addresses(&d, "old"), vec!["a.example.com"]);
+        // Order in the input does not matter.
+        let mut w = grouped_world()
+            .gw(port_80("young", 1))
+            .gw(port_80("old", 0));
+        assert_eq!(status_addresses(&w.run(), "old"), vec!["a.example.com"]);
+        w.gateways.reverse();
+        assert_eq!(status_addresses(&w.run(), "old"), vec!["a.example.com"]);
+    }
+
+    #[test]
+    fn requested_addresses_pick_the_group() {
+        let young = with_spec_addresses(
+            port_80("young", 1),
+            json!([{"type": "Hostname", "value": "a.example.com"}]),
+        );
+        // The older one published the group address, but a request wins.
+        let old = with_status_addresses(port_80("old", 0), &["a.example.com"]);
+        let d = grouped_world()
+            .gw(old)
+            .gw(young)
+            .rt(catch_all("to-old", "old", 0, "web"))
+            .rt(catch_all("to-young", "young", 1, "api"))
+            .run();
+        assert_eq!(upstream_services(&d, "gw-a"), vec!["api"]);
+        assert_eq!(status_addresses(&d, "young"), vec!["a.example.com"]);
+        assert_eq!(status_addresses(&d, "old"), vec!["192.0.2.1"]);
+
+        // A shared address picks the shared servers.
+        let g = with_spec_addresses(port_80("gw", 0), json!([{"value": "192.0.2.1"}]));
+        let d = grouped_world()
+            .gw(g)
+            .rt(catch_all("r", "gw", 0, "web"))
+            .run();
+        assert_eq!(upstream_services(&d, "http"), vec!["web"]);
+        assert_eq!(status_addresses(&d, "gw"), vec!["192.0.2.1"]);
+
+        // An address of no group: accepted, not programmed, not served.
+        let g = with_spec_addresses(
+            port_80("gw", 0),
+            json!([{"type": "Hostname", "value": "a.example.com"}, {"value": "198.51.100.1"}]),
+        );
+        let d = grouped_world()
+            .gw(g)
+            .rt(catch_all("r", "gw", 0, "web"))
+            .run();
+        assert_eq!(gateway_cond(&d, "gw", "Accepted"), tf("True", "Accepted"));
+        assert_eq!(
+            gateway_cond(&d, "gw", "Programmed"),
+            tf("False", "AddressNotUsable")
+        );
+        assert_eq!(
+            listener_cond(&d, "gw", "http", "Accepted"),
+            tf("True", "Accepted")
+        );
+        assert_eq!(
+            listener_cond(&d, "gw", "http", "Programmed"),
+            tf("False", "Invalid")
+        );
+        assert!(d.locations.is_empty());
+        assert!(status_addresses(&d, "gw").is_empty());
+
+        // An address type that is not supported: not accepted.
+        let g = with_spec_addresses(
+            port_80("gw", 0),
+            json!([{"type": "test/fake", "value": "x"}, {"value": "a.example.com"}]),
+        );
+        let d = grouped_world().gw(g).run();
+        assert_eq!(
+            gateway_cond(&d, "gw", "Accepted"),
+            tf("False", "UnsupportedAddress")
+        );
+    }
+
+    #[test]
+    fn without_shared_addresses_a_gateway_may_get_no_group() {
+        let mut w = grouped_world()
+            .gw(port_80("old", 0))
+            .gw(port_80("young", 1))
+            .rt(catch_all("to-old", "old", 0, "web"))
+            .rt(catch_all("to-young", "young", 1, "api"));
+        w.options.addresses.clear();
+        let d = w.run();
+        assert_eq!(upstream_services(&d, "gw-a"), vec!["web"]);
+        assert!(d.server_locations["http"].is_empty());
+        assert_eq!(
+            gateway_cond(&d, "young", "Accepted"),
+            tf("True", "Accepted")
+        );
+        assert_eq!(
+            gateway_cond(&d, "young", "Programmed"),
+            tf("False", "AddressNotAssigned")
+        );
+        assert_eq!(
+            route_cond(&d, &rkey("ns", "to-young"), "Accepted"),
+            tf("True", "Accepted")
+        );
+        // Without groups, the shared servers serve without an address (as before).
+        let mut w = World::new()
+            .gw(basic_gateway())
+            .rt(catch_all("r", "gw", 0, "web"));
+        w.options.addresses.clear();
+        let d = w.run();
+        assert_eq!(upstream_services(&d, "http"), vec!["web"]);
+        assert_eq!(
+            gateway_cond(&d, "gw", "Programmed"),
+            tf("False", "AddressNotAssigned")
+        );
+    }
+
+    #[test]
+    fn group_port_without_server_is_unavailable() {
+        let g = gateway("ns", "gw", 0, json!([http_listener("http", 8080, None)]));
+        let d = grouped_world().gw(g).run();
+        assert_eq!(
+            listener_cond(&d, "gw", "http", "Accepted"),
+            tf("False", "PortUnavailable")
+        );
+    }
+
+    #[test]
+    fn long_gateway_names_are_fine() {
+        let name = format!("gateway-name-maximum-length-{}", "a".repeat(225));
+        assert_eq!(name.len(), 253);
+        let d = World::new()
+            .gw(port_80(&name, 0))
+            .rt(catch_all("r", &name, 0, "web"))
+            .run();
+        assert_eq!(gateway_cond(&d, &name, "Accepted"), tf("True", "Accepted"));
+        assert!(
+            d.locations.keys().all(|n| n.len() < 64),
+            "{:?}",
+            d.locations.keys()
+        );
+    }
+
+    // ---- rule order ----
+
+    #[test]
+    fn identical_matches_first_rule_wins() {
+        let m = |headers: Value| json!([{"path": {"type": "Exact", "value": "/rule-order"}, "headers": headers}]);
+        let d = World::new()
+            .gw(basic_gateway())
+            .rt(route(
+                "ns",
+                "r",
+                0,
+                json!({"rules": [
+                    {"matches": m(json!([{"name": "x-version", "value": "one"}, {"name": "x-color", "value": "blue"}])),
+                     "backendRefs": [backend("web", 80)]},
+                    {"matches": m(json!([{"name": "x-color", "value": "blue"}, {"name": "x-version", "value": "one"}])),
+                     "backendRefs": [backend("api", 80)]},
+                    {"matches": [{"path": {"type": "Exact", "value": "/invalid"}}],
+                     "backendRefs": [backend("missing", 80)]},
+                    {"matches": [{"path": {"type": "Exact", "value": "/invalid"}}],
+                     "backendRefs": [backend("v2", 80)]},
+                ]}),
+            ))
+            .run();
+        let first = |path: &str| {
+            *locations(&d, "http")
+                .iter()
+                .find(|l| l.path == path)
+                .unwrap()
+        };
+        assert!(
+            first("=/rule-order")
+                .upstream
+                .as_deref()
+                .unwrap()
+                .contains("-web-")
+        );
+        let invalid = first("=/invalid");
+        assert_eq!(invalid.upstream, None);
+        assert_eq!(plugins_of(&d, invalid)[0].category, "mock");
+    }
+
+    // ---- ListenerSets ----
+
+    fn listener_set(
+        ns: &str,
+        name: &str,
+        age: i64,
+        gateway: Value,
+        listeners: Value,
+    ) -> ListenerSet {
+        serde_json::from_value(json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "ListenerSet",
+            "metadata": {
+                "namespace": ns, "name": name, "generation": 7,
+                "creationTimestamp": ts(age),
+            },
+            "spec": {"parentRef": gateway, "listeners": listeners}
+        }))
+        .unwrap()
+    }
+
+    /// Gateway `ns/gw` with listener `gw` (port 80, `gw.example.com`) allowing
+    /// ListenerSets `from`.
+    fn parent_gateway(from: &str) -> Gateway {
+        let mut g = gateway(
+            "ns",
+            "gw",
+            0,
+            json!([http_listener("gw", 80, Some("gw.example.com"))]),
+        );
+        g.spec.allowed_listeners =
+            Some(serde_json::from_value(json!({"namespaces": {"from": from}})).unwrap());
+        g
+    }
+
+    fn ls_status<'d>(d: &'d Desired, ns: &str, name: &str) -> &'d ListenerSetStatus {
+        &d.status.listener_sets[&ObjectKey::new(ns, name)]
+    }
+
+    fn ls_cond(d: &Desired, ns: &str, name: &str, type_: &str) -> (String, String) {
+        let c = condition(ls_status(d, ns, name).conditions.as_ref().unwrap(), type_);
+        (c.status.clone(), c.reason.clone())
+    }
+
+    fn ls_listener<'d>(
+        d: &'d Desired,
+        ns: &str,
+        name: &str,
+        listener: &str,
+    ) -> &'d ListenerSetStatusListeners {
+        ls_status(d, ns, name)
+            .listeners
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|l| l.name == listener)
+            .unwrap()
+    }
+
+    fn ls_listener_cond(
+        d: &Desired,
+        ns: &str,
+        name: &str,
+        listener: &str,
+        type_: &str,
+    ) -> (String, String) {
+        let c = condition(&ls_listener(d, ns, name, listener).conditions, type_);
+        (c.status.clone(), c.reason.clone())
+    }
+
+    fn attached_sets(d: &Desired) -> Option<i32> {
+        d.status.gateways[&ObjectKey::new("ns", "gw")].attached_listener_sets
+    }
+
+    fn ls_ref(name: &str) -> Value {
+        json!({"group": GATEWAY_GROUP, "kind": "ListenerSet", "name": name})
+    }
+
+    fn hosts(d: &Desired, server: &str) -> Vec<(Option<String>, String)> {
+        locations(d, server)
+            .iter()
+            .map(|l| (l.host.clone(), l.path.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn listener_set_listeners_are_merged_into_the_gateway() {
+        let rule = |path: &str| json!([{"matches": [{"path": {"type": "PathPrefix", "value": path}}], "backendRefs": [backend("web", 80)]}]);
+        let d = World::new()
+            .gw(parent_gateway("Same"))
+            .ls(listener_set(
+                "ns",
+                "ls",
+                1,
+                json!({"name": "gw"}),
+                json!([http_listener("ls", 80, Some("ls.example.com"))]),
+            ))
+            .rt(route("ns", "via-gw", 0, json!({"rules": rule("/gw")})))
+            .rt(route("ns", "via-ls", 1, json!({"parentRefs": [ls_ref("ls")], "rules": rule("/ls")})))
+            .rt(route(
+                "ns",
+                "both",
+                2,
+                json!({"parentRefs": [{"name": "gw", "sectionName": "ls"}, ls_ref("ls")], "rules": rule("/both")}),
+            ))
+            .run();
+        let mut got = hosts(&d, "http");
+        got.sort();
+        let h = |host: &str, path: &str| (Some(host.to_string()), format!("~^{path}(/|$)"));
+        assert_eq!(
+            got,
+            vec![
+                h("gw.example.com", "/gw"),
+                h("ls.example.com", "/both"),
+                h("ls.example.com", "/ls"),
+            ]
+        );
+        assert_eq!(attached_sets(&d), Some(1));
+        assert_eq!(ls_cond(&d, "ns", "ls", "Accepted"), tf("True", "Accepted"));
+        assert_eq!(
+            ls_cond(&d, "ns", "ls", "Programmed"),
+            tf("True", "Programmed")
+        );
+        assert_eq!(ls_listener(&d, "ns", "ls", "ls").attached_routes, 2);
+        assert_eq!(listener_status(&d, "gw", "gw").attached_routes, 1);
+        // The Gateway parentRef with a ListenerSet listener's name matches nothing.
+        let both = &d.status.routes[&rkey("ns", "both")].parents;
+        let accepted: Vec<(String, String)> = both
+            .iter()
+            .map(|p| {
+                let c = condition(&p.conditions, "Accepted");
+                (c.status.clone(), c.reason.clone())
+            })
+            .collect();
+        assert_eq!(
+            accepted,
+            vec![tf("False", "NoMatchingParent"), tf("True", "Accepted")]
+        );
+        assert_eq!(both[1].parent_ref.kind.as_deref(), Some("ListenerSet"));
+        let generation = condition(
+            &ls_status(&d, "ns", "ls").conditions.clone().unwrap(),
+            "Accepted",
+        )
+        .observed_generation;
+        assert_eq!(generation, Some(7));
+    }
+
+    #[test]
+    fn listener_sets_must_be_allowed() {
+        let set = |ns: &str, name: &str| {
+            listener_set(
+                ns,
+                name,
+                1,
+                json!({"name": "gw", "namespace": "ns"}),
+                json!([http_listener("l", 80, Some(&format!("{name}.example.com")))]),
+            )
+        };
+        let via = |ns: &str, name: &str| {
+            route(
+                ns,
+                &format!("via-{name}"),
+                1,
+                json!({"parentRefs": [{"group": GATEWAY_GROUP, "kind": "ListenerSet", "name": name, "namespace": ns}],
+                       "rules": [{"backendRefs": [backend("web", 80)]}]}),
+            )
+        };
+        // Not allowed by default.
+        let d = World::new()
+            .gw(gateway(
+                "ns",
+                "gw",
+                0,
+                json!([http_listener("gw", 80, Some("gw.example.com"))]),
+            ))
+            .ls(set("ns", "a"))
+            .rt(via("ns", "a"))
+            .run();
+        assert_eq!(
+            ls_cond(&d, "ns", "a", "Accepted"),
+            tf("False", "NotAllowed")
+        );
+        assert_eq!(
+            ls_cond(&d, "ns", "a", "Programmed"),
+            tf("False", "NotAllowed")
+        );
+        assert_eq!(attached_sets(&d), Some(0));
+        assert_eq!(
+            route_cond(&d, &rkey("ns", "via-a"), "Accepted"),
+            tf("False", "NotAllowedByListeners")
+        );
+        assert_eq!(hosts(&d, "http"), vec![]);
+
+        for (from, same, other) in [
+            ("None", false, false),
+            ("Same", true, false),
+            ("All", true, true),
+        ] {
+            let d = World::new()
+                .gw(parent_gateway(from))
+                .ls(set("ns", "a"))
+                .ls(set("other", "b"))
+                .run();
+            let reason = |ok: bool| {
+                if ok {
+                    tf("True", "Accepted")
+                } else {
+                    tf("False", "NotAllowed")
+                }
+            };
+            assert_eq!(ls_cond(&d, "ns", "a", "Accepted"), reason(same), "{from}");
+            assert_eq!(
+                ls_cond(&d, "other", "b", "Accepted"),
+                reason(other),
+                "{from}"
+            );
+        }
+        let mut g = parent_gateway("Selector");
+        g.spec.allowed_listeners = Some(
+            serde_json::from_value(
+                json!({"namespaces": {"from": "Selector", "selector": {"matchLabels": {"team": "b"}}}}),
+            )
+            .unwrap(),
+        );
+        let d = World::new()
+            .gw(g)
+            .ls(set("ns", "a"))
+            .ls(set("other", "b"))
+            .run();
+        assert_eq!(
+            ls_cond(&d, "ns", "a", "Accepted"),
+            tf("False", "NotAllowed")
+        );
+        assert_eq!(
+            ls_cond(&d, "other", "b", "Accepted"),
+            tf("True", "Accepted")
+        );
+        assert_eq!(attached_sets(&d), Some(1));
+        // A ListenerSet of a Gateway that is not ours gets no status.
+        let mut d_world = World::new().gw(parent_gateway("All"));
+        d_world.gateways = vec![Arc::new({
+            let mut g = parent_gateway("All");
+            g.spec.gateway_class_name = "other".into();
+            g
+        })];
+        let d = d_world.ls(set("ns", "a")).run();
+        assert!(d.status.listener_sets.is_empty());
+    }
+
+    #[test]
+    fn listener_set_conflicts_follow_precedence() {
+        let mut g = parent_gateway("Same");
+        g.spec.listeners.push(
+            serde_json::from_value(http_listener("taken", 80, Some("taken.example.com"))).unwrap(),
+        );
+        let tcp = json!({"name": "tcp", "port": 80, "protocol": "TCP"});
+        let d = World::new()
+            .gw(g)
+            .ls(listener_set(
+                "ns",
+                "first",
+                1,
+                json!({"name": "gw"}),
+                json!([
+                    http_listener("ok", 80, Some("first.example.com")),
+                    http_listener("taken", 80, Some("taken.example.com")),
+                    http_listener("shared", 80, Some("shared.example.com")),
+                ]),
+            ))
+            .ls(listener_set(
+                "ns",
+                "second",
+                2,
+                json!({"name": "gw"}),
+                json!([http_listener("shared", 80, Some("shared.example.com")), tcp]),
+            ))
+            .run();
+        // The Gateway's own listeners win.
+        assert_eq!(
+            listener_cond(&d, "gw", "taken", "Accepted"),
+            tf("True", "Accepted")
+        );
+        assert_eq!(gateway_cond(&d, "gw", "Accepted"), tf("True", "Accepted"));
+        let conflicted = |ls: &str, l: &str, reason: &str| {
+            for type_ in ["Accepted", "Programmed"] {
+                assert_eq!(
+                    ls_listener_cond(&d, "ns", ls, l, type_),
+                    tf("False", reason),
+                    "{ls}/{l} {type_}"
+                );
+            }
+            assert_eq!(
+                ls_listener_cond(&d, "ns", ls, l, "Conflicted"),
+                tf("True", reason)
+            );
+        };
+        conflicted("first", "taken", "HostnameConflict");
+        assert_eq!(
+            ls_listener_cond(&d, "ns", "first", "shared", "Accepted"),
+            tf("True", "Accepted")
+        );
+        assert_eq!(
+            ls_cond(&d, "ns", "first", "Accepted"),
+            tf("True", "ListenersNotValid")
+        );
+        assert_eq!(
+            ls_cond(&d, "ns", "first", "Programmed"),
+            tf("True", "Programmed")
+        );
+        // The older ListenerSet wins; a protocol this controller does not support still
+        // conflicts.
+        conflicted("second", "shared", "HostnameConflict");
+        conflicted("second", "tcp", "ProtocolConflict");
+        assert_eq!(
+            ls_cond(&d, "ns", "second", "Accepted"),
+            tf("False", "ListenersNotValid")
+        );
+        assert_eq!(
+            ls_cond(&d, "ns", "second", "Programmed"),
+            tf("False", "ListenersNotValid")
+        );
+        assert_eq!(attached_sets(&d), Some(1));
+    }
+
+    #[test]
+    fn listener_set_references_are_its_own() {
+        let https = |name: &str, host: &str| {
+            json!({"name": name, "port": 443, "protocol": "HTTPS", "hostname": host,
+                   "tls": {"certificateRefs": [{"name": "cert", "namespace": "certs"}]}})
+        };
+        let mut w = World::new()
+            .gw(parent_gateway("All"))
+            .ls(listener_set(
+                "ns",
+                "granted",
+                1,
+                json!({"name": "gw", "namespace": "ns"}),
+                json!([https("l", "granted.example.com")]),
+            ))
+            .ls(listener_set(
+                "other",
+                "denied",
+                2,
+                json!({"name": "gw", "namespace": "ns"}),
+                json!([https("l", "denied.example.com")]),
+            ));
+        w.secret("certs", "cert");
+        // The grant names ListenerSets of `ns`; one for Gateways does not count.
+        w.grants.push(Arc::new(grant(
+            "certs",
+            "ListenerSet",
+            "ns",
+            "Secret",
+            None,
+        )));
+        w.grants
+            .push(Arc::new(grant("certs", "Gateway", "other", "Secret", None)));
+        let d = w.run();
+        assert!(
+            d.referenced
+                .secrets
+                .contains(&SecretKey::new("certs", "cert"))
+        );
+        assert_eq!(
+            ls_listener_cond(&d, "ns", "granted", "l", "ResolvedRefs"),
+            tf("True", "ResolvedRefs")
+        );
+        assert_eq!(
+            ls_cond(&d, "ns", "granted", "Accepted"),
+            tf("True", "Accepted")
+        );
+        assert_eq!(
+            ls_listener_cond(&d, "other", "denied", "l", "ResolvedRefs"),
+            tf("False", "RefNotPermitted")
+        );
+        assert_eq!(
+            ls_cond(&d, "other", "denied", "Accepted"),
+            tf("False", "ListenersNotValid")
+        );
+        let cert = &d.certificates[&names::certificate_name(&SecretKey::new("certs", "cert"))];
+        assert_eq!(cert.domains, vec!["granted.example.com".to_string()]);
+    }
+
+    #[test]
+    fn listener_set_routes_follow_its_allowed_routes() {
+        let mut w = World::new().gw(parent_gateway("All")).ls(listener_set(
+            "other",
+            "ls",
+            1,
+            json!({"name": "gw", "namespace": "ns"}),
+            json!([http_listener("same", 80, Some("ls.example.com"))]),
+        ));
+        w.service(service("other", "web", &[80]));
+        let parent = json!([{"group": GATEWAY_GROUP, "kind": "ListenerSet", "name": "ls", "namespace": "other"}]);
+        let d = w
+            .rt(route(
+                "other",
+                "local",
+                0,
+                json!({"parentRefs": parent, "rules": [{"backendRefs": [backend("web", 80)]}]}),
+            ))
+            .rt(route(
+                "ns",
+                "remote",
+                1,
+                json!({"parentRefs": parent, "rules": [{"backendRefs": [backend("web", 80)]}]}),
+            ))
+            .run();
+        // "Same" is the ListenerSet's namespace.
+        assert_eq!(
+            route_cond(&d, &rkey("other", "local"), "Accepted"),
+            tf("True", "Accepted")
+        );
+        assert_eq!(
+            route_cond(&d, &rkey("ns", "remote"), "Accepted"),
+            tf("False", "NotAllowedByListeners")
+        );
+        assert_eq!(ls_listener(&d, "other", "ls", "same").attached_routes, 1);
+        assert!(d.referenced.services.contains(&ServiceKey {
+            namespace: "other".into(),
+            name: "web".into()
+        }));
+    }
+
+    #[test]
+    fn listener_set_unsupported_protocol_with_kinds() {
+        let d = World::new()
+            .gw(parent_gateway("All"))
+            .ls(listener_set(
+                "ns",
+                "ls",
+                1,
+                json!({"name": "gw"}),
+                json!([{"name": "tls", "port": 443, "protocol": "TLS", "hostname": "t.example.com",
+                        "allowedRoutes": {"kinds": [{"kind": "HTTPRoute"}]}, "tls": {"mode": "Passthrough"}}]),
+            ))
+            .run();
+        assert_eq!(
+            ls_listener_cond(&d, "ns", "ls", "tls", "ResolvedRefs"),
+            tf("False", "InvalidRouteKinds")
+        );
+        assert_eq!(
+            ls_listener_cond(&d, "ns", "ls", "tls", "Accepted"),
+            tf("False", "UnsupportedProtocol")
+        );
+    }
+
+    #[test]
+    fn listener_sets_of_unaccepted_gateways() {
+        let mut g = parent_gateway("All");
+        g.spec.listeners = vec![
+            serde_json::from_value(json!({"name": "x", "port": 80, "protocol": "UDP"})).unwrap(),
+        ];
+        let d = World::new()
+            .gw(g)
+            .ls(listener_set(
+                "ns",
+                "ls",
+                1,
+                json!({"name": "gw"}),
+                json!([http_listener("l", 80, None)]),
+            ))
+            .run();
+        assert_eq!(
+            ls_cond(&d, "ns", "ls", "Accepted"),
+            tf("False", "ParentNotAccepted")
+        );
+        assert_eq!(attached_sets(&d), Some(0));
+        // A Gateway without an address: the ListenerSet is accepted, not programmed.
+        let mut w = grouped_world()
+            .gw(port_80("other", -1))
+            .gw(parent_gateway("All"))
+            .ls(listener_set(
+                "ns",
+                "ls",
+                1,
+                json!({"name": "gw"}),
+                json!([http_listener("l", 80, None)]),
+            ));
+        w.options.addresses.clear();
+        let d = w.run();
+        assert_eq!(ls_cond(&d, "ns", "ls", "Accepted"), tf("True", "Accepted"));
+        assert_eq!(
+            ls_cond(&d, "ns", "ls", "Programmed"),
+            tf("False", "ParentNotProgrammed")
+        );
+        // Listeners of a group Gateway's ListenerSet use the group's servers.
+        let d = grouped_world()
+            .gw(parent_gateway("All"))
+            .ls(listener_set("ns", "ls", 1, json!({"name": "gw"}), json!([http_listener("l", 80, Some("ls.example.com"))])))
+            .rt(route("ns", "r", 0, json!({"parentRefs": [ls_ref("ls")], "rules": [{"backendRefs": [backend("web", 80)]}]})))
+            .run();
+        assert_eq!(upstream_services(&d, "gw-a"), vec!["web"]);
+        assert!(d.server_locations["http"].is_empty());
+    }
+
+    #[test]
+    fn secrets_of_listener_sets_that_are_not_allowed_are_not_watched() {
+        let https = |secret: &str| {
+            json!([{"name": "l", "port": 443, "protocol": "HTTPS", "hostname": "h.example.com",
+                    "tls": {"certificateRefs": [{"name": secret}]}}])
+        };
+        let w = World::new()
+            .gw(parent_gateway("Same"))
+            .ls(listener_set(
+                "ns",
+                "in",
+                1,
+                json!({"name": "gw"}),
+                https("in-cert"),
+            ))
+            .ls(listener_set(
+                "other",
+                "out",
+                2,
+                json!({"name": "gw", "namespace": "ns"}),
+                https("out-cert"),
+            ));
+        let refs = referenced(&w.input());
+        assert!(refs.secrets.contains(&SecretKey::new("ns", "in-cert")));
+        assert!(!refs.secrets.contains(&SecretKey::new("other", "out-cert")));
+    }
+
+    #[test]
+    fn backend_tls_for_listener_set_routes_of_a_group_gateway() {
+        let mut gw = parent_gateway("Same");
+        gw.spec.tls = Some(
+            serde_json::from_value(json!({
+                "backend": {"clientCertificateRef": {"name": "client"}}
+            }))
+            .unwrap(),
+        );
+        let mut w = grouped_world()
+            .gw(gw)
+            .ls(listener_set(
+                "ns",
+                "ls",
+                1,
+                json!({"name": "gw"}),
+                json!([http_listener("l", 80, Some("ls.example.com"))]),
+            ))
+            .rt(route(
+                "ns",
+                "r",
+                0,
+                json!({"parentRefs": [ls_ref("ls")], "rules": [{"backendRefs": [backend("secure", 443)]}]}),
+            ));
+        w.service(tls_service("secure", None));
+        w.policies.push(Arc::new(btls_policy(
+            "p",
+            0,
+            "secure",
+            Some("btls"),
+            "secure.example.com",
+        )));
+        w.ca_config_map(Some(cert_pem()));
+        w.secret("ns", "client");
+        let d = w.run();
+        // On the group's server, with the Gateway's client certificate.
+        let l = locations(&d, "gw-a")[0];
+        let tls = d.upstreams[l.upstream.as_ref().unwrap()]
+            .tls
+            .clone()
+            .unwrap();
+        assert_eq!(tls.sni, "secure.example.com");
+        assert_eq!(
+            tls.client_cert,
+            Some((cert_pem().to_string(), key_pem().to_string()))
+        );
+        assert!(d.server_locations["http"].is_empty());
+        // The policy's ancestor is the ListenerSet's Gateway.
+        let ancestors = &d.status.policies[&ObjectKey::new("ns", "p")].ancestors;
+        assert_eq!(ancestors.len(), 1);
+        assert_eq!(ancestors[0].ancestor_ref.name, "gw");
+        assert_eq!(policy_cond(&d, "p", "Accepted"), tf("True", "Accepted"));
+        assert_eq!(
+            gateway_cond(&d, "gw", "ResolvedRefs"),
+            tf("True", "ResolvedRefs")
+        );
+        assert!(d.referenced.services.contains(&ServiceKey {
+            namespace: "ns".into(),
+            name: "secure".into()
+        }));
+    }
+
     // ---- GRPCRoutes ----
 
     /// A GRPCRoute in `ns` with parentRef `gw` (same namespace) and `spec` merged in.
@@ -5621,5 +7185,49 @@ mod tests {
             grpc_cond(&d, &rkey("ns", "b"), "Accepted"),
             tf("False", "NoMatchingListenerHostname")
         );
+    }
+
+    #[test]
+    fn grpc_routes_attach_to_listener_sets() {
+        let d = World::h2()
+            .gw(parent_gateway("Same"))
+            .ls(listener_set(
+                "ns",
+                "ls",
+                1,
+                json!({"name": "gw"}),
+                json!([http_listener("ls", 80, Some("ls.example.com"))]),
+            ))
+            .grt(grpc_route(
+                "ns",
+                "g",
+                0,
+                json!({"parentRefs": [ls_ref("ls")],
+                       "rules": [{"matches": [{"method": {"service": "pkg.Svc", "method": "Get"}}],
+                                  "backendRefs": [backend("grpc", 9000)]}]}),
+            ))
+            .run();
+        assert_eq!(
+            grpc_cond(&d, &rkey("ns", "g"), "Accepted"),
+            tf("True", "Accepted")
+        );
+        let parent = &d.status.grpc_routes[&rkey("ns", "g")].parents[0];
+        assert_eq!(parent.parent_ref.kind.as_deref(), Some("ListenerSet"));
+        assert_eq!(
+            hosts(&d, "http"),
+            vec![(
+                Some("ls.example.com".to_string()),
+                "=/pkg.Svc/Get".to_string()
+            )]
+        );
+        let l = ls_listener(&d, "ns", "ls", "ls");
+        assert_eq!(l.attached_routes, 1);
+        let kinds: Vec<&str> = l
+            .supported_kinds
+            .iter()
+            .flatten()
+            .map(|k| k.kind.as_str())
+            .collect();
+        assert_eq!(kinds, vec!["HTTPRoute", "GRPCRoute"]);
     }
 }

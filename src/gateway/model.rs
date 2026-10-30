@@ -8,12 +8,13 @@ use std::sync::Arc;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
 use tokio::sync::{broadcast, oneshot};
 
-use crate::config::UpstreamConfig;
+use crate::config::{GatewayGroup, UpstreamConfig};
 use crate::gateway::api::backendtlspolicies::{BackendTlsPolicy, BackendTlsPolicyStatus};
 use crate::gateway::api::gatewayclasses::{GatewayClass, GatewayClassStatus};
 use crate::gateway::api::gateways::{Gateway, GatewayStatus};
 use crate::gateway::api::grpcroutes::GrpcRoute;
 use crate::gateway::api::httproutes::{HttpRoute, HttpRouteStatus};
+use crate::gateway::api::listenersets::{ListenerSet, ListenerSetStatus};
 use crate::gateway::api::referencegrants::ReferenceGrant;
 use crate::types::{ServiceKey, UpstreamOptions, UpstreamTls};
 
@@ -49,7 +50,7 @@ impl RouteKind {
     }
 }
 
-/// A namespaced object: a Gateway, a route or a Secret.
+/// A namespaced object: a Gateway, a ListenerSet, a route or a Secret.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectKey {
     pub namespace: String,
@@ -72,6 +73,7 @@ impl fmt::Display for ObjectKey {
 }
 
 pub type GatewayKey = ObjectKey;
+pub type ListenerSetKey = ObjectKey;
 pub type RouteKey = ObjectKey;
 pub type SecretKey = ObjectKey;
 pub type ConfigMapKey = ObjectKey;
@@ -114,10 +116,14 @@ pub struct TranslateOptions {
     /// TCP check).
     pub health_check: Option<String>,
     pub cluster_domain: String,
-    /// Pingap servers the provider may list locations in; empty: every stored server.
+    /// The shared group: Pingap servers the provider may list locations of Gateways
+    /// without a group of their own in; empty: every stored server not in a group.
     pub servers: Vec<String>,
-    /// Written to `status.addresses` of accepted Gateways (IP addresses or host names).
+    /// The addresses of the shared group, written to `status.addresses` of its
+    /// accepted Gateways (IP addresses or host names).
     pub addresses: Vec<String>,
+    /// Server groups given to one Gateway each.
+    pub groups: Vec<GatewayGroup>,
 }
 
 /// A consistent snapshot to translate. Lists are in no particular order; the
@@ -127,6 +133,7 @@ pub struct TranslateInput<'a> {
     pub gateways: &'a [Arc<Gateway>],
     pub routes: &'a [Arc<HttpRoute>],
     pub grpc_routes: &'a [Arc<GrpcRoute>],
+    pub listener_sets: &'a [Arc<ListenerSet>],
     pub grants: &'a [Arc<ReferenceGrant>],
     /// Every namespace (for `allowedRoutes.namespaces.selector`).
     pub namespaces: &'a BTreeMap<String, Arc<Namespace>>,
@@ -249,6 +256,8 @@ pub struct DesiredStatus {
     pub classes: BTreeMap<String, GatewayClassStatus>,
     /// Gateways of those classes.
     pub gateways: BTreeMap<GatewayKey, GatewayStatus>,
+    /// ListenerSets whose parent is one of those Gateways.
+    pub listener_sets: BTreeMap<ListenerSetKey, ListenerSetStatus>,
     /// Routes with at least one parent of ours: only the `parents` entries with our
     /// `controllerName` are set; entries of other controllers are left as they are.
     pub routes: BTreeMap<RouteKey, HttpRouteStatus>,
@@ -369,6 +378,7 @@ pub trait GatewaySource: Send + Sync + 'static {
     fn gateways(&self) -> Vec<Arc<Gateway>>;
     fn routes(&self) -> Vec<Arc<HttpRoute>>;
     fn grpc_routes(&self) -> Vec<Arc<GrpcRoute>>;
+    fn listener_sets(&self) -> Vec<Arc<ListenerSet>>;
     fn grants(&self) -> Vec<Arc<ReferenceGrant>>;
     fn backend_tls_policies(&self) -> Vec<Arc<BackendTlsPolicy>>;
     fn namespaces(&self) -> BTreeMap<String, Arc<Namespace>>;
@@ -408,6 +418,11 @@ pub trait StatusPublisher: Send + Sync + 'static {
         gateway: &Gateway,
         status: &GatewayStatus,
     ) -> impl Future<Output = anyhow::Result<bool>> + Send;
+    fn publish_listener_set(
+        &self,
+        listener_set: &ListenerSet,
+        status: &ListenerSetStatus,
+    ) -> impl Future<Output = anyhow::Result<bool>> + Send;
     /// `status.parents` entries of other controllers are kept.
     fn publish_route(
         &self,
@@ -441,6 +456,9 @@ impl<T: GatewaySource> GatewaySource for Arc<T> {
     }
     fn grpc_routes(&self) -> Vec<Arc<GrpcRoute>> {
         (**self).grpc_routes()
+    }
+    fn listener_sets(&self) -> Vec<Arc<ListenerSet>> {
+        (**self).listener_sets()
     }
     fn grants(&self) -> Vec<Arc<ReferenceGrant>> {
         (**self).grants()

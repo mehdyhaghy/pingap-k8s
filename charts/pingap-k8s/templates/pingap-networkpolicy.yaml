@@ -32,6 +32,13 @@ spec:
         - port: {{ . }}
           protocol: TCP
         {{- end }}
+        {{- range (include "pingap-k8s.gatewayGroups" $ | fromJsonArray) }}
+        {{- range .ports }}
+        # Gateway server group listener port {{ int .port }}.
+        - port: {{ int .targetPort }}
+          protocol: TCP
+        {{- end }}
+        {{- end }}
     {{- with $np.adminFrom }}
     # Admin UI.
     - from:

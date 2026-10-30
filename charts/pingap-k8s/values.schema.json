@@ -108,7 +108,38 @@
         "externalName": { "type": "boolean" },
         "addresses": { "$ref": "#/$defs/stringList" },
         "healthCheck": { "type": "string" },
-        "maxTxnOps": { "type": "integer", "minimum": 2, "maximum": 1024 }
+        "maxTxnOps": { "type": "integer", "minimum": 2, "maximum": 1024 },
+        "groups": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "ports"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+                "maxLength": 63
+              },
+              "addresses": { "$ref": "#/$defs/stringList" },
+              "ports": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["port", "targetPort"],
+                  "properties": {
+                    "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+                    "targetPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+                    "tls": { "type": "boolean" },
+                    "settings": { "type": "object" }
+                  }
+                }
+              }
+            }
+          }
+        }
       }
     },
     "etcd": {

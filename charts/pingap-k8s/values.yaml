@@ -52,14 +52,15 @@ events:
   enabled: false
 
 gateway:
-  # Gateway API provider (off by default; needs the Gateway API v1.6.3
+  # Gateway API provider (off by default; needs the Gateway API v1.7.0
   # Standard-channel CRDs installed). Gateways of the GatewayClasses whose
-  # spec.controllerName is controllerName, and the HTTPRoutes attached to them,
-  # become Pingap locations, certificates, plugins and upstreams (names starting
-  # with "k8s-") in the same etcd prefix. Changing enabled, controllerName or
-  # maxTxnOps restarts the controller pods (the controller reads them at start
-  # only; the other settings apply live). Grants the chart's only ClusterRole
-  # (read the Gateway API resources and namespaces, patch their status).
+  # spec.controllerName is controllerName, their ListenerSets and the HTTPRoutes
+  # attached to them, become Pingap locations, certificates, plugins and
+  # upstreams (names starting with "k8s-") in the same etcd prefix. Changing
+  # enabled, controllerName or maxTxnOps restarts the controller pods (the
+  # controller reads them at start only; the other settings apply live). Grants
+  # the chart's only ClusterRole (read the Gateway API resources and namespaces,
+  # patch their status).
   enabled: false
   controllerName: pingap.io/gateway-controller
   # GatewayClass created by the chart (cluster-scoped); empty: none.
@@ -85,6 +86,28 @@ gateway:
   # Written to status.addresses of accepted Gateways: IPs or hostnames clients
   # use to reach Pingap.
   addresses: []
+  # Server groups, each given to one Gateway at a time, so the routes of a
+  # Gateway with a group of its own are never mixed with those of other
+  # Gateways (servers and addresses above are the shared group of the others).
+  # A group is Pingap servers "gw-<name>-<port>" on container ports of their
+  # own (added to pingap.seed.config, which is only written into an empty etcd
+  # prefix: add them by hand to an existing one and restart Pingap) and, with
+  # pingap.deploy, a Service "<release>-pingap-gw-<name>" (same type and
+  # annotations as pingap.service) mapping each listener port onto its server.
+  # The group's address is that Service's DNS name unless addresses is set.
+  # A Gateway keeps the group it has (its status.addresses); the oldest
+  # Gateways without one take the free groups; a Gateway whose spec.addresses
+  # are a group's addresses gets that group.
+  #   - name: a
+  #     ports:
+  #       - port: 80          # Gateway listener port (Service port)
+  #         targetPort: 9080  # port of the Pingap server
+  #       - port: 443
+  #         targetPort: 9443
+  #         tls: true         # HTTPS listeners (global_certificates server)
+  #         settings: {}      # more fields of the Pingap server, e.g. enabled_h2
+  #     addresses: []
+  groups: []
   # Pingap health_check of generated upstreams, e.g.
   # "http://k8s/healthz?connection_timeout=1s&check_frequency=5s".
   # Empty: Pingap's default TCP check.
