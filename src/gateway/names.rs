@@ -6,7 +6,7 @@
 //! same text (`a-b`/`c` and `a`/`b-c`, `a.b` and `a-b`) still differ in the hash. Owners
 //! are found from the `remark`, never parsed back out of a name.
 
-use crate::types::{PortRef, ServiceRef};
+use crate::types::{PortRef, ServiceRef, UpstreamTls};
 
 use super::model::{BackendKind, OWNED_PREFIX, RouteKey, RouteKind, SecretKey};
 
@@ -77,6 +77,42 @@ pub fn split_upstream_name(
     let mut parts = vec![namespace, service, "split"];
     parts.extend(suffix);
     build(&parts, &hash)
+}
+
+/// The TLS variant of the upstream `name` (from [`upstream_name`] or
+/// [`split_upstream_name`]): `<name without its hash>-tls-<h8>`, hashed over `name` and
+/// every TLS field (SNI, CA bundle, client certificate and key), so a changed CA or a
+/// rotated client certificate is a new upstream. The plain and the TLS upstream of the
+/// same backends never share a name.
+pub fn tls_upstream_name(name: &str, tls: &UpstreamTls) -> String {
+    let (client_cert, client_key) = tls
+        .client_cert
+        .as_ref()
+        .map_or(("", ""), |(c, k)| (c.as_str(), k.as_str()));
+    let hash = fnv1a(&[
+        "tls",
+        name,
+        &tls.sni,
+        if tls.ca.is_some() { "ca" } else { "system" },
+        tls.ca.as_deref().unwrap_or(""),
+        if tls.client_cert.is_some() {
+            "client"
+        } else {
+            "anonymous"
+        },
+        client_cert,
+        client_key,
+    ]);
+    let readable = name
+        .rsplit_once('-')
+        .map_or(name, |(head, _)| head)
+        .strip_prefix(OWNED_PREFIX)
+        .unwrap_or(name);
+    let mut out = String::from(OWNED_PREFIX);
+    out.push_str(readable);
+    out.push_str("-tls-");
+    out.push_str(&hash);
+    out
 }
 
 /// The HTTP/2 cleartext variant of a generated upstream name (from [`upstream_name`] or
@@ -232,6 +268,7 @@ fn fnv1a(parts: &[&str]) -> String {
 mod tests {
     use super::*;
     use crate::types::ServiceKey;
+    use std::collections::BTreeSet;
 
     fn route(ns: &str, name: &str) -> RouteKey {
         RouteKey::new(ns, name)
@@ -452,5 +489,53 @@ mod tests {
         let b = loc(&route("ns", &format!("{long}2")), None, "");
         assert_ne!(a, b);
         assert_eq!(sanitize(""), "x");
+    }
+
+    #[test]
+    fn tls_upstream_names() {
+        let base = upstream_name("ns", "api", &PortRef::Number(443), BackendKind::Pods, None);
+        let tls = UpstreamTls {
+            sni: "api.example.com".into(),
+            ca: Some("CA".into()),
+            client_cert: None,
+        };
+        let name = tls_upstream_name(&base, &tls);
+        assert!(name.starts_with("k8s-ns-api-443-tls-"), "{name}");
+        assert_eq!(name.len(), "k8s-ns-api-443-tls-".len() + 8);
+        assert_ne!(name, base);
+        assert_eq!(name, tls_upstream_name(&base, &tls.clone()));
+        let other_ca = UpstreamTls {
+            ca: Some("CA2".into()),
+            ..tls.clone()
+        };
+        let system = UpstreamTls {
+            ca: None,
+            ..tls.clone()
+        };
+        let empty_ca = UpstreamTls {
+            ca: Some(String::new()),
+            ..tls.clone()
+        };
+        let other_sni = UpstreamTls {
+            sni: "x.example.com".into(),
+            ..tls.clone()
+        };
+        let client = UpstreamTls {
+            client_cert: Some(("C".into(), "K".into())),
+            ..tls.clone()
+        };
+        let rotated = UpstreamTls {
+            client_cert: Some(("C2".into(), "K2".into())),
+            ..tls.clone()
+        };
+        let names: BTreeSet<String> = [
+            &tls, &other_ca, &system, &empty_ca, &other_sni, &client, &rotated,
+        ]
+        .into_iter()
+        .map(|t| tls_upstream_name(&base, t))
+        .collect();
+        assert_eq!(names.len(), 7);
+        let split_base = split_upstream_name(&[], BackendKind::Pods, None);
+        assert_ne!(tls_upstream_name(&split_base, &tls), name);
     }
 }

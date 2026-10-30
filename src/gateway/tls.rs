@@ -1,4 +1,5 @@
-//! Listener certificate Secrets into the PEM text of Pingap certificates.
+//! Listener certificate Secrets into the PEM text of Pingap certificates, and CA bundles
+//! (BackendTLSPolicy `caCertificateRefs`) into the PEM text of a Pingap upstream `ca`.
 //!
 //! The PEM is checked here, because Pingap rejects the whole config reload when one
 //! certificate does not parse.
@@ -67,6 +68,60 @@ pub fn certificate_from_secret(secret: &Secret) -> Result<(String, String), Stri
     }
     PrivateKeyDer::from_pem_slice(tls_key.as_bytes()).map_err(|e| format!("{TLS_KEY}: {e}"))?;
     Ok((certs, tls_key))
+}
+
+/// The `CERTIFICATE` blocks of a CA bundle (at least one), re-encoded, as the PEM text of a
+/// Pingap upstream `ca`. Pingap refuses an upstream whose `ca` does not parse, so every
+/// block must decode and hold a DER certificate structure; other blocks and text around
+/// them are dropped. The error is the reason, for a condition message.
+pub fn ca_bundle(text: &str) -> Result<String, String> {
+    let blocks = pem::parse_many(text).map_err(|e| e.to_string())?;
+    let lf = pem::EncodeConfig::new().set_line_ending(pem::LineEnding::LF);
+    let mut out = String::new();
+    for block in blocks.iter().filter(|b| b.tag() == "CERTIFICATE") {
+        if !is_certificate_der(block.contents()) {
+            return Err("a CERTIFICATE block does not hold a DER certificate".into());
+        }
+        out.push_str(&pem::encode_config(block, lf));
+    }
+    if out.is_empty() {
+        return Err("holds no PEM certificate".into());
+    }
+    Ok(out)
+}
+
+/// Whether `der` is a DER SEQUENCE spanning all of it that starts with two more SEQUENCEs
+/// (`Certificate ::= SEQUENCE { tbsCertificate SEQUENCE { ... }, signatureAlgorithm, ... }`
+/// with `tbsCertificate` starting with its `[0]` version or `serialNumber`). A shape
+/// check only: enough to tell a certificate from other data.
+fn is_certificate_der(der: &[u8]) -> bool {
+    /// `(tag, content, rest)` of the first DER element.
+    fn element(der: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+        let (&tag, rest) = der.split_first()?;
+        let (&first, rest) = rest.split_first()?;
+        let (len, rest) = if first < 0x80 {
+            (usize::from(first), rest)
+        } else {
+            let width = usize::from(first & 0x7f);
+            if width == 0 || width > 4 || rest.len() < width {
+                return None;
+            }
+            let (bytes, rest) = rest.split_at(width);
+            (
+                bytes.iter().fold(0usize, |l, b| l << 8 | usize::from(*b)),
+                rest,
+            )
+        };
+        (rest.len() >= len).then(|| (tag, &rest[..len], &rest[len..]))
+    }
+    const SEQUENCE: u8 = 0x30;
+    let Some((SEQUENCE, certificate, [])) = element(der) else {
+        return false;
+    };
+    let Some((SEQUENCE, tbs, _)) = element(certificate) else {
+        return false;
+    };
+    element(tbs).is_some()
 }
 
 #[cfg(test)]
@@ -310,5 +365,24 @@ pub(crate) mod tests {
             .unwrap()
             .insert(TLS_CERT.into(), ByteString(vec![0xff, 0xfe]));
         assert!(certificate_from_secret(&not_utf8).is_err());
+    }
+
+    #[test]
+    fn ca_bundle_keeps_certificates_only() {
+        let bundle = format!("note\n{}{}", cert_pem(), pem_text("X509 CRL", "AAAA"));
+        assert_eq!(ca_bundle(&bundle), Ok(cert_pem().to_string()));
+        let two = format!("{0}{0}", cert_pem());
+        assert_eq!(ca_bundle(&two), Ok(two.clone()));
+    }
+
+    #[test]
+    fn ca_bundle_errors() {
+        assert!(ca_bundle("").is_err());
+        assert!(ca_bundle("not pem").is_err());
+        assert!(ca_bundle(key_pem()).is_err(), "a key is not a CA");
+        // Valid base64 that is not a certificate.
+        assert!(ca_bundle(&pem_text("CERTIFICATE", "AAAA")).is_err());
+        // Broken base64.
+        assert!(ca_bundle(&pem_text("CERTIFICATE", "A*A=")).is_err());
     }
 }

@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use etcd_client::Client;
 use pingap_k8s::etcd::{EtcdError, EtcdWriter, MAX_CAS_RETRIES, parse_etcd_url};
-use pingap_k8s::types::{AddrsWriter, WriteOutcome};
+use pingap_k8s::types::{AddrsWriter, UpstreamTls, WriteOutcome};
 
 /// A writer under a prefix of its own, or `None` when no test etcd is configured.
 async fn writer(test: &str) -> Option<EtcdWriter> {
@@ -126,7 +126,7 @@ async fn created_entry_gets_health_check_once() {
     };
     let key = w.upstream_key("k8s-api");
     let hc = "http://api/healthz?check_frequency=5s";
-    w.write_upstream("k8s-api", &s(&["10.0.0.1:80"]), Some(hc), None)
+    w.write_upstream("k8s-api", &s(&["10.0.0.1:80"]), Some(hc), None, None)
         .await
         .unwrap();
     let (value, _) = get(&w.client(), &key).await.unwrap();
@@ -137,7 +137,7 @@ async fn created_entry_gets_health_check_once() {
     // An existing entry only gets its addrs replaced, whatever health check is asked for.
     let edited = value.replace("check_frequency=5s", "check_frequency=9s");
     put(&w.client(), &key, &edited).await;
-    w.write_upstream("k8s-api", &s(&["10.0.0.2:80"]), Some(hc), None)
+    w.write_upstream("k8s-api", &s(&["10.0.0.2:80"]), Some(hc), None, None)
         .await
         .unwrap();
     let (value, _) = get(&w.client(), &key).await.unwrap();
@@ -152,7 +152,7 @@ async fn h2c_upstreams_get_alpn_once() {
     };
     // Created with it.
     let key = w.upstream_key("k8s-grpc");
-    w.write_upstream("k8s-grpc", &s(&["10.0.0.1:9000"]), None, Some("H2"))
+    w.write_upstream("k8s-grpc", &s(&["10.0.0.1:9000"]), None, None, Some("H2"))
         .await
         .unwrap();
     let (value, _) = get(&w.client(), &key).await.unwrap();
@@ -162,7 +162,7 @@ async fn h2c_upstreams_get_alpn_once() {
     );
     // Same addrs and alpn: nothing to write.
     let outcome = w
-        .write_upstream("k8s-grpc", &s(&["10.0.0.1:9000"]), None, Some("H2"))
+        .write_upstream("k8s-grpc", &s(&["10.0.0.1:9000"]), None, None, Some("H2"))
         .await
         .unwrap();
     assert_eq!(outcome, WriteOutcome::Unchanged);
@@ -176,7 +176,7 @@ async fn h2c_upstreams_get_alpn_once() {
     )
     .await;
     let outcome = w
-        .write_upstream("api", &s(&["10.0.0.1:80"]), None, Some("H2"))
+        .write_upstream("api", &s(&["10.0.0.1:80"]), None, None, Some("H2"))
         .await
         .unwrap();
     assert!(
@@ -196,7 +196,7 @@ async fn h2c_upstreams_get_alpn_once() {
     )
     .await;
     let outcome = w
-        .write_upstream("api", &s(&["10.0.0.2:80"]), None, Some("H2"))
+        .write_upstream("api", &s(&["10.0.0.2:80"]), None, None, Some("H2"))
         .await
         .unwrap();
     assert!(
@@ -206,6 +206,51 @@ async fn h2c_upstreams_get_alpn_once() {
     let (value, _) = get(&w.client(), &key).await.unwrap();
     assert!(value.contains("alpn = \"H1\""), "{value}");
     assert!(value.contains("10.0.0.2:80"), "{value}");
+}
+
+#[tokio::test]
+async fn created_entry_gets_tls_fields() {
+    let Some(w) = writer("tls").await else {
+        return;
+    };
+    let key = w.upstream_key("k8s-api-tls");
+    let tls = UpstreamTls {
+        sni: "api.example.com".into(),
+        ca: Some("CA PEM".into()),
+        client_cert: Some(("CERT PEM".into(), "KEY PEM".into())),
+    };
+    w.write_upstream(
+        "k8s-api-tls",
+        &s(&["10.0.0.1:8443"]),
+        None,
+        Some(&tls),
+        None,
+    )
+    .await
+    .unwrap();
+    let (value, _) = get(&w.client(), &key).await.unwrap();
+    let table: toml::Table = toml::from_str(&value).unwrap();
+    let entry = &table["upstreams"]["k8s-api-tls"];
+    assert_eq!(entry["sni"].as_str(), Some("api.example.com"));
+    assert_eq!(entry["verify_cert"].as_bool(), Some(true));
+    assert_eq!(entry["ca"].as_str(), Some("CA PEM"));
+    assert_eq!(entry["client_cert"].as_str(), Some("CERT PEM"));
+    assert_eq!(entry["client_key"].as_str(), Some("KEY PEM"));
+    // Later writes replace the addrs only.
+    w.write_upstream(
+        "k8s-api-tls",
+        &s(&["10.0.0.2:8443"]),
+        None,
+        Some(&tls),
+        None,
+    )
+    .await
+    .unwrap();
+    let (value, _) = get(&w.client(), &key).await.unwrap();
+    assert!(
+        value.contains("10.0.0.2:8443") && value.contains("sni"),
+        "{value}"
+    );
 }
 
 #[tokio::test]

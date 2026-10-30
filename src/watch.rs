@@ -6,7 +6,13 @@
 //! - the Service object itself, selected by `metadata.name=<svc>` (port table).
 //!
 //! Both use `any_semantic()` (re-lists served from the apiserver watch cache)
-//! with bookmarks on. [`WatchRegistry::set_services`] starts watchers for new
+//! with bookmarks on. Streaming lists (`sendInitialEvents`, WatchList, on by default
+//! since Kubernetes 1.34) are not used: each list here is one Service or the few
+//! slices of one, already served from the watch cache, so they save next to nothing;
+//! and kube-runtime 4.2's `StreamingList` strategy sends no `Event::Init`, so an
+//! initial stream that restarts (a 410, or the stream ending) leaves the objects of
+//! the broken attempt in the reflector's buffer, including ones deleted since.
+//! [`WatchRegistry::set_services`] starts watchers for new
 //! Services, stops removed ones and leaves unchanged ones running, so a config
 //! reload never re-lists Services it already watches. The caller passes the
 //! union of the Services of all upstreams, which is what makes a watcher shared

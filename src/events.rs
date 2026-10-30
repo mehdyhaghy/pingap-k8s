@@ -85,6 +85,11 @@ impl Notice {
             ResolveWarning::ServiceMissing(key) => (key, "ServiceMissing"),
             ResolveWarning::PortNotInService { service, .. } => (service, "PortNotInService"),
             ResolveWarning::PortNotInSlices { service, .. } => (service, "PortNotInSlices"),
+            ResolveWarning::ExternalNameNotEnabled(key) => (key, "ExternalNameNotEnabled"),
+            ResolveWarning::ExternalNameInvalid { service, .. } => (service, "ExternalNameInvalid"),
+            ResolveWarning::TrafficPolicyIgnored { service, .. } => {
+                (service, "TrafficPolicyIgnored")
+            }
         };
         Notice {
             regarding: Regarding::Service {
@@ -376,6 +381,24 @@ mod tests {
                     port_name: "http".into(),
                 },
                 "PortNotInSlices",
+            ),
+            (
+                ResolveWarning::ExternalNameNotEnabled(key("web")),
+                "ExternalNameNotEnabled",
+            ),
+            (
+                ResolveWarning::ExternalNameInvalid {
+                    service: key("web"),
+                    reason: "spec.externalName is empty".into(),
+                },
+                "ExternalNameInvalid",
+            ),
+            (
+                ResolveWarning::TrafficPolicyIgnored {
+                    service: key("web"),
+                    setting: "trafficDistribution: PreferSameZone".into(),
+                },
+                "TrafficPolicyIgnored",
             ),
         ];
         for (warning, reason) in cases {

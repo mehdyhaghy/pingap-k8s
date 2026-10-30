@@ -1,5 +1,5 @@
 //! Gateway provider: the cluster-wide watches of GatewayClasses, Gateways, HTTPRoutes,
-//! GRPCRoutes, ReferenceGrants and Namespaces.
+//! GRPCRoutes, ReferenceGrants, BackendTLSPolicies and Namespaces.
 //!
 //! Each kind has one watcher feeding a [`reflector::Store`](kube::runtime::reflector::Store).
 //! Every object is kept, whatever its class: the controller decides what it handles, so a
@@ -35,6 +35,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use super::api::backendtlspolicies::BackendTlsPolicy;
 use super::api::gatewayclasses::GatewayClass;
 use super::api::gateways::Gateway;
 use super::api::grpcroutes::GrpcRoute;
@@ -65,16 +66,18 @@ pub enum WatchedKind {
     HttpRoute,
     GrpcRoute,
     ReferenceGrant,
+    BackendTlsPolicy,
     Namespace,
 }
 
 impl WatchedKind {
-    pub const ALL: [WatchedKind; 6] = [
+    pub const ALL: [WatchedKind; 7] = [
         WatchedKind::GatewayClass,
         WatchedKind::Gateway,
         WatchedKind::HttpRoute,
         WatchedKind::GrpcRoute,
         WatchedKind::ReferenceGrant,
+        WatchedKind::BackendTlsPolicy,
         WatchedKind::Namespace,
     ];
 
@@ -86,6 +89,7 @@ impl WatchedKind {
             WatchedKind::HttpRoute => "HTTPRoutes",
             WatchedKind::GrpcRoute => "GRPCRoutes",
             WatchedKind::ReferenceGrant => "ReferenceGrants",
+            WatchedKind::BackendTlsPolicy => "BackendTLSPolicies",
             WatchedKind::Namespace => "Namespaces",
         }
     }
@@ -98,6 +102,7 @@ impl WatchedKind {
             WatchedKind::HttpRoute => Some("httproutes.gateway.networking.k8s.io"),
             WatchedKind::GrpcRoute => Some("grpcroutes.gateway.networking.k8s.io"),
             WatchedKind::ReferenceGrant => Some("referencegrants.gateway.networking.k8s.io"),
+            WatchedKind::BackendTlsPolicy => Some("backendtlspolicies.gateway.networking.k8s.io"),
             WatchedKind::Namespace => None,
         }
     }
@@ -112,6 +117,9 @@ pub fn rbac_hint(kind: WatchedKind) -> &'static str {
         WatchedKind::GrpcRoute => "get/list/watch on grpcroutes.gateway.networking.k8s.io",
         WatchedKind::ReferenceGrant => {
             "get/list/watch on referencegrants.gateway.networking.k8s.io"
+        }
+        WatchedKind::BackendTlsPolicy => {
+            "get/list/watch on backendtlspolicies.gateway.networking.k8s.io"
         }
         WatchedKind::Namespace => "list/watch on namespaces (core API group \"\")",
     }
@@ -439,12 +447,13 @@ struct Inner {
     routes: ResourceWatch<HttpRoute>,
     grpc_routes: ResourceWatch<GrpcRoute>,
     grants: ResourceWatch<ReferenceGrant>,
+    policies: ResourceWatch<BackendTlsPolicy>,
     namespaces: ResourceWatch<Namespace>,
 }
 
 impl Inner {
     /// (kind, synced, up, missing) of every watch.
-    fn flags(&self) -> [(WatchedKind, bool, bool, bool); 6] {
+    fn flags(&self) -> [(WatchedKind, bool, bool, bool); 7] {
         fn f<K>(kind: WatchedKind, w: &ResourceWatch<K>) -> (WatchedKind, bool, bool, bool)
         where
             K: Resource + ResourceExt + Clone + DeserializeOwned + Debug + Send + Sync,
@@ -458,6 +467,7 @@ impl Inner {
             f(WatchedKind::HttpRoute, &self.routes),
             f(WatchedKind::GrpcRoute, &self.grpc_routes),
             f(WatchedKind::ReferenceGrant, &self.grants),
+            f(WatchedKind::BackendTlsPolicy, &self.policies),
             f(WatchedKind::Namespace, &self.namespaces),
         ]
     }
@@ -496,7 +506,7 @@ pub struct GatewayWatch {
 }
 
 impl GatewayWatch {
-    /// Starts the six watches. Must be called inside a Tokio runtime.
+    /// Starts the seven watches. Must be called inside a Tokio runtime.
     pub fn new(client: Client) -> Self {
         let (changes, _) = broadcast::channel(CHANGE_CHANNEL_CAPACITY);
         let inner = Inner {
@@ -510,12 +520,18 @@ impl GatewayWatch {
                 strip_metadata,
                 &changes,
             ),
+            policies: start_cluster(
+                &client,
+                WatchedKind::BackendTlsPolicy,
+                strip_metadata,
+                &changes,
+            ),
             namespaces: start_cluster(&client, WatchedKind::Namespace, strip_namespace, &changes),
             changes,
         };
         info!(
-            "watching GatewayClasses, Gateways, HTTPRoutes, GRPCRoutes, ReferenceGrants and \
-             Namespaces"
+            "watching GatewayClasses, Gateways, HTTPRoutes, GRPCRoutes, ReferenceGrants, \
+             BackendTLSPolicies and Namespaces"
         );
         GatewayWatch {
             inner: Arc::new(inner),
@@ -582,6 +598,10 @@ impl GatewaySource for GatewayWatch {
 
     fn grants(&self) -> Vec<Arc<ReferenceGrant>> {
         self.inner.grants.store().state()
+    }
+
+    fn backend_tls_policies(&self) -> Vec<Arc<BackendTlsPolicy>> {
+        self.inner.policies.store().state()
     }
 
     fn namespaces(&self) -> BTreeMap<String, Arc<Namespace>> {
@@ -758,10 +778,11 @@ mod tests {
         assert!(watch.routes().is_empty());
         assert!(watch.grpc_routes().is_empty());
         assert!(watch.grants().is_empty());
+        assert!(watch.backend_tls_policies().is_empty());
         assert!(watch.namespaces().is_empty());
         assert!(watch.missing_crds().is_empty());
         let states = watch.watch_states();
-        assert_eq!(states.len(), 6);
+        assert_eq!(states.len(), 7);
         assert!(states.iter().all(|s| !s.synced && !s.up && !s.crd_missing));
     }
 }

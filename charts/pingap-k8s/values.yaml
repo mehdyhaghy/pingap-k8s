@@ -42,7 +42,8 @@ rbac:
 
 events:
   # Post Kubernetes Events (events.k8s.io/v1, reportingController "pingap-k8s")
-  # for resolve warnings (ServiceMissing, PortNotInService, PortNotInSlices) and
+  # for resolve warnings (ServiceMissing, PortNotInService, PortNotInSlices,
+  # ExternalNameNotEnabled, ExternalNameInvalid, TrafficPolicyIgnored) and
   # drain fallbacks on the Service, and for MalformedUpstream and
   # EtcdUnreachable/EtcdRecovered on the controller Pod. This is the controller's
   # only write permission in Kubernetes: with rbac.create, the Roles above also
@@ -55,9 +56,10 @@ gateway:
   # Standard-channel CRDs installed). Gateways of the GatewayClasses whose
   # spec.controllerName is controllerName, and the HTTPRoutes attached to them,
   # become Pingap locations, certificates, plugins and upstreams (names starting
-  # with "k8s-") in the same etcd prefix. Changing enabled restarts the
-  # controller pods. Grants the chart's only ClusterRole (read the Gateway API
-  # resources and namespaces, patch their status).
+  # with "k8s-") in the same etcd prefix. Changing enabled, controllerName or
+  # maxTxnOps restarts the controller pods (the controller reads them at start
+  # only; the other settings apply live). Grants the chart's only ClusterRole
+  # (read the Gateway API resources and namespaces, patch their status).
   enabled: false
   controllerName: pingap.io/gateway-controller
   # GatewayClass created by the chart (cluster-scoped); empty: none.
@@ -68,6 +70,11 @@ gateway:
   # Restrict that Secret access to these names (Role resourceNames), e.g.
   # ["web-tls"]. Empty: every Secret in those namespaces.
   secretNames: []
+  # The gateway namespaces also get get/list/watch on configmaps, for the CA
+  # certificates (ca.crt) of BackendTLSPolicies. Restrict it to these names
+  # (Role resourceNames), e.g. ["backend-ca"]. Empty: every ConfigMap in those
+  # namespaces.
+  configMapNames: []
   # Pingap servers (already in etcd) listeners may be mapped onto, by port and
   # TLS (global_certificates). Empty: every stored server. The controller never
   # creates servers.
@@ -82,6 +89,10 @@ gateway:
   # "http://k8s/healthz?connection_timeout=1s&check_frequency=5s".
   # Empty: Pingap's default TCP check.
   healthCheck: ""
+  # Operations per etcd transaction of the Gateway writer ([gateway]
+  # max_txn_ops, 2 to 1024). Keep it below the etcd server's --max-txn-ops
+  # (128 by default).
+  maxTxnOps: 64
 
 etcd:
   # Pingap's etcd URL, the same string Pingap gets with --conf:
@@ -127,7 +138,7 @@ etcd:
     # Client certificate for the quickstart Pingap (pingap.etcdTlsSecret wins).
     pingapClientSecret: ""
     # Common name a peer certificate must have (--peer-cert-allowed-cn), so the
-    # client certificates, signed by the same CA, can not join as a member.
+    # client certificates, signed by the same CA, cannot join as a member.
     # Empty: the etcd fullname with autoGenerate (the generated server CN), no
     # check otherwise. Set it to your server certificate's CN.
     peerAllowedCN: ""
@@ -184,10 +195,23 @@ config:
     debounce_max: "2s"
     # Full re-list and re-reconcile, corrects drift.
     resync: "5m"
-    ipv4_only: false
+    # Address families written (default "primary"): "primary" (one address per
+    # pod, in the Service's primary family, spec.ipFamilies[0]), "ipv4", "ipv6"
+    # or "both" (a pod of a dual-stack Service is written once per family).
+    # Replaces the deprecated ipv4_only (true is "ipv4", false is "primary");
+    # set one of the two, not both. Left unset here so values that still set
+    # ipv4_only keep working.
+    # ip_family: primary
+    # ExternalName Services in services entries write <externalName>:<port>
+    # (Pingap resolves the name). Off: they are skipped with a warning in
+    # target "pods" mode. Anyone who can create Services in a listed namespace
+    # can then point the upstream at any host.
+    external_name: false
     # What the controller writes into Pingap's addrs: "pods" (ready pod IPs
-    # from EndpointSlices) or "service" (the Service DNS name; see README,
-    # "Upstream target"). Can be set per upstream as well.
+    # from EndpointSlices) or "service" (the Service's ClusterIP; its DNS name
+    # for a headless Service; see README, "Upstream target"). Can be set per
+    # upstream as well. "pods" ignores the Service's trafficDistribution and
+    # internalTrafficPolicy: Local (a TrafficPolicyIgnored warning is logged).
     target: pods
   # One entry per Pingap upstream the controller owns. Any [defaults] key can be
   # overridden per upstream. Example:
@@ -336,6 +360,10 @@ pingap:
     annotations: {}
     loadBalancerSourceRanges: []
     externalTrafficPolicy: ""
+    # Dual-stack: SingleStack, PreferDualStack or RequireDualStack, and the
+    # families in order (e.g. [IPv6, IPv4]). Empty: the cluster default.
+    ipFamilyPolicy: ""
+    ipFamilies: []
   admin:
     # Admin UI listener; its Service is always ClusterIP (use kubectl port-forward).
     port: 3018

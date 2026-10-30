@@ -860,10 +860,17 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
         let writer = Arc::clone(&self.writer);
         let upstream = name.to_string();
         let health_check = st.config.health_check.clone();
+        let tls = st.config.tls.clone();
         let alpn = h2c.then_some(crate::gateway::render::H2C_ALPN);
         let handle = self.inflight.spawn(async move {
             let result = writer
-                .write_upstream(&upstream, &desired, health_check.as_deref(), alpn)
+                .write_upstream(
+                    &upstream,
+                    &desired,
+                    health_check.as_deref(),
+                    tls.as_ref(),
+                    alpn,
+                )
                 .await;
             (upstream, desired, result)
         });
@@ -1006,9 +1013,11 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
 /// The Service a resolve warning is about.
 fn warning_service(w: &ResolveWarning) -> &ServiceKey {
     match w {
-        ResolveWarning::ServiceMissing(key) => key,
+        ResolveWarning::ServiceMissing(key) | ResolveWarning::ExternalNameNotEnabled(key) => key,
         ResolveWarning::PortNotInService { service, .. }
-        | ResolveWarning::PortNotInSlices { service, .. } => service,
+        | ResolveWarning::PortNotInSlices { service, .. }
+        | ResolveWarning::ExternalNameInvalid { service, .. }
+        | ResolveWarning::TrafficPolicyIgnored { service, .. } => service,
     }
 }
 
@@ -1141,6 +1150,7 @@ mod tests {
             upstream: &str,
             addrs: &[String],
             _health_check: Option<&str>,
+            _tls: Option<&crate::types::UpstreamTls>,
             alpn: Option<&str>,
         ) -> impl Future<Output = anyhow::Result<WriteOutcome>> + Send {
             lock(&self.alpns).push((upstream.to_string(), alpn.map(String::from)));
@@ -1218,7 +1228,8 @@ mod tests {
             options: UpstreamOptions {
                 include_not_ready: false,
                 drain_terminating: true,
-                ipv4_only: false,
+                ip_family: crate::types::IpFamily::Primary,
+                external_name: false,
                 debounce: Duration::from_millis(500),
                 debounce_max: Duration::from_secs(2),
                 target: UpstreamTarget::Pods,
@@ -1226,6 +1237,7 @@ mod tests {
             },
             health_check: None,
             h2c: false,
+            tls: None,
         }
     }
 

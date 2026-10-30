@@ -18,7 +18,8 @@
 //! matches. Regular expressions use the `regex` crate dialect, as for HTTPRoutes.
 //!
 //! What cannot be converted drops the rule, with the reason in the route status:
-//! `RequestMirror` filters (mirroring is not implemented for gRPC backends) and method
+//! `RequestMirror` filters (Pingap's `mirror` plugin copies requests with an HTTP/1.1
+//! client, which an h2c gRPC backend does not accept) and method
 //! values that are not valid gRPC names. Everything else is left to the HTTPRoute
 //! translation, which refuses the same things for both kinds (regular expression header
 //! matches, `ExtensionRef` filters, filters on backendRefs).
@@ -96,7 +97,11 @@ fn convert_rule(rule: &GrpcRouteRules) -> Result<HttpRouteRules, String> {
         .flatten()
         .any(|f| f.r#type == GrpcRouteRulesFiltersType::RequestMirror)
     {
-        return Err("RequestMirror filters are not supported on GRPCRoutes".into());
+        return Err(
+            "RequestMirror filters are not supported on GRPCRoutes (Pingap mirrors over \
+             HTTP/1.1 only)"
+                .into(),
+        );
     }
     let matches = match rule.matches.as_deref() {
         None => None,

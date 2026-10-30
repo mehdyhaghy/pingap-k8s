@@ -2,16 +2,17 @@
 //! endpoint writer and the etcd store together.
 //!
 //! One task runs one `select!` loop. A pass is triggered by Gateway API object,
-//! Namespace, Secret and backend Service changes, etcd changes, settings changes
-//! (config reload), the deferred-retry timer and the resync tick, debounced like the
+//! Namespace, Secret, ConfigMap and backend Service changes, etcd changes, settings
+//! changes (config reload), the deferred-retry timer and the resync tick, debounced like the
 //! endpoint reconciler (500 ms after the last trigger, at most 2 s after the first).
 //! Promotion to leader and startup run a pass at once.
 //!
 //! A pass is level-triggered and does, in order:
 //! 1. wait until the Gateway API watches have listed once, translate a first time to
-//!    learn what the handled Gateways and routes reference, and point the Secret
-//!    watches at the referenced Secrets;
-//! 2. wait until every source has listed once: the Secret watches and the backend
+//!    learn what the handled Gateways and routes reference, and point the Secret and
+//!    ConfigMap watches at the referenced Secrets and BackendTLSPolicy CA ConfigMaps;
+//! 2. wait until every source has listed once: the Secret and ConfigMap watches and the
+//!    backend
 //!    Services (the endpoint writer watches those; a [`GeneratedUpstreams`] with the new
 //!    Service set returns `applied` once they listed). Nothing is planned, written or
 //!    deleted before that;
@@ -23,8 +24,8 @@
 //! 5. plan. The leader applies the plan; a failed apply (CAS conflict or etcd error)
 //!    re-reads and re-plans up to [`APPLY_ATTEMPTS`] times, then the pass is retried
 //!    with backoff (0.5 s doubling to 30 s);
-//! 6. the leader writes the status of the handled GatewayClasses, Gateways and
-//!    HTTPRoutes where it differs from the stored one.
+//! 6. the leader writes the status of the handled GatewayClasses, Gateways, HTTPRoutes
+//!    and BackendTLSPolicies where it differs from the stored one.
 //!
 //! Followers run steps 1 to 5 without applying, so their gauges and the endpoint
 //! writer's desired state are ready for a promotion; they never write to etcd or to the
@@ -241,6 +242,7 @@ struct Objects {
     routes: Vec<Arc<crate::gateway::api::httproutes::HttpRoute>>,
     grpc_routes: Vec<Arc<crate::gateway::api::grpcroutes::GrpcRoute>>,
     grants: Vec<Arc<crate::gateway::api::referencegrants::ReferenceGrant>>,
+    policies: Vec<Arc<crate::gateway::api::backendtlspolicies::BackendTlsPolicy>>,
     namespaces: BTreeMap<String, Arc<k8s_openapi::api::core::v1::Namespace>>,
 }
 
@@ -466,6 +468,7 @@ where
             routes: g.routes(),
             grpc_routes: g.grpc_routes(),
             grants: g.grants(),
+            policies: g.backend_tls_policies(),
             namespaces: g.namespaces(),
         }
     }
@@ -479,6 +482,7 @@ where
         let options = &settings.translate;
         let no_services = BTreeMap::new();
         let no_secrets = BTreeMap::new();
+        let no_config_maps = BTreeMap::new();
         let no_plugins = BTreeSet::new();
         let referenced = self.parts.logic.referenced(&TranslateInput {
             classes: &objects.classes,
@@ -489,11 +493,16 @@ where
             namespaces: &objects.namespaces,
             services: &no_services,
             secrets: &no_secrets,
+            policies: &objects.policies,
+            config_maps: &no_config_maps,
             servers: &[],
             plugins: &no_plugins,
             options,
         });
         self.parts.secrets.set_secrets(referenced.secrets.clone());
+        self.parts
+            .secrets
+            .set_config_maps(referenced.config_maps.clone());
         self.watched = referenced.services.clone();
 
         // Backend Services: the endpoint writer starts their watches and returns
@@ -527,6 +536,7 @@ where
                 })
                 .collect();
             let secrets = self.parts.secrets.secrets();
+            let config_maps = self.parts.secrets.config_maps();
             let desired = self.parts.logic.translate(&TranslateInput {
                 classes: &objects.classes,
                 gateways: &objects.gateways,
@@ -536,6 +546,8 @@ where
                 namespaces: &objects.namespaces,
                 services: &services,
                 secrets: &secrets,
+                policies: &objects.policies,
+                config_maps: &config_maps,
                 servers: &servers,
                 plugins: &plugins,
                 options,
@@ -700,6 +712,20 @@ where
                 }
             }
         }
+        for policy in &objects.policies {
+            let key = object_key(&policy.metadata);
+            let Some(want) = desired.status.policies.get(&key) else {
+                continue;
+            };
+            match status.publish_backend_tls_policy(policy, want).await {
+                Ok(true) => debug!(backendtlspolicy = %key, "BackendTLSPolicy status updated"),
+                Ok(false) => {}
+                Err(err) => warn!(
+                    backendtlspolicy = %key,
+                    "updating the BackendTLSPolicy status failed: {err:#}"
+                ),
+            }
+        }
     }
 }
 
@@ -783,15 +809,17 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use k8s_openapi::api::core::v1::{Namespace, Secret};
+    use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
+    use crate::gateway::api::backendtlspolicies::{BackendTlsPolicy, BackendTlsPolicyStatus};
 
     use crate::gateway::api::gatewayclasses::{GatewayClass, GatewayClassSpec, GatewayClassStatus};
     use crate::gateway::api::gateways::{Gateway, GatewayStatus};
     use crate::gateway::api::grpcroutes::GrpcRoute;
     use crate::gateway::api::httproutes::{HttpRoute, HttpRouteStatus};
     use crate::gateway::api::referencegrants::ReferenceGrant;
-    use crate::gateway::model::{Deferred, Expect, Op, SecretKey, Step, StoredEntry};
+    use crate::gateway::model::{ConfigMapKey, Deferred, Expect, Op, SecretKey, Step, StoredEntry};
     use crate::types::{PortRef, ServiceRef, ServiceSnapshot};
 
     fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -847,6 +875,9 @@ mod tests {
         fn grants(&self) -> Vec<Arc<ReferenceGrant>> {
             Vec::new()
         }
+        fn backend_tls_policies(&self) -> Vec<Arc<BackendTlsPolicy>> {
+            Vec::new()
+        }
         fn namespaces(&self) -> BTreeMap<String, Arc<Namespace>> {
             BTreeMap::new()
         }
@@ -862,6 +893,7 @@ mod tests {
         synced: AtomicBool,
         tx: broadcast::Sender<()>,
         wanted: Mutex<Vec<BTreeSet<SecretKey>>>,
+        wanted_config_maps: Mutex<Vec<BTreeSet<ConfigMapKey>>>,
     }
 
     impl SecretSource for FakeSecrets {
@@ -869,6 +901,12 @@ mod tests {
             lock(&self.wanted).push(keys);
         }
         fn secrets(&self) -> BTreeMap<SecretKey, Arc<Secret>> {
+            BTreeMap::new()
+        }
+        fn set_config_maps(&self, keys: BTreeSet<ConfigMapKey>) {
+            lock(&self.wanted_config_maps).push(keys);
+        }
+        fn config_maps(&self) -> BTreeMap<ConfigMapKey, Arc<ConfigMap>> {
             BTreeMap::new()
         }
         fn is_synced(&self) -> bool {
@@ -981,6 +1019,13 @@ mod tests {
         ) -> anyhow::Result<bool> {
             Ok(false)
         }
+        async fn publish_backend_tls_policy(
+            &self,
+            _policy: &BackendTlsPolicy,
+            _status: &BackendTlsPolicyStatus,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
     }
 
     #[derive(Default)]
@@ -1058,6 +1103,7 @@ mod tests {
             options: crate::config::Defaults::default().upstream_options(),
             health_check: None,
             h2c: false,
+            tls: None,
         }
     }
 
@@ -1114,6 +1160,7 @@ mod tests {
             synced: AtomicBool::new(setup.secrets_synced),
             tx: broadcast::channel(16).0,
             wanted: Mutex::new(Vec::new()),
+            wanted_config_maps: Mutex::new(Vec::new()),
         });
         let store = Arc::new(FakeStore::default());
         let status = Arc::new(FakeStatus::default());
@@ -1226,13 +1273,22 @@ mod tests {
             ..Setup::default()
         };
         let secret = SecretKey::new("apps", "tls");
+        let config_map = ConfigMapKey::new("apps", "ca");
         lock(&setup.logic.referenced).secrets.insert(secret.clone());
+        lock(&setup.logic.referenced)
+            .config_maps
+            .insert(config_map.clone());
         let h = start(setup);
         sleep_ms(5_000).await;
-        // The Secret watches follow the referenced Secrets, but nothing is planned.
+        // The Secret and ConfigMap watches follow the referenced objects, but nothing is
+        // planned.
         assert_eq!(
             lock(&h.secrets.wanted).last(),
             Some(&BTreeSet::from([secret]))
+        );
+        assert_eq!(
+            lock(&h.secrets.wanted_config_maps).last(),
+            Some(&BTreeSet::from([config_map]))
         );
         assert_eq!(h.plans(), 0);
 

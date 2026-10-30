@@ -49,12 +49,40 @@ pub struct ServiceRef {
     pub weight: Option<u32>,
 }
 
+/// TLS from Pingap to the backends of an upstream (a Gateway API BackendTLSPolicy):
+/// Pingap `sni`, `verify_cert = true`, `ca` and, for a backend that asks for a client
+/// certificate, `client_cert` / `client_key`. Written only when the entry is created; the
+/// generated name changes with it, so it is never updated in place.
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+pub struct UpstreamTls {
+    /// SNI and the name the backend certificate must match.
+    pub sni: String,
+    /// PEM CA bundle; `None`: the system trust store.
+    pub ca: Option<String>,
+    /// PEM certificate chain and private key presented to the backend.
+    pub client_cert: Option<(String, String)>,
+}
+
+/// Leaves the PEM text out (the private key must not reach logs).
+impl fmt::Debug for UpstreamTls {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UpstreamTls")
+            .field("sni", &self.sni)
+            .field("ca", &self.ca.as_ref().map(|_| "<PEM>"))
+            .field("client_cert", &self.client_cert.as_ref().map(|_| "<PEM>"))
+            .finish()
+    }
+}
+
 /// Per-upstream options after `[defaults]` and per-upstream overrides are merged.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpstreamOptions {
     pub include_not_ready: bool,
     pub drain_terminating: bool,
-    pub ipv4_only: bool,
+    /// Which address families of the endpoints are written.
+    pub ip_family: IpFamily,
+    /// `ExternalName` Services contribute `<externalName>:<port>` (Pingap DNS discovery).
+    pub external_name: bool,
     pub debounce: Duration,
     pub debounce_max: Duration,
     pub target: UpstreamTarget,
@@ -62,6 +90,42 @@ pub struct UpstreamOptions {
     /// addresses, and the weights are scaled to a small total (Gateway API `backendRefs`
     /// semantics). Off: the weight is written on every address as it is.
     pub spread_weights: bool,
+}
+
+/// Address families written for an upstream (`ip_family`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IpFamily {
+    /// One address per endpoint: the Service's primary family (`spec.ipFamilies[0]`),
+    /// the other family only for endpoints that have no address in the primary one.
+    #[default]
+    Primary,
+    /// IPv4 addresses only.
+    Ipv4,
+    /// IPv6 addresses only.
+    Ipv6,
+    /// Every family: a pod of a dual-stack Service is written once per family.
+    Both,
+}
+
+impl IpFamily {
+    /// The config value: `primary`, `ipv4`, `ipv6` or `both`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IpFamily::Primary => "primary",
+            IpFamily::Ipv4 => "ipv4",
+            IpFamily::Ipv6 => "ipv6",
+            IpFamily::Both => "both",
+        }
+    }
+
+    /// Whether addresses of a family (`ipv6` true for IPv6) may be written at all.
+    pub fn allows(self, ipv6: bool) -> bool {
+        match self {
+            IpFamily::Primary | IpFamily::Both => true,
+            IpFamily::Ipv4 => !ipv6,
+            IpFamily::Ipv6 => ipv6,
+        }
+    }
 }
 
 /// What an upstream's `addrs` point at.
@@ -111,17 +175,19 @@ pub trait AddrsWriter: Send + Sync + 'static {
     ) -> impl Future<Output = anyhow::Result<WriteOutcome>> + Send;
 
     /// [`AddrsWriter::write_addrs`]; an entry it creates also gets `health_check`
-    /// (already validated). An existing entry's `health_check` is left alone. `alpn`
-    /// (Pingap's `"H2"` for h2c backends) is written into an entry that is created or has
-    /// no `alpn`; an `alpn` already stored is left alone.
+    /// (already validated) and the TLS fields of `tls`. An existing entry's fields other
+    /// than `addrs` are left alone, except `alpn` (Pingap's `"H2"` for HTTP/2 backends):
+    /// it is written into an entry that is created or has no `alpn`; an `alpn` already
+    /// stored is left alone.
     fn write_upstream(
         &self,
         upstream: &str,
         addrs: &[String],
         health_check: Option<&str>,
+        tls: Option<&UpstreamTls>,
         alpn: Option<&str>,
     ) -> impl Future<Output = anyhow::Result<WriteOutcome>> + Send {
-        let _ = (health_check, alpn);
+        let _ = (health_check, tls, alpn);
         self.write_addrs(upstream, addrs)
     }
 }
