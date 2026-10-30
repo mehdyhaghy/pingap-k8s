@@ -73,6 +73,7 @@ fn location(owner: &str, path: &str, upstream: &str) -> LocationEntry {
         rewrite: None,
         proxy_set_headers: vec![],
         plugins: vec![],
+        options: Default::default(),
     }
 }
 

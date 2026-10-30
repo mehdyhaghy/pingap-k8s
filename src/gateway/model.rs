@@ -149,6 +149,25 @@ pub struct LocationEntry {
     pub proxy_set_headers: Vec<String>,
     /// Names in run order; generated plugins are in [`Desired::plugins`].
     pub plugins: Vec<String>,
+    /// Retries and timeouts of the rule.
+    pub options: LocationOptions,
+}
+
+/// Pingap location settings from the `retry` and `timeouts` of a rule. `None` leaves
+/// the field out: no retry, and the timeouts of the upstream. Durations are in
+/// milliseconds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LocationOptions {
+    /// Retries of a connection that could not be established, each to another backend.
+    pub max_retries: Option<u8>,
+    /// The time from the start of the request after which no retry is made.
+    pub max_retry_window: Option<u64>,
+    pub connection_timeout: Option<u64>,
+    /// Pingap's `read_timeout` is per read: the wait for the response header and for
+    /// each piece of the body.
+    pub read_timeout: Option<u64>,
+    /// Per write, as `read_timeout`.
+    pub write_timeout: Option<u64>,
 }
 
 /// A generated Pingap plugin: `[plugins.<name>]` with `category` and its fields. Named

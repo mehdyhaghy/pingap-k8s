@@ -451,6 +451,7 @@ mod tests {
             rewrite: None,
             proxy_set_headers: vec![],
             plugins: vec![],
+            options: Default::default(),
         }
     }
 
