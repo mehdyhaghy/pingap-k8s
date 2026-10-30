@@ -102,8 +102,8 @@ fi
 # --- Gateway API CRDs (before the chart: it creates a GatewayClass) -------------
 # The Standard channel of the release the generated types come from
 # (scripts/gen-gateway-api.sh), checked against its pinned digest.
-GATEWAY_API_VERSION=v1.6.3
-GATEWAY_API_SHA256=356c2b8e286a964dc20995435659ad1095386329974793af10bbfe3eff977fe5
+GATEWAY_API_VERSION=v1.7.0
+GATEWAY_API_SHA256=4e2602c4cbe1afbc394d86f4ac6522e1a5263b01133bba1e40a6d1a549e753a1
 gateway_crds="$ROOT/target/e2e/gateway-api-$GATEWAY_API_VERSION-standard-install.yaml"
 mkdir -p "$(dirname "$gateway_crds")"
 if [[ ! -s "$gateway_crds" ]] || ! echo "$GATEWAY_API_SHA256  $gateway_crds" | shasum -a 256 -c - >/dev/null 2>&1; then

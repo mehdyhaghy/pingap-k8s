@@ -57,9 +57,9 @@ CONF_NAMESPACES=(gateway-conformance-infra gateway-conformance-app-backend gatew
 # The release the generated types come from (scripts/gen-gateway-api.sh): the
 # Standard CRDs with their pinned digest, and the conformance suite at the
 # commit of the tag.
-GATEWAY_API_VERSION=v1.6.3
-GATEWAY_API_SHA256=356c2b8e286a964dc20995435659ad1095386329974793af10bbfe3eff977fe5
-GATEWAY_API_COMMIT=c0836133e24073fcdcdbb1713aba3cc73a89d0b5
+GATEWAY_API_VERSION=v1.7.0
+GATEWAY_API_SHA256=4e2602c4cbe1afbc394d86f4ac6522e1a5263b01133bba1e40a6d1a549e753a1
+GATEWAY_API_COMMIT=e26d183dbbc1bb782b78addbd26faba03955c152
 
 log() { printf '[conformance] %s\n' "$*" >&2; }
 

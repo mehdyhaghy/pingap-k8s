@@ -28,7 +28,7 @@ etcd-client = { version = "0.21", features = ["tls", "tls-native-roots"] }
 futures = "0.3"
 humantime = "2"
 humantime-serde = "1"
-k8s-openapi = { version = "0.28", default-features = false, features = ["v1_32"] }
+k8s-openapi = { version = "0.28", default-features = false, features = ["v1_35"] }
 kube = { version = "4.2", default-features = false, features = ["client", "derive", "runtime", "rustls-tls"] }
 notify = "8"
 opentelemetry = { version = "0.33", default-features = false, features = ["metrics", "logs"] }

@@ -1,4 +1,4 @@
-// Generated from the Gateway API v1.6.3 Standard-channel CRD httproutes.gateway.networking.k8s.io
+// Generated from the Gateway API v1.7.0 Standard-channel CRD httproutes.gateway.networking.k8s.io
 // by scripts/gen-gateway-api.sh. Do not edit.
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
@@ -64,6 +64,8 @@ pub struct HttpRouteRules {
     pub matches: Option<Vec<HttpRouteRulesMatches>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<HttpRouteRulesRetry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeouts: Option<HttpRouteRulesTimeouts>,
 }
@@ -704,6 +706,16 @@ pub struct HttpRouteRulesMatchesQueryParams {
 pub enum HttpRouteRulesMatchesQueryParamsType {
     Exact,
     RegularExpression,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct HttpRouteRulesRetry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codes: Option<Vec<i64>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]

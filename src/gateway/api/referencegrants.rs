@@ -1,4 +1,4 @@
-// Generated from the Gateway API v1.6.3 Standard-channel CRD referencegrants.gateway.networking.k8s.io
+// Generated from the Gateway API v1.7.0 Standard-channel CRD referencegrants.gateway.networking.k8s.io
 // by scripts/gen-gateway-api.sh. Do not edit.
 
 use kube::CustomResource;

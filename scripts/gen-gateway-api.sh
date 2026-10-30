@@ -8,9 +8,9 @@
 # e2e manifests (tests/e2e) to the same release.
 set -euo pipefail
 
-GATEWAY_API_VERSION="${1:-v1.6.3}"
+GATEWAY_API_VERSION="${1:-v1.7.0}"
 KOPIUM="${KOPIUM:-kopium}"
-RESOURCES=(gatewayclasses gateways httproutes referencegrants)
+RESOURCES=(gatewayclasses gateways httproutes grpcroutes referencegrants backendtlspolicies listenersets)
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 out="$root/src/gateway/api"

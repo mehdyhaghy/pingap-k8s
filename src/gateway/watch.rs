@@ -54,7 +54,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 pub(crate) const LAST_APPLIED_ANNOTATION: &str = "kubectl.kubernetes.io/last-applied-configuration";
 
 /// The Gateway API release whose CRDs the provider expects.
-pub const GATEWAY_API_VERSION: &str = "v1.6.3";
+pub const GATEWAY_API_VERSION: &str = "v1.7.0";
 
 /// One watched kind, for logs, states and the 403 message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -702,7 +702,7 @@ mod tests {
         assert_eq!(classify_error(&api_error(404, "NotFound")), "not_found");
         let msg = missing_crd_message("Gateways", WatchedKind::Gateway.crd().unwrap());
         assert!(msg.contains("gateways.gateway.networking.k8s.io"), "{msg}");
-        assert!(msg.contains("v1.6.3 standard-install.yaml"), "{msg}");
+        assert!(msg.contains("v1.7.0 standard-install.yaml"), "{msg}");
         assert_eq!(WatchedKind::Namespace.crd(), None);
         assert!(WatchedKind::ALL.iter().all(|k| !rbac_hint(*k).is_empty()));
     }
