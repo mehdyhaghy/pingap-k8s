@@ -96,9 +96,14 @@
 //! server, host and match) is reached through Gateways with different client
 //! certificates, the Gateway of the first such parentRef of the route applies.
 //!
-//! Listener isolation is not implemented: a request for `a.example.com` that matches no
-//! route of an `a.example.com` listener can match a route of a `*.example.com` listener
-//! on the same server.
+//! **Listener isolation.** A request goes to the listener of a Gateway and port with
+//! the most specific hostname that matches it, and only that listener's routes serve it.
+//! A location of a less specific listener whose host a more specific listener of the
+//! same Gateway and port fully takes (`abc.example.com` of a listener without hostname,
+//! next to an `abc.example.com` listener) is left out; for every more specific listener
+//! hostname inside its host, the location gets a 404 copy (a `mock` plugin) on that
+//! hostname, tried after the locations of that hostname. Gateways that share a server
+//! are not isolated from each other.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv6Addr};
@@ -159,13 +164,14 @@ pub const KIND_SECRET: &str = "Secret";
 
 /// The features of the Gateway API conformance suite this provider implements, sorted
 /// as `status.supportedFeatures` must be.
-pub const SUPPORTED_FEATURES: [&str; 30] = [
+pub const SUPPORTED_FEATURES: [&str; 31] = [
     "BackendTLSPolicy",
     "GRPCRoute",
     "GRPCRouteNamedRouteRule",
     "GRPCRouteRequestHeaderModifier",
     "Gateway",
     "GatewayBackendClientCertificate",
+    "GatewayHTTPListenerIsolation",
     "GatewayStaticAddresses",
     "HTTPRoute",
     "HTTPRoute303RedirectStatusCode",
@@ -677,7 +683,19 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
                         .map(|(name, kind)| upstream_variant(name, kind, client_cert));
                     for server in &listener.servers {
                         for host in &hosts {
+                            let Some(fenced) =
+                                isolation(&listeners, attachment.listener, host.as_deref())
+                            else {
+                                continue;
+                            };
                             for m in &rule.matches {
+                                for inner in &fenced {
+                                    candidates.entry(server.clone()).or_default().push(
+                                        isolation_location(
+                                            kind, &key, age, rule, m, server, inner, listener,
+                                        ),
+                                    );
+                                }
                                 let mut candidate = build_location(
                                     kind,
                                     &key,
@@ -2104,6 +2122,78 @@ fn hosts_overlap(a: &[Option<String>], b: &[Option<String>]) -> bool {
     })
 }
 
+/// Whether every host of `inner` is a host of `outer` (`None` is every host).
+fn host_covers(outer: Option<&str>, inner: Option<&str>) -> bool {
+    match (outer, inner) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(outer), Some(inner)) => {
+            outer == inner
+                || outer
+                    .strip_prefix('*')
+                    .is_some_and(|suffix| inner.len() > suffix.len() && inner.ends_with(suffix))
+        }
+    }
+}
+
+/// Listener isolation: a request goes to the listener of its Gateway and port with the
+/// most specific hostname that matches it, and only the routes of that listener may
+/// serve it. For the locations of listener `li` with host `host`: `None` when a more
+/// specific listener takes every host of `host` (no location), else the hostnames of
+/// the more specific listeners inside `host`, each of which gets a 404 location for the
+/// same match, tried after its own locations (see [`isolation_location`]).
+fn isolation(listeners: &[Listener<'_>], li: usize, host: Option<&str>) -> Option<Vec<String>> {
+    let listener = &listeners[li];
+    let mut fenced = Vec::new();
+    for (i, other) in listeners.iter().enumerate() {
+        let Some(hostname) = other.hostname.as_deref() else {
+            continue;
+        };
+        if i == li
+            || other.owner.gateway != listener.owner.gateway
+            || other.spec.port != listener.spec.port
+            || !other.programmed()
+            || listener.hostname.as_deref() == Some(hostname)
+            || !host_covers(listener.hostname.as_deref(), Some(hostname))
+        {
+            continue;
+        }
+        if host_covers(Some(hostname), host) {
+            return None;
+        }
+        if host_covers(host, Some(hostname)) && !fenced.iter().any(|h| h == hostname) {
+            fenced.push(hostname.to_string());
+        }
+    }
+    Some(fenced)
+}
+
+/// The 404 location of listener isolation: the match of a route of a less specific
+/// listener, on the hostname `host` of a more specific listener. It goes after every
+/// location of that hostname, so the routes of the more specific listener come first.
+#[allow(clippy::too_many_arguments)]
+fn isolation_location(
+    kind: RouteKind,
+    route: &RouteKey,
+    age: usize,
+    rule: &Rule,
+    m: &Match,
+    server: &str,
+    host: &str,
+    listener: &Listener<'_>,
+) -> Candidate {
+    let mut candidate = build_location(kind, route, age, rule, m, server, Some(host), listener);
+    let plugin = mock_status(100, 404);
+    candidate.entry.upstream = None;
+    candidate.entry.rewrite = None;
+    candidate.entry.proxy_set_headers = Vec::new();
+    candidate.entry.options = LocationOptions::default();
+    candidate.entry.plugins = vec![plugin.0.clone()];
+    candidate.plugins = vec![plugin];
+    candidate.order.isolation = true;
+    candidate
+}
+
 fn namespace_allowed(input: &TranslateInput<'_>, listener: &Listener<'_>, namespace: &str) -> bool {
     let namespaces = listener
         .spec
@@ -3142,6 +3232,8 @@ struct Candidate {
 struct Order {
     exact_host_len: std::cmp::Reverse<usize>,
     host_len: std::cmp::Reverse<usize>,
+    /// A 404 location of listener isolation: after the routes of its hostname.
+    isolation: bool,
     /// A GRPCRoute match without method match: after every method match (zero characters
     /// of service and method), where an HTTPRoute `PathPrefix /` goes before regular
     /// expressions.
@@ -3234,6 +3326,7 @@ fn build_location(
         order: Order {
             exact_host_len: std::cmp::Reverse(exact_host_len),
             host_len: std::cmp::Reverse(host_len),
+            isolation: false,
             any_method: kind == RouteKind::Grpc && m.pingap_path.is_empty(),
             path_kind: std::cmp::Reverse(m.kind),
             path_len: std::cmp::Reverse(path_len),
@@ -4139,6 +4232,234 @@ mod tests {
         assert_eq!(locs.len(), 1);
         assert_eq!(locs[0].host.as_deref(), Some("foo.example.com"));
         assert_eq!(listener_status(&d, "gw", "http").attached_routes, 1);
+    }
+
+    /// What Pingap does with a request to `host` and `path` on `server`: the owner of
+    /// the first location (by weight) whose host and path match, and the status of its
+    /// `mock` plugin, if any. `None` when no location matches (404).
+    fn serve<'d>(
+        d: &'d Desired,
+        server: &str,
+        host: &str,
+        path: &str,
+    ) -> Option<(&'d str, Option<i64>)> {
+        let location = locations(d, server).into_iter().find(|l| {
+            let host_ok = match l.host.as_deref() {
+                None => true,
+                Some(h) => host_covers(Some(h), Some(host)),
+            };
+            let path_ok = match l.path.strip_prefix('~') {
+                Some(re) => Regex::new(re).unwrap().is_match(path),
+                None => l.path.is_empty() || l.path.strip_prefix('=') == Some(path),
+            };
+            host_ok && path_ok
+        })?;
+        let status = plugins_of(d, location)
+            .iter()
+            .find(|p| p.category == "mock")
+            .and_then(|p| p.fields.get("status").and_then(toml::Value::as_integer));
+        Some((location.owner.name.as_str(), status))
+    }
+
+    #[test]
+    fn host_coverage() {
+        assert!(host_covers(None, None));
+        assert!(host_covers(None, Some("a.example.com")));
+        assert!(!host_covers(Some("a.example.com"), None));
+        assert!(host_covers(
+            Some("*.example.com"),
+            Some("*.foo.example.com")
+        ));
+        assert!(host_covers(
+            Some("*.example.com"),
+            Some("abc.foo.example.com")
+        ));
+        assert!(host_covers(Some("*.example.com"), Some("*.example.com")));
+        assert!(!host_covers(
+            Some("*.foo.example.com"),
+            Some("*.example.com")
+        ));
+        assert!(!host_covers(Some("*.example.com"), Some("example.com")));
+        assert!(!host_covers(Some("a.example.com"), Some("b.example.com")));
+    }
+
+    /// The listeners of conformance test GatewayHTTPListenerIsolation, with the routes of
+    /// its two Gateways (without and with route hostnames).
+    fn isolation_world(route_hostnames: Value) -> World {
+        let listener = |name: &str, hostname: Option<&str>| {
+            let mut l = http_listener(name, 80, hostname);
+            l["allowedRoutes"] = json!({"namespaces": {"from": "All"}});
+            l
+        };
+        let gw = gateway(
+            "ns",
+            "gw",
+            0,
+            json!([
+                listener("empty", None),
+                listener("wildcard-example-com", Some("*.example.com")),
+                listener("wildcard-foo-example-com", Some("*.foo.example.com")),
+                listener("abc-foo-example-com", Some("abc.foo.example.com")),
+            ]),
+        );
+        let mut w = World::new().gw(gw);
+        for (age, section) in [
+            "empty",
+            "wildcard-example-com",
+            "wildcard-foo-example-com",
+            "abc-foo-example-com",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            w = w.rt(route(
+                "ns",
+                section,
+                age as i64,
+                json!({
+                    "parentRefs": [{"name": "gw", "sectionName": section}],
+                    "hostnames": route_hostnames,
+                    "rules": [{"matches": [{"path": {"type": "PathPrefix", "value": format!("/{section}")}}],
+                               "backendRefs": [backend("web", 80)]}],
+                }),
+            ));
+        }
+        w
+    }
+
+    #[test]
+    fn listener_isolation() {
+        let sections = [
+            "empty",
+            "wildcard-example-com",
+            "wildcard-foo-example-com",
+            "abc-foo-example-com",
+        ];
+        // Host of the request -> the listener it selects.
+        let hosts = [
+            ("bar.com", "empty"),
+            ("bar.example.com", "wildcard-example-com"),
+            ("bar.foo.example.com", "wildcard-foo-example-com"),
+            ("abc.foo.example.com", "abc-foo-example-com"),
+        ];
+        let route_hostnames = [
+            json!([]),
+            json!([
+                "bar.com",
+                "*.example.com",
+                "*.foo.example.com",
+                "abc.foo.example.com"
+            ]),
+        ];
+        for hostnames in route_hostnames {
+            let d = isolation_world(hostnames.clone()).run();
+            for section in sections {
+                assert_eq!(
+                    route_cond(&d, &rkey("ns", section), "Accepted"),
+                    tf("True", "Accepted")
+                );
+            }
+            for (host, selected) in hosts {
+                for section in sections {
+                    let got = serve(&d, "http", host, &format!("/{section}"));
+                    if section == selected {
+                        assert_eq!(got, Some((section, None)), "{hostnames} {host} /{section}");
+                    } else {
+                        // Not served by the route: a 404, from an isolation location or
+                        // because nothing matches.
+                        assert!(
+                            got.is_none_or(|(_, status)| status == Some(404)),
+                            "{hostnames} {host} /{section}: {got:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn listener_isolation_locations() {
+        let d = isolation_world(json!([])).run();
+        let got: Vec<(Option<&str>, &str, bool)> = locations(&d, "http")
+            .iter()
+            .map(|l| {
+                (
+                    l.host.as_deref(),
+                    l.owner.name.as_str(),
+                    l.upstream.is_none(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Some("abc.foo.example.com"), "abc-foo-example-com", false),
+                // Longer path first.
+                (
+                    Some("abc.foo.example.com"),
+                    "wildcard-foo-example-com",
+                    true
+                ),
+                (Some("abc.foo.example.com"), "wildcard-example-com", true),
+                (Some("abc.foo.example.com"), "empty", true),
+                (Some("*.foo.example.com"), "wildcard-foo-example-com", false),
+                (Some("*.foo.example.com"), "wildcard-example-com", true),
+                (Some("*.foo.example.com"), "empty", true),
+                (Some("*.example.com"), "wildcard-example-com", false),
+                (Some("*.example.com"), "empty", true),
+                (None, "empty", false),
+            ]
+        );
+        // A more specific listener that takes every host of a route: no location.
+        let d = isolation_world(json!(["abc.foo.example.com"])).run();
+        let got: Vec<(Option<&str>, &str)> = locations(&d, "http")
+            .iter()
+            .map(|l| (l.host.as_deref(), l.owner.name.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(Some("abc.foo.example.com"), "abc-foo-example-com")]
+        );
+        for section in ["empty", "wildcard-example-com", "wildcard-foo-example-com"] {
+            assert_eq!(
+                route_cond(&d, &rkey("ns", section), "Accepted"),
+                tf("True", "Accepted")
+            );
+        }
+    }
+
+    #[test]
+    fn listener_isolation_is_per_gateway_and_port() {
+        // A wildcard listener of another Gateway, and one on another port, on the same
+        // server: no isolation location for them.
+        let w = World::new()
+            .gw(gateway(
+                "ns",
+                "any",
+                0,
+                json!([http_listener("http", 80, None)]),
+            ))
+            .gw(gateway(
+                "ns",
+                "wild",
+                1,
+                json!([
+                    http_listener("http", 80, Some("*.example.com")),
+                    http_listener("alt", 8080, Some("a.example.com"))
+                ]),
+            ))
+            .rt(route(
+                "ns",
+                "r",
+                0,
+                json!({"parentRefs": [{"name": "any"}],
+                "rules": [{"backendRefs": [backend("web", 80)]}]}),
+            ));
+        let d = w.run();
+        let locs = locations(&d, "http");
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].host, None);
+        assert!(locs[0].upstream.is_some());
     }
 
     // ---- matching and precedence ----
