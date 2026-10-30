@@ -857,9 +857,10 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
         let writer = Arc::clone(&self.writer);
         let upstream = name.to_string();
         let health_check = st.config.health_check.clone();
+        let tls = st.config.tls.clone();
         let handle = self.inflight.spawn(async move {
             let result = writer
-                .write_upstream(&upstream, &desired, health_check.as_deref())
+                .write_upstream(&upstream, &desired, health_check.as_deref(), tls.as_ref())
                 .await;
             (upstream, desired, result)
         });
@@ -1211,6 +1212,7 @@ mod tests {
                 spread_weights: false,
             },
             health_check: None,
+            tls: None,
         }
     }
 

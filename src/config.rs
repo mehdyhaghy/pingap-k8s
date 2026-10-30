@@ -25,7 +25,9 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::types::{IpFamily, PortRef, ServiceKey, ServiceRef, UpstreamOptions, UpstreamTarget};
+use crate::types::{
+    IpFamily, PortRef, ServiceKey, ServiceRef, UpstreamOptions, UpstreamTarget, UpstreamTls,
+};
 
 /// Maximum length of a DNS label.
 const DNS_LABEL_MAX: usize = 63;
@@ -265,6 +267,9 @@ pub struct UpstreamConfig {
     /// Pingap `health_check` written when the controller creates the entry (generated
     /// Gateway upstreams only; the name changes with it, so it is never updated in place).
     pub health_check: Option<String>,
+    /// TLS to the backends, written when the controller creates the entry (generated
+    /// Gateway upstreams only; like `health_check`, never updated in place).
+    pub tls: Option<UpstreamTls>,
 }
 
 // ---- raw (serde) layer ----
@@ -521,6 +526,7 @@ fn build_upstream(
         services,
         options,
         health_check: None,
+        tls: None,
     })
 }
 

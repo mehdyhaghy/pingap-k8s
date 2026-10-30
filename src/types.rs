@@ -49,6 +49,31 @@ pub struct ServiceRef {
     pub weight: Option<u32>,
 }
 
+/// TLS from Pingap to the backends of an upstream (a Gateway API BackendTLSPolicy):
+/// Pingap `sni`, `verify_cert = true`, `ca` and, for a backend that asks for a client
+/// certificate, `client_cert` / `client_key`. Written only when the entry is created; the
+/// generated name changes with it, so it is never updated in place.
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+pub struct UpstreamTls {
+    /// SNI and the name the backend certificate must match.
+    pub sni: String,
+    /// PEM CA bundle; `None`: the system trust store.
+    pub ca: Option<String>,
+    /// PEM certificate chain and private key presented to the backend.
+    pub client_cert: Option<(String, String)>,
+}
+
+/// Leaves the PEM text out (the private key must not reach logs).
+impl fmt::Debug for UpstreamTls {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UpstreamTls")
+            .field("sni", &self.sni)
+            .field("ca", &self.ca.as_ref().map(|_| "<PEM>"))
+            .field("client_cert", &self.client_cert.as_ref().map(|_| "<PEM>"))
+            .finish()
+    }
+}
+
 /// Per-upstream options after `[defaults]` and per-upstream overrides are merged.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpstreamOptions {
@@ -150,14 +175,16 @@ pub trait AddrsWriter: Send + Sync + 'static {
     ) -> impl Future<Output = anyhow::Result<WriteOutcome>> + Send;
 
     /// [`AddrsWriter::write_addrs`]; an entry it creates also gets `health_check`
-    /// (already validated). An existing entry's `health_check` is left alone.
+    /// (already validated) and the TLS fields of `tls`. An existing entry's fields other
+    /// than `addrs` are left alone.
     fn write_upstream(
         &self,
         upstream: &str,
         addrs: &[String],
         health_check: Option<&str>,
+        tls: Option<&UpstreamTls>,
     ) -> impl Future<Output = anyhow::Result<WriteOutcome>> + Send {
-        let _ = health_check;
+        let _ = (health_check, tls);
         self.write_addrs(upstream, addrs)
     }
 }

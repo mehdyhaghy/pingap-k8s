@@ -70,6 +70,11 @@ gateway:
   # Restrict that Secret access to these names (Role resourceNames), e.g.
   # ["web-tls"]. Empty: every Secret in those namespaces.
   secretNames: []
+  # The gateway namespaces also get get/list/watch on configmaps, for the CA
+  # certificates (ca.crt) of BackendTLSPolicies. Restrict it to these names
+  # (Role resourceNames), e.g. ["backend-ca"]. Empty: every ConfigMap in those
+  # namespaces.
+  configMapNames: []
   # Pingap servers (already in etcd) listeners may be mapped onto, by port and
   # TLS (global_certificates). Empty: every stored server. The controller never
   # creates servers.

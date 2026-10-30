@@ -699,6 +699,7 @@ mod tests {
             },
             addr: "legacy.example.com:80".into(),
             health_check: None,
+            tls: None,
         };
         case.desired
             .external
