@@ -1,0 +1,112 @@
+# OpenSSF Security Insights (https://security-insights.openssf.org/), schema v2.2.0.
+header:
+  schema-version: 2.2.0
+  last-updated: '2026-11-01'
+  last-reviewed: '2026-11-01'
+  url: https://raw.githubusercontent.com/mehdyhaghy/pingap-k8s/main/security-insights.yml
+
+project:
+  name: pingap-k8s
+  homepage: https://github.com/mehdyhaghy/pingap-k8s
+  roadmap: https://github.com/mehdyhaghy/pingap-k8s/blob/main/ROADMAP.md
+  administrators:
+    - name: Mehdy Haghy
+      affiliation: Independent
+      social: https://github.com/mehdyhaghy
+      primary: true
+  repositories:
+    - name: pingap-k8s
+      url: https://github.com/mehdyhaghy/pingap-k8s
+      comment: The controller, the Helm chart, the plain manifests and the kubectl plugin.
+  documentation:
+    quickstart-guide: https://github.com/mehdyhaghy/pingap-k8s#quickstart-everything-in-one-install
+    detailed-guide: https://github.com/mehdyhaghy/pingap-k8s#configuration-reference
+    code-of-conduct: https://github.com/mehdyhaghy/pingap-k8s/blob/main/CODE_OF_CONDUCT.md
+    release-process: https://github.com/mehdyhaghy/pingap-k8s/blob/main/CONTRIBUTING.md#releasing
+    support-policy: https://github.com/mehdyhaghy/pingap-k8s/blob/main/SECURITY.md#supported-versions
+    signature-verification: https://github.com/mehdyhaghy/pingap-k8s#security
+  vulnerability-reporting:
+    reports-accepted: true
+    bug-bounty-available: false
+    policy: https://github.com/mehdyhaghy/pingap-k8s/blob/main/SECURITY.md
+    comment: Report privately through GitHub (Security tab, Report a vulnerability).
+
+repository:
+  url: https://github.com/mehdyhaghy/pingap-k8s
+  status: active
+  bug-fixes-only: false
+  accepts-change-request: true
+  accepts-automated-change-request: true
+  no-third-party-packages: false
+  core-team:
+    - name: Mehdy Haghy
+      affiliation: Independent
+      social: https://github.com/mehdyhaghy
+      primary: true
+  documentation:
+    contributing-guide: https://github.com/mehdyhaghy/pingap-k8s/blob/main/CONTRIBUTING.md
+    review-policy: https://github.com/mehdyhaghy/pingap-k8s/blob/main/GOVERNANCE.md#decisions
+    security-policy: https://github.com/mehdyhaghy/pingap-k8s/blob/main/SECURITY.md
+    governance: https://github.com/mehdyhaghy/pingap-k8s/blob/main/GOVERNANCE.md
+    dependency-management-policy: https://github.com/mehdyhaghy/pingap-k8s/blob/main/CONTRIBUTING.md#dependencies
+  license:
+    url: https://github.com/mehdyhaghy/pingap-k8s/blob/main/LICENSE
+    expression: Apache-2.0
+  release:
+    automated-pipeline: true
+    changelog: https://github.com/mehdyhaghy/pingap-k8s/blob/main/CHANGELOG.md
+    distribution-points:
+      - uri: https://github.com/mehdyhaghy/pingap-k8s/releases
+        comment: GitHub Releases (chart package, plain manifests, kubectl plugin, krew manifest), signed with cosign.
+      - uri: pkg:oci/pingap-k8s?repository_url=ghcr.io/mehdyhaghy
+        comment: Container image, multi-arch, signed with cosign, with SBOM and provenance attestations.
+      - uri: pkg:oci/pingap-k8s?repository_url=ghcr.io/mehdyhaghy/charts
+        comment: Helm chart (OCI), signed with cosign.
+    license:
+      url: https://github.com/mehdyhaghy/pingap-k8s/blob/main/LICENSE
+      expression: Apache-2.0
+  security:
+    assessments:
+      self:
+        comment: No formal security self-assessment yet. The threat model and hardening defaults are in the README Security section.
+    tools:
+      - name: CodeQL
+        type: SAST
+        rulesets: [default]
+        integration:
+          adhoc: false
+          ci: true
+          release: false
+        results: {}
+      - name: OpenSSF Scorecard
+        type: other
+        rulesets: [default]
+        integration:
+          adhoc: false
+          ci: true
+          release: false
+        results: {}
+      - name: cargo audit
+        type: SCA
+        rulesets: [default]
+        integration:
+          adhoc: true
+          ci: true
+          release: true
+        results: {}
+      - name: gitleaks
+        type: secret
+        rulesets: [default]
+        integration:
+          adhoc: true
+          ci: true
+          release: true
+        results: {}
+      - name: Dependabot
+        type: SCA
+        rulesets: [default]
+        integration:
+          adhoc: false
+          ci: true
+          release: false
+        results: {}
