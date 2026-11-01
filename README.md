@@ -1,5 +1,7 @@
 # pingap-k8s
 
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/mehdyhaghy/pingap-k8s/badge)](https://scorecard.dev/viewer/?uri=github.com/mehdyhaghy/pingap-k8s)
+
 Kubernetes endpoint discovery and [Gateway API](https://gateway-api.sigs.k8s.io/) routing for
 [Pingap](https://github.com/vicanso/pingap).
 
@@ -537,8 +539,8 @@ Not supported: TCPRoute, UDPRoute and TLSRoute (passthrough and terminate; Pinga
 HTTP-only L7 proxy, and L4 was declined upstream in
 [vicanso/pingap#159](https://github.com/vicanso/pingap/issues/159)), method matching and regex
 header or query matches, `HTTPRouteRetryCodes`, retry backoff, BackendTLSPolicy SAN validation,
-different filters per backendRef, 421 detection of misdirected requests (Pingap does not expose
-the TLS SNI to routing), and session persistence.
+filters that differ between the weighted backendRefs of a rule, 421 detection of misdirected
+requests (Pingap does not expose the TLS SNI to routing), and session persistence.
 
 ## Graceful shutdown of application pods (preStop)
 

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.16.10 (unreleased)
+## 0.16.10 (2026-10-31)
 
 Versions now follow Pingap: the Pingap version the release is tested with plus one digit for our
 own releases (Pingap 0.16.1: 0.16.10 to 0.16.19). `make version-check` and the release workflow
@@ -39,8 +39,8 @@ Gateway API provider (off by default, `gateway.enabled`), Gateway API v1.7.0 Sta
   (`gateway.secretNames`, `gateway.configMapNames`). `make exposure-check` allows only that
   ClusterRole.
 - Not supported: TCPRoute, UDPRoute, TLSRoute (Pingap is HTTP-only), retry codes and backoff,
-  BackendTLSPolicy SAN validation, different filters per backendRef, 421 misdirected-request
-  detection, session persistence.
+  BackendTLSPolicy SAN validation, filters that differ between weighted backendRefs, 421
+  misdirected-request detection, session persistence.
 - Conformance (v1.7.0): GATEWAY-HTTP core 40/40 and extended 46/46; GATEWAY-GRPC core 17/17 and extended 9/9 (Standard channel, no failures).
 
 Upstreams:
