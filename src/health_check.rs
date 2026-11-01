@@ -97,6 +97,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn host_names_are_ascii() {
+        // `idna` is built without Unicode tables (deny.toml, Cargo.toml).
+        assert!(validate("http://xn--bcher-kva.example/healthz").is_ok());
+        let err = validate("http://b\u{fc}cher.example/healthz").unwrap_err();
+        assert!(err.starts_with("not a URL"), "{err}");
+    }
+
+    #[test]
     fn accepted() {
         for value in [
             "tcp://api",

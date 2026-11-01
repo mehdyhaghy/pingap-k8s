@@ -46,8 +46,11 @@ const SA_NAMESPACE_FILE: &str = "/var/run/secrets/kubernetes.io/serviceaccount/n
 /// How long one wait for the first list of all watchers lasts before the
 /// missing ones are logged. The wait itself continues.
 const SYNC_WAIT: Duration = Duration::from_secs(30);
-/// Quiet period after a config file event before reloading.
+/// Quiet period after a config file change before reloading.
 const FILE_DEBOUNCE: Duration = Duration::from_secs(1);
+/// How often the config file is read to detect changes. The kubelet takes up
+/// to a minute or more to update a mounted ConfigMap, so this adds little.
+const FILE_POLL: Duration = Duration::from_secs(2);
 /// How long a reload waits for the reconciler to switch to the new upstreams
 /// before it stops the watchers only the old ones used. On timeout they keep
 /// running (harmless) until the next reload.
@@ -572,7 +575,7 @@ async fn run(
     }
 
     // Config reload until shutdown.
-    let _file_watcher = watch_config_file(&config_path, reload_tx);
+    let _file_watcher = watch_config_file(&config_path, FILE_POLL, reload_tx);
     let mut controller = Controller {
         path: config_path,
         namespace,
@@ -889,49 +892,37 @@ fn join_keys(keys: &BTreeSet<ServiceKey>) -> String {
 // ---------------------------------------------------------------------------
 // Config reload
 
-/// Watches the config file's directory (Kubernetes swaps a `..data` symlink
-/// there on ConfigMap updates). `None` (with a warning) if it cannot be
-/// watched; SIGHUP still works then.
-fn watch_config_file(path: &Path, tx: mpsc::Sender<Trigger>) -> Option<notify::RecommendedWatcher> {
-    use notify::{EventKind, RecursiveMode, Watcher as _};
-    let dir = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
-    let name = path.file_name()?.to_os_string();
-    let watcher =
-        notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
-            Ok(event) => {
-                if matches!(event.kind, EventKind::Access(_)) {
+/// Polls the config file's content and sends [`Trigger::File`] when it
+/// changes. Reading the path follows the `..data` symlink Kubernetes swaps on
+/// ConfigMap updates. A failed read (for example in the middle of a swap) is
+/// skipped. SIGHUP still reloads at once.
+fn watch_config_file(path: &Path, every: Duration, tx: mpsc::Sender<Trigger>) -> JoinHandle<()> {
+    let path = path.to_path_buf();
+    info!(path = %path.display(), every = ?every, "watching config file for changes");
+    tokio::spawn(async move {
+        let read = |path: PathBuf| async move {
+            tokio::task::spawn_blocking(move || std::fs::read(path))
+                .await
+                .ok()
+                .and_then(Result::ok)
+        };
+        let mut last = read(path.clone()).await;
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let Some(now) = read(path.clone()).await else {
+                continue;
+            };
+            if last.as_ref() != Some(&now) {
+                last = Some(now);
+                if tx.send(Trigger::File).await.is_err() {
                     return;
                 }
-                if event.paths.iter().any(|p| is_config_path(p, &name)) {
-                    let _ = tx.try_send(Trigger::File);
-                }
             }
-            Err(err) => warn!("config file watch error: {err}"),
-        });
-    let mut watcher = match watcher {
-        Ok(w) => w,
-        Err(err) => {
-            warn!("cannot watch config file changes ({err}); reload with SIGHUP");
-            return None;
         }
-    };
-    if let Err(err) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
-        warn!(dir = %dir.display(), "cannot watch config directory ({err}); reload with SIGHUP");
-        return None;
-    }
-    info!(dir = %dir.display(), "watching config directory for changes");
-    Some(watcher)
-}
-
-/// The config file itself, or a Kubernetes ConfigMap `..data`/`..<timestamp>` entry.
-fn is_config_path(path: &Path, name: &std::ffi::OsStr) -> bool {
-    match path.file_name() {
-        Some(f) => f == name || f.to_string_lossy().starts_with(".."),
-        None => false,
-    }
+    })
 }
 
 /// Owns the running state that reloads and generated upstreams change.
@@ -1441,16 +1432,39 @@ mod tests {
         assert_eq!(election_name("/pingap/"), "/pingap-k8s-election");
     }
 
-    #[test]
-    fn config_path_filter() {
-        let name = std::ffi::OsStr::new("config.toml");
-        assert!(is_config_path(Path::new("/etc/x/config.toml"), name));
-        assert!(is_config_path(Path::new("/etc/x/..data"), name));
-        assert!(is_config_path(
-            Path::new("/etc/x/..2026_10_25_10_00_00.123"),
-            name
-        ));
-        assert!(!is_config_path(Path::new("/etc/x/other.toml"), name));
+    #[tokio::test]
+    async fn config_file_changes_are_detected() {
+        // Laid out like a ConfigMap mount: config.toml -> ..data/config.toml,
+        // ..data -> a timestamped directory, swapped on update.
+        let dir = TempDir::new("poll");
+        let v1 = dir.0.join("..v1");
+        let v2 = dir.0.join("..v2");
+        std::fs::create_dir_all(&v1).unwrap();
+        std::fs::create_dir_all(&v2).unwrap();
+        std::fs::write(v1.join("config.toml"), "a = 1\n").unwrap();
+        std::fs::write(v2.join("config.toml"), "a = 2\n").unwrap();
+        std::os::unix::fs::symlink("..v1", dir.0.join("..data")).unwrap();
+        std::os::unix::fs::symlink("..data/config.toml", dir.0.join("config.toml")).unwrap();
+        let path = dir.0.join("config.toml");
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let task = watch_config_file(&path, Duration::from_millis(20), tx);
+        let quiet = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(quiet.is_err(), "no trigger while the file is unchanged");
+
+        // Swap ..data atomically, as the kubelet does.
+        std::os::unix::fs::symlink("..v2", dir.0.join("..data_tmp")).unwrap();
+        std::fs::rename(dir.0.join("..data_tmp"), dir.0.join("..data")).unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        assert_eq!(got.unwrap(), Some(Trigger::File));
+        let quiet = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(quiet.is_err(), "one trigger per change");
+
+        // A missing file is skipped, not reported.
+        std::fs::remove_file(&path).unwrap();
+        let quiet = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(quiet.is_err(), "a failed read does not trigger");
+        task.abort();
     }
 
     const BASE: &str = r#"
