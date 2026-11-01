@@ -5,10 +5,12 @@ pingap-k8s follows the
 
 ## Reporting
 
-Report unacceptable behavior privately to the maintainers at mehdy@haghy.com. Every report is
-reviewed and answered within three working days, and the reporter's identity is kept
-confidential. If a maintainer is involved, say so in the report: once there are several
-maintainers, that maintainer takes no part in handling it.
+Report unacceptable behavior privately to the maintainers: open a private report on GitHub (the
+repository's **Security** tab, then **Report a vulnerability**) with a title starting with "Code
+of Conduct". Only the maintainers can see it. Every report is reviewed and answered within three
+working days, and the reporter's identity is kept confidential. If a maintainer is involved, say
+so in the report: once there are several maintainers, that maintainer takes no part in handling
+it.
 
 ## Scope
 

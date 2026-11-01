@@ -10,7 +10,7 @@ project:
   homepage: https://github.com/mehdyhaghy/pingap-k8s
   roadmap: https://github.com/mehdyhaghy/pingap-k8s/blob/main/ROADMAP.md
   administrators:
-    - name: Mehdy Haghy
+    - name: mehdyhaghy
       affiliation: Independent
       social: https://github.com/mehdyhaghy
       primary: true
@@ -39,7 +39,7 @@ repository:
   accepts-automated-change-request: true
   no-third-party-packages: false
   core-team:
-    - name: Mehdy Haghy
+    - name: mehdyhaghy
       affiliation: Independent
       social: https://github.com/mehdyhaghy
       primary: true
