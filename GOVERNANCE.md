@@ -16,8 +16,8 @@ This document describes how pingap-k8s is run today and how that changes as more
 **Contributors** send pull requests, reviews, documentation, tests or answers to issues.
 Anyone can contribute; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-**Maintainers** are listed in [MAINTAINERS.md](MAINTAINERS.md). They review and merge pull
-requests, cut releases, triage issues and security reports, and decide the
+**Maintainers** are listed by GitHub handle in [`.github/CODEOWNERS`](.github/CODEOWNERS). They
+review and merge pull requests, cut releases, triage issues and security reports, and decide the
 [roadmap](ROADMAP.md).
 
 ## Decisions
@@ -35,20 +35,19 @@ least two.
 
 ## Becoming a maintainer
 
-A contributor can become a maintainer after a sustained record of good contributions and
-reviews (as a guide: several merged non-trivial pull requests over at least three months). Any
-maintainer can nominate them in a pull request to [MAINTAINERS.md](MAINTAINERS.md); it is
-accepted by lazy consensus of the maintainers.
+A contributor can become a maintainer after a sustained record of good contributions and reviews
+(as a guide: several merged non-trivial pull requests over at least three months). Any
+maintainer can nominate them in a pull request to `.github/CODEOWNERS`; it is accepted by lazy
+consensus of the maintainers.
 
 The project aims for maintainers from more than one organization. Once there are at least
 three maintainers, no single organization may have a majority of them.
 
 ## Stepping down and removal
 
-A maintainer can step down at any time by opening a pull request to MAINTAINERS.md; they are
-listed as emeritus. A maintainer inactive for six months, or one who breaks the
-[Code of Conduct](CODE_OF_CONDUCT.md), can be removed by a two-thirds vote of the other
-maintainers.
+A maintainer can step down at any time by opening a pull request to `.github/CODEOWNERS`. A
+maintainer inactive for six months, or one who breaks the [Code of Conduct](CODE_OF_CONDUCT.md),
+can be removed by a two-thirds vote of the other maintainers.
 
 ## Security
 

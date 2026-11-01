@@ -857,7 +857,7 @@ and [prometheus](https://github.com/tikv/rust-prometheus). Pingap is built on
 
 - [Contributing](CONTRIBUTING.md), [Code of Conduct](CODE_OF_CONDUCT.md) and
   [Security policy](SECURITY.md)
-- [Governance](GOVERNANCE.md) and [Maintainers](MAINTAINERS.md)
+- [Governance](GOVERNANCE.md)
 - [Roadmap](ROADMAP.md) and [Changelog](CHANGELOG.md)
 - [Adopters](ADOPTERS.md): using pingap-k8s? Add yourself.
 
