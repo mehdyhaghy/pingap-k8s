@@ -43,6 +43,33 @@ anything.
 Line coverage: `cargo llvm-cov --lib --bins` (add `--test 'etcd_*'` with `PINGAP_K8S_TEST_ETCD`
 set to include the etcd tests).
 
+## Pull requests and sign-off
+
+Open an issue first for larger changes, so the design can be agreed before the work. Keep a
+pull request to one topic, with tests (see [Tests](#tests)) and docs for what it changes.
+Everyone taking part follows the [Code of Conduct](CODE_OF_CONDUCT.md); how decisions are made
+is in [GOVERNANCE.md](GOVERNANCE.md).
+
+Every commit must be signed off under the [Developer Certificate of Origin](https://developercertificate.org/)
+(DCO): it certifies that you wrote the change or have the right to submit it under the
+project's license. Add the line with `git commit -s`:
+
+```
+Signed-off-by: Your Name <you@example.com>
+```
+
+## Dependencies
+
+- Rust crates are pinned in `Cargo.lock` and built with `--locked`. Add a crate only when the
+  standard library or an existing dependency cannot do the job, prefer well-maintained crates
+  with an Apache-2.0 or MIT compatible license, and turn off default features you do not use.
+- `cargo audit` checks `Cargo.lock` against the RustSec advisories in CI and before every
+  release; a vulnerable crate is updated (or replaced) before the next release, and in a patch
+  release when the controller is affected.
+- Base images are pinned by tag and digest, GitHub Actions by commit SHA. Dependabot proposes
+  updates for both weekly; maintainers update the Rust crates by hand (`cargo update`) and
+  review the changes.
+
 ## Releasing
 
 Versions follow Pingap: a release is the Pingap version it is tested with plus one more digit,

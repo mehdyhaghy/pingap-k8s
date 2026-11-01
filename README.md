@@ -808,6 +808,17 @@ Report vulnerabilities privately, as described in [SECURITY.md](SECURITY.md).
   sha256sum -c --ignore-missing kubectl-pingap_${VERSION}_checksums.txt
   ```
 
+### Software bill of materials (SBOM)
+
+Each release image carries an SPDX SBOM and SLSA provenance as BuildKit attestations, published
+with the image on GHCR (the Rust crates come from `Cargo.lock`, the base image packages from the
+distroless image). To read them:
+
+```sh
+docker buildx imagetools inspect ghcr.io/mehdyhaghy/pingap-k8s:<version> --format '{{ json .SBOM }}'
+docker buildx imagetools inspect ghcr.io/mehdyhaghy/pingap-k8s:<version> --format '{{ json .Provenance }}'
+```
+
 ## Performance
 
 At 50 upstreams × 20 endpoints: event-to-write p50 0.52 s (the 500 ms debounce), ~30 MB
@@ -841,6 +852,16 @@ Built with [kube-rs](https://github.com/kube-rs/kube), [k8s-openapi](https://git
 [tracing](https://github.com/tokio-rs/tracing), [OpenTelemetry](https://github.com/open-telemetry/opentelemetry-rust)
 and [prometheus](https://github.com/tikv/rust-prometheus). Pingap is built on
 [Pingora](https://github.com/cloudflare/pingora).
+
+## Community
+
+- [Contributing](CONTRIBUTING.md), [Code of Conduct](CODE_OF_CONDUCT.md) and
+  [Security policy](SECURITY.md)
+- [Governance](GOVERNANCE.md) and [Maintainers](MAINTAINERS.md)
+- [Roadmap](ROADMAP.md) and [Changelog](CHANGELOG.md)
+- [Adopters](ADOPTERS.md): using pingap-k8s? Add yourself.
+
+Questions, bugs and ideas go to [GitHub issues](https://github.com/mehdyhaghy/pingap-k8s/issues).
 
 ## License
 
