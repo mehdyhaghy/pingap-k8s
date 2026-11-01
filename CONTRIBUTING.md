@@ -18,6 +18,10 @@ builder stage, so a multi-arch build needs no emulation.
 
 ## Tests
 
+A change that adds or changes behavior comes with tests for it: unit tests, plus an e2e test
+when it touches what Pingap or the cluster sees. A bug fix comes with a test that fails without
+the fix. `make check` must pass before a pull request is merged.
+
 | Command | What it covers | CI job |
 | --- | --- | --- |
 | `cargo test` | unit tests (including Kubernetes Events against a mock API server), OTLP export to an in-process receiver, the kubectl plugin against a fake `kubectl` | `rust` |
