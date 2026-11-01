@@ -5,7 +5,7 @@ NAMESPACE   ?= pingap-k8s
 IMAGE       ?= pingap-k8s:dev
 PLATFORMS   ?= linux/amd64,linux/arm64
 
-.PHONY: all fmt fmt-check clippy test check helm-lint helm-template exposure-check version-check manifests manifests-check docker docker-multiarch
+.PHONY: all fmt fmt-check clippy test deny check helm-lint helm-template exposure-check version-check manifests manifests-check docker docker-multiarch
 
 all: check
 
@@ -20,6 +20,10 @@ clippy:
 
 test:
 	cargo test --locked
+
+# Dependency licenses (CNCF allowlist) and sources; needs cargo-deny.
+deny:
+	cargo deny --locked check licenses sources
 
 check: fmt-check clippy test helm-lint helm-template exposure-check version-check manifests-check
 

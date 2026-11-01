@@ -30,7 +30,6 @@ humantime = "2"
 humantime-serde = "1"
 k8s-openapi = { version = "0.28", default-features = false, features = ["v1_35"] }
 kube = { version = "4.2", default-features = false, features = ["client", "derive", "runtime", "rustls-tls"] }
-notify = "8"
 opentelemetry = { version = "0.33", default-features = false, features = ["metrics", "logs"] }
 opentelemetry-appender-tracing = "0.33"
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "metrics", "logs", "internal-logs", "tls-ring", "tls-roots"] }
@@ -51,6 +50,10 @@ toml_edit = "0.25"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2"
+# Pins the ASCII-only backend of `idna` (via `url`, for health-check URLs, whose
+# hosts are Kubernetes names): the Unicode backends pull in Unicode-3.0 licensed
+# crates, which are not on the CNCF license allowlist. Not used directly.
+idna_adapter = "~1.0"
 
 [dev-dependencies]
 opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic", "metrics", "logs"] }

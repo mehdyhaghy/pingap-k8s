@@ -32,6 +32,7 @@ the fix. `make check` must pass before a pull request is merged.
 | `scripts/otel-local.sh` | the binary exporting to a real OpenTelemetry Collector (docker) | no |
 | `scripts/bench-local.sh` | the benchmarks of [docs/benchmarks.md](docs/benchmarks.md) | no |
 | `cargo audit` | RustSec advisories for `Cargo.lock` | `dependencies` |
+| `make deny` (`cargo deny check licenses sources`) | dependency licenses against the CNCF allowlist and crate sources, per `deny.toml` | `dependencies` |
 | `gitleaks git . && gitleaks dir .` | secrets in the git history and the working tree (`.gitleaks.toml`) | `secrets` |
 
 The `ci` workflow does not run on every push: run `make check` and the scripts above locally,
@@ -61,8 +62,10 @@ Signed-off-by: Your Name <you@example.com>
 ## Dependencies
 
 - Rust crates are pinned in `Cargo.lock` and built with `--locked`. Add a crate only when the
-  standard library or an existing dependency cannot do the job, prefer well-maintained crates
-  with an Apache-2.0 or MIT compatible license, and turn off default features you do not use.
+  standard library or an existing dependency cannot do the job, prefer well-maintained crates,
+  and turn off default features you do not use. Licenses must be Apache-2.0 or on the
+  [CNCF allowlist](https://github.com/cncf/foundation/blob/main/policies-guidance/allowed-third-party-license-policy.md);
+  `deny.toml` enforces it and lists the reviewed exceptions.
 - `cargo audit` checks `Cargo.lock` against the RustSec advisories in CI and before every
   release; a vulnerable crate is updated (or replaced) before the next release, and in a patch
   release when the controller is affected.

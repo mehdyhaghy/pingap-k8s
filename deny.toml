@@ -1,0 +1,44 @@
+# cargo-deny (https://embarkstudios.github.io/cargo-deny/): `cargo deny check licenses sources`.
+# Licenses: Apache-2.0 plus the CNCF Allowlist License Policy
+# (https://github.com/cncf/foundation/blob/main/policies-guidance/allowed-third-party-license-policy.md).
+# Advisories are checked by `cargo audit` in CI.
+
+[graph]
+# The platforms that are built and released (image and kubectl plugin).
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+]
+all-features = false
+
+[licenses]
+confidence-threshold = 0.93
+# The allowlist is the policy; not every license on it is used today.
+unused-allowed-license = "allow"
+allow = [
+  "Apache-2.0",
+  "0BSD",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "OpenSSL",
+  "Zlib",
+]
+exceptions = [
+  # Unicode data tables of the identifier check in proc-macro2: used only by
+  # proc macros at build time, not part of the binaries. Also allowed by
+  # kube-rs, a CNCF project.
+  { allow = ["Unicode-3.0"], crate = "unicode-ident" },
+]
+
+[licenses.private]
+ignore = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

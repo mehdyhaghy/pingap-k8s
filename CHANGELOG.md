@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.16.11 (unreleased)
+
+- The config file is checked for changes every 2 s instead of with filesystem notifications
+  (the `notify` crate, CC0-1.0, is not on the CNCF license allowlist). Reloads on ConfigMap
+  updates and `SIGHUP` work as before.
+- Health-check URLs in upstreams must use ASCII host names (Punycode for internationalized
+  names); `idna` is built without its Unicode-3.0 tables.
+- CI checks dependency licenses against the CNCF allowlist (`cargo deny`, `deny.toml`).
+
 ## 0.16.10 (2026-10-31)
 
 Versions now follow Pingap: the Pingap version the release is tested with plus one digit for our
