@@ -1,11 +1,12 @@
 apiVersion: v2
 name: pingap-k8s
 description: >-
-  Kubernetes controller for Pingap. Watches Services and EndpointSlices and writes the
-  ready pod addresses into the upstreams of Pingap's etcd config storage.
+  Kubernetes controller for Pingap. Writes the ready pod addresses of Services into the
+  upstreams of Pingap's etcd config storage, and with the Gateway API provider turns
+  Gateways, HTTPRoutes and GRPCRoutes into Pingap locations, certificates and upstreams.
 type: application
-version: 0.16.10
-appVersion: "0.16.10"
+version: 0.16.20
+appVersion: "0.16.20"
 kubeVersion: ">=1.35.0-0"
 home: https://github.com/mehdyhaghy/pingap-k8s
 sources:
@@ -16,5 +17,6 @@ keywords:
   - etcd
   - endpointslice
   - service-discovery
+  - gateway-api
 annotations:
   licenses: Apache-2.0

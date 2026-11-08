@@ -1,0 +1,47 @@
+name: Bug report
+description: Something does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please do not report security vulnerabilities here: see [SECURITY.md](https://github.com/mehdyhaghy/pingap-k8s/blob/main/SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: pingap-k8s version
+      description: "`pingap-k8s --version`, or the chart version."
+    validations:
+      required: true
+  - type: input
+    id: pingap
+    attributes:
+      label: Pingap version
+    validations:
+      required: true
+  - type: input
+    id: kubernetes
+    attributes:
+      label: Kubernetes version and distribution
+      placeholder: "1.35.8, kind"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce it
+      description: The smallest config, chart values or Gateway API objects that show it. Remove secrets and hostnames you do not want to share.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Controller logs and status
+      description: "`kubectl logs` of the controller, and `kubectl pingap status` if you use the plugin."
+      render: text

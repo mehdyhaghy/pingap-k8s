@@ -65,7 +65,7 @@ exposure-check:
 	done; echo "exposure-check: ok"
 
 # The version is the Pingap version in the chart values plus one release digit
-# (Pingap 0.16.1: 0.16.10 to 0.16.19), the same in Cargo.toml and Chart.yaml.
+# (Pingap 0.16.2: 0.16.20 to 0.16.29), the same in Cargo.toml and Chart.yaml.
 version-check:
 	@echo "version-check: $$(scripts/check-version.sh)"
 

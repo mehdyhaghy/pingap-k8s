@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Checks that the release version follows the Pingap version: the version is the
 # Pingap version the release is tested with plus one more digit, our own release
-# number for that Pingap version (0 to 9). Pingap 0.16.1 gives 0.16.10, 0.16.11, ...
+# number for that Pingap version (0 to 9). Pingap 0.16.2 gives 0.16.20, 0.16.21, ...
 # The Pingap version is pingap.image.tag in the chart values. Also checks that
 # Cargo.toml, Chart.yaml version and Chart.yaml appVersion agree.
 # Prints the version on success.

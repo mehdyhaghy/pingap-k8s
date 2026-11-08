@@ -20,8 +20,14 @@ values-*.local.yaml
 secrets/
 # Local notes, checkpoints, memory and AI coding tool state
 SPEC.md
+SPEC.*.md
+ISSUE-*.md
+PR-*.md
 notes/
+drafts/
+scratch/
 *.private.md
+*.draft.md
 .checkpoint/
 .checkpoints/
 memory/

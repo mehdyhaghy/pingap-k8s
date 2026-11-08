@@ -16,12 +16,13 @@ events:
   enabled: true
 
 # Gateway API provider: the GatewayClass "pingap" and the [gateway] table. Listeners
-# map onto the seed's gw-http (8082) and gw-https (8443, global_certificates) servers;
-# backends and listener Secrets live in e2e-app.
+# map onto the seed's gw-http (8082), gw-https (8443, global_certificates) and
+# gw-https-h2 (8444, TLS with HTTP/2) servers; backends and listener Secrets live in
+# e2e-app.
 gateway:
   enabled: true
   namespaces: ["e2e-app"]
-  servers: ["gw-http", "gw-https"]
+  servers: ["gw-http", "gw-https", "gw-https-h2"]
   addresses: ["pingap-k8s-pingap.pingap-k8s.svc"]
   # E2E test 30: two server groups, each with its own Pingap server and Service
   # (pingap-k8s-pingap-gw-a / -gw-b, port 80). The test's Gateways ask for them by
@@ -61,7 +62,7 @@ pingap:
     existingSecret: pingap-k8s-pingap-admin-e2e
   networkPolicy:
     # The gRPC listener of e2e test 12, and the Gateway API listeners.
-    extraPorts: [8081, 8082, 8443]
+    extraPorts: [8081, 8082, 8443, 8444]
     # E2E tests 9 and 10 call the admin API from the client pod.
     adminFrom:
       - namespaceSelector:
@@ -104,6 +105,14 @@ pingap:
       [servers.gw-https]
       addr = "[::]:8443"
       global_certificates = true
+      strict_sni = true
+
+      # E2E test 34: HTTP/2 over TLS (ALPN h2), for HTTP/2 connection reuse.
+      [servers.gw-https-h2]
+      addr = "[::]:8444"
+      global_certificates = true
+      enabled_h2 = true
+      strict_sni = true
 
       [locations.echo]
       upstream = "echo"

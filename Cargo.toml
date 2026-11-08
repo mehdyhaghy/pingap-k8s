@@ -1,9 +1,9 @@
 [package]
 name = "pingap-k8s"
-version = "0.16.10"
+version = "0.16.20"
 edition = "2024"
 rust-version = "1.89"
-description = "Kubernetes controller for Pingap: syncs Service endpoints into Pingap's etcd config"
+description = "Kubernetes endpoint discovery and Gateway API provider for Pingap, through its etcd config"
 license = "Apache-2.0"
 repository = "https://github.com/mehdyhaghy/pingap-k8s"
 publish = false
@@ -50,6 +50,8 @@ toml_edit = "0.25"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2"
+# The certificate names (SAN) of a listener Secret, read the way Pingap reads them.
+x509-parser = "0.18"
 # Pins the ASCII-only backend of `idna` (via `url`, for health-check URLs, whose
 # hosts are Kubernetes names): the Unicode backends pull in Unicode-3.0 licensed
 # crates, which are not on the CNCF license allowlist. Not used directly.
@@ -68,3 +70,6 @@ rcgen = "0.14.10"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[profile.dev.package."*"]
+debug = false

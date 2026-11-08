@@ -1,8 +1,9 @@
-//! The end-to-end tests 19–32 of the Gateway API provider, one test function each.
+//! The end-to-end tests 19–32, 34 and 35 of the Gateway API provider, one test function each.
 //!
 //! The chart creates the GatewayClass `pingap` (tests/e2e/values.yaml): listeners map onto
-//! the seed's Pingap servers `gw-http` (plain HTTP and h2c, port 8082) and `gw-https` (TLS
-//! by SNI, port 8443), backends and listener Secrets live in `e2e-app`. The server groups
+//! the seed's Pingap servers `gw-http` (plain HTTP and h2c, port 8082), `gw-https` (TLS
+//! by SNI, port 8443) and `gw-https-h2` (TLS with HTTP/2, port 8444; both TLS servers with
+//! `strict_sni`), backends and listener Secrets live in `e2e-app`. The server groups
 //! `a` and `b` (port 80 each, own Service) are only for test 30: the other Gateways ask
 //! for the shared address ([`gateway`]), so they never take a group. The chart's Pingap
 //! Service exposes port 80 only, so requests go from the client pod to the Pingap pod IP
@@ -35,6 +36,8 @@ const API_VERSION: &str = "gateway.networking.k8s.io/v1";
 const HTTP_PORT: u16 = 8082;
 /// The seed's `gw-https` server (`global_certificates`).
 const HTTPS_PORT: u16 = 8443;
+/// The seed's `gw-https-h2` server (`global_certificates`, `enabled_h2`: ALPN h2).
+const HTTPS_H2_PORT: u16 = 8444;
 /// No Pingap server listens here.
 const UNMAPPED_PORT: u16 = 9999;
 const HTTP_SERVER: &str = "gw-http";
@@ -422,7 +425,11 @@ struct Front {
 }
 
 fn scheme(port: u16) -> &'static str {
-    if port == HTTPS_PORT { "https" } else { "http" }
+    if port == HTTPS_PORT || port == HTTPS_H2_PORT {
+        "https"
+    } else {
+        "http"
+    }
 }
 
 impl Front {
@@ -674,6 +681,22 @@ async fn secret_certificates(env: &Env, ns: &str, name: &str) -> anyhow::Result<
 /// certificate for `host` (openssl on the test host; the key never leaves the test host
 /// and the cluster). Every call makes a new key and serial number.
 async fn apply_tls_secret(env: &Env, ns: &str, name: &str, host: &str) -> anyhow::Result<()> {
+    apply_tls_secret_for(env, ns, name, &[host]).await
+}
+
+/// [`apply_tls_secret`] for a certificate with the DNS names `hosts` (the first is the CN).
+async fn apply_tls_secret_for(
+    env: &Env,
+    ns: &str,
+    name: &str,
+    hosts: &[&str],
+) -> anyhow::Result<()> {
+    let host = hosts[0];
+    let san = hosts
+        .iter()
+        .map(|h| format!("DNS:{h}"))
+        .collect::<Vec<_>>()
+        .join(",");
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_nanos();
@@ -700,7 +723,7 @@ async fn apply_tls_secret(env: &Env, ns: &str, name: &str, host: &str) -> anyhow
                 "-subj",
                 format!("/CN={host}").as_str(),
                 "-addext",
-                format!("subjectAltName=DNS:{host}").as_str(),
+                format!("subjectAltName={san}").as_str(),
             ]
             .iter()
             .map(|s| s.to_string())
@@ -2325,6 +2348,378 @@ async fn e2e_32_backend_tls_policy() {
             .wait("5xx with the wrong hostname", HTTP_PORT, host, "/hostname", &[], |r| (500..600).contains(&r.status))
             .await;
         println!("[{T}] wrong hostname: {}", r.short());
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------------------
+// 34. Misdirected requests on a reused HTTP/2 connection
+// ---------------------------------------------------------------------------------------
+
+/// What one request of [`reuse_requests`] got back.
+#[derive(Debug, Clone, PartialEq)]
+struct ReuseResult {
+    status: u16,
+    http_version: String,
+    /// New connections curl opened for this request: 0 when it reused one.
+    connects: u32,
+}
+
+/// The `curl` arguments for one request of a [`reuse_requests`] run.
+fn reuse_args(front: &Front, port: u16, url_host: &str, host: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = ["-s", "-k", "--http2", "-m", "5", "-o", "/dev/null", "-w"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    args.push("%{http_code} %{http_version} %{num_connects}\n".into());
+    args.push("--resolve".into());
+    args.push(front.resolve(url_host, port));
+    if let Some(host) = host {
+        args.push("-H".into());
+        args.push(format!("Host: {host}:{port}"));
+    }
+    args.push(format!("https://{url_host}:{port}/hostname"));
+    args
+}
+
+/// Runs `requests` (URL host, `Host` header) in one curl process, separated by
+/// `--next`: curl keeps its connections across them, so requests to the same URL host
+/// share one HTTP/2 connection, opened with that URL host as the TLS server name (SNI),
+/// whatever `Host` (`:authority`) they send.
+async fn reuse_requests(
+    front: &Front,
+    port: u16,
+    requests: &[(&str, Option<&str>)],
+) -> anyhow::Result<Vec<ReuseResult>> {
+    let mut cmd = vec!["curl".to_string()];
+    for (i, (url_host, host)) in requests.iter().enumerate() {
+        if i > 0 {
+            cmd.push("--next".into());
+        }
+        cmd.extend(reuse_args(front, port, url_host, *host));
+    }
+    let out = front
+        .kubectl
+        .exec(&front.namespace, &front.pod, None, &cmd)
+        .await?;
+    let results: Vec<ReuseResult> = out
+        .stdout
+        .lines()
+        .filter_map(|l| {
+            let mut parts = l.split_whitespace();
+            Some(ReuseResult {
+                status: parts.next()?.parse().ok()?,
+                http_version: parts.next()?.to_string(),
+                connects: parts.next()?.parse().ok()?,
+            })
+        })
+        .collect();
+    if results.len() != requests.len() {
+        anyhow::bail!(
+            "expected {} results, got {:?} ({:?})",
+            requests.len(),
+            out.stdout,
+            out.stderr
+        );
+    }
+    Ok(results)
+}
+
+/// Gateway `t34` on the HTTP/2 TLS server (`gw-https-h2`, `strict_sni`) has listeners
+/// `a.t34.example.com`, `b.t34.example.com` and `*.w.t34.example.com`, all with one
+/// Secret whose certificate names all three, so a client may reuse one connection for
+/// all of them (HTTP/2 connection coalescing). On a connection opened for
+/// `a.t34.example.com`, a request with `Host: b.t34.example.com` belongs to another
+/// listener and gets 421 Misdirected Request; on one opened for `x.w.t34.example.com`,
+/// `y.w.t34.example.com` is the same (wildcard) listener and is served, and
+/// `a.t34.example.com` gets 421. The connection stays usable after a 421. Every request
+/// after the first of a connection reuses it (curl's `num_connects` is 0).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_34_misdirected_request_on_reused_connection() {
+    const T: &str = "e2e_34";
+    let Some(env) = Env::setup("e2e_34_misdirected_request_on_reused_connection").await else {
+        return;
+    };
+    let ns = env.app_namespace.clone();
+    let (a, b, wild) = (
+        "a.t34.example.com",
+        "b.t34.example.com",
+        "*.w.t34.example.com",
+    );
+    let (x, y) = ("x.w.t34.example.com", "y.w.t34.example.com");
+    let objs = [
+        obj(GATEWAYS, &ns, "t34"),
+        obj(ROUTES, &ns, "t34"),
+        obj("secret", &ns, "t34-tls"),
+    ];
+    ready(&env).await;
+    with_objects(&env, &objs, async {
+        apply_tls_secret_for(&env, &ns, "t34-tls", &[a, b, wild])
+            .await
+            .unwrap();
+        let listener = |name: &str, host: &str| {
+            json!({
+                "name": name, "port": HTTPS_H2_PORT, "protocol": "HTTPS", "hostname": host,
+                "tls": { "mode": "Terminate", "certificateRefs": [{ "kind": "Secret", "name": "t34-tls" }] },
+            })
+        };
+        apply(
+            &env,
+            &list(vec![
+                gateway(
+                    &ns,
+                    "t34",
+                    vec![listener("a", a), listener("b", b), listener("wild", wild)],
+                ),
+                route(
+                    &ns,
+                    "t34",
+                    json!([{ "name": "t34" }]),
+                    &[a, b, wild],
+                    json!([{ "backendRefs": [backend("echo", None)] }]),
+                ),
+            ]),
+        )
+        .await
+        .unwrap();
+        wait_gateway(&env, &ns, "t34", "Gateway t34 programmed", |g| {
+            ["a", "b", "wild"]
+                .iter()
+                .all(|l| listener_cond_is(g, l, "Programmed", "True", "Programmed"))
+        })
+        .await;
+        let front = Front::new(&env).await.unwrap();
+        for host in [a, b, x] {
+            front
+                .wait(
+                    &format!("HTTPS through t34 for {host}"),
+                    HTTPS_H2_PORT,
+                    host,
+                    "/hostname",
+                    &[],
+                    |r| r.status == 200,
+                )
+                .await;
+        }
+
+        let requests = [
+            (a, None),
+            (a, Some(b)),
+            (a, Some(a)),
+            (x, None),
+            (x, Some(y)),
+            (x, Some(a)),
+            (x, Some(x)),
+        ];
+        let results = reuse_requests(&front, HTTPS_H2_PORT, &requests)
+            .await
+            .unwrap();
+        for ((url_host, host), r) in requests.iter().zip(&results) {
+            println!(
+                "[{T}] SNI {url_host}, Host {}: {} over HTTP/{}, new connections {}",
+                host.unwrap_or(url_host),
+                r.status,
+                r.http_version,
+                r.connects
+            );
+        }
+        let expected = [200, 421, 200, 200, 200, 421, 200];
+        let statuses: Vec<u16> = results.iter().map(|r| r.status).collect();
+        assert_eq!(statuses, expected, "{results:?}");
+        assert!(
+            results.iter().all(|r| r.http_version == "2"),
+            "not HTTP/2: {results:?}"
+        );
+        // One connection per TLS server name, reused by every later request to it.
+        let connects: Vec<u32> = results.iter().map(|r| r.connects).collect();
+        assert_eq!(connects, [1, 0, 0, 1, 0, 0, 0], "{results:?}");
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------------------
+// 35. Misdirected WebSocket upgrades and HTTP/1.1 keep-alive reuse
+// ---------------------------------------------------------------------------------------
+
+/// A WebSocket upgrade over HTTP/1.1 on a new TLS connection opened with the server name
+/// (SNI) `url_host`, sending `Host: <host>`: the status of the answer (101 when it
+/// switched protocols). curl waits for more after a 101 until its timeout, so its exit
+/// status is not looked at.
+async fn ws_upgrade(front: &Front, port: u16, url_host: &str, host: &str) -> anyhow::Result<u16> {
+    let cmd: Vec<String> = [
+        "curl",
+        "-s",
+        "-k",
+        "--http1.1",
+        "-m",
+        "3",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        "--resolve",
+        &front.resolve(url_host, port),
+        "-H",
+        &format!("Host: {host}:{port}"),
+        "-H",
+        "Connection: Upgrade",
+        "-H",
+        "Upgrade: websocket",
+        "-H",
+        "Sec-WebSocket-Version: 13",
+        "-H",
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+        &format!("https://{url_host}:{port}/ws"),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let out = front
+        .kubectl
+        .exec(&front.namespace, &front.pod, None, &cmd)
+        .await?;
+    out.stdout
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("unexpected curl output {:?} ({:?})", out.stdout, out.stderr))
+}
+
+/// Gateway `t35` on the HTTP/1.1 TLS server (`gw-https`, `strict_sni`) has listeners
+/// `a.t35.example.com`, `b.t35.example.com` and `*.w.t35.example.com` with one Secret
+/// for all three; `/ws` goes to the WebSocket port of the echo pods. A WebSocket is an
+/// HTTP/1.1 upgrade on a connection of its own: with the `Host` of the TLS server name's
+/// listener it switches protocols (101), with the `Host` of another listener it gets 421
+/// and is never upgraded, and a name of the same wildcard listener is upgraded. A plain
+/// request with another listener's `Host` on a reused HTTP/1.1 keep-alive connection
+/// also gets 421.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_35_misdirected_websocket_and_keepalive() {
+    const T: &str = "e2e_35";
+    let Some(env) = Env::setup("e2e_35_misdirected_websocket_and_keepalive").await else {
+        return;
+    };
+    let ns = env.app_namespace.clone();
+    let (a, b, wild) = (
+        "a.t35.example.com",
+        "b.t35.example.com",
+        "*.w.t35.example.com",
+    );
+    let (x, y) = ("x.w.t35.example.com", "y.w.t35.example.com");
+    let objs = [
+        obj(GATEWAYS, &ns, "t35"),
+        obj(ROUTES, &ns, "t35"),
+        obj("secret", &ns, "t35-tls"),
+    ];
+    ready(&env).await;
+    with_objects(&env, &objs, async {
+        apply_tls_secret_for(&env, &ns, "t35-tls", &[a, b, wild])
+            .await
+            .unwrap();
+        apply(
+            &env,
+            &list(vec![
+                gateway(
+                    &ns,
+                    "t35",
+                    vec![
+                        https_listener("a", a, "t35-tls"),
+                        https_listener("b", b, "t35-tls"),
+                        https_listener("wild", wild, "t35-tls"),
+                    ],
+                ),
+                route(
+                    &ns,
+                    "t35",
+                    json!([{ "name": "t35" }]),
+                    &[a, b, wild],
+                    json!([
+                        { "matches": [prefix("/ws")],
+                          "backendRefs": [{ "name": "echo", "port": 8090 }] },
+                        { "backendRefs": [backend("echo", None)] },
+                    ]),
+                ),
+            ]),
+        )
+        .await
+        .unwrap();
+        wait_gateway(&env, &ns, "t35", "Gateway t35 programmed", |g| {
+            ["a", "b", "wild"]
+                .iter()
+                .all(|l| listener_cond_is(g, l, "Programmed", "True", "Programmed"))
+        })
+        .await;
+        let front = Front::new(&env).await.unwrap();
+        for host in [a, b, x] {
+            front
+                .wait(
+                    &format!("HTTPS through t35 for {host}"),
+                    HTTPS_PORT,
+                    host,
+                    "/hostname",
+                    &[],
+                    |r| r.status == 200,
+                )
+                .await;
+        }
+
+        // The `/ws` backend is a new upstream: 503 until its endpoints are written.
+        wait_for(
+            "WebSocket upgrade through t35",
+            TRAFFIC_WAIT,
+            POLL,
+            || async {
+                match ws_upgrade(&front, HTTPS_PORT, a, a).await? {
+                    101 => Ok(Some(())),
+                    status => anyhow::bail!("last status: {status}"),
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        // WebSocket upgrades: (TLS server name, Host, expected status).
+        let cases = [
+            (a, a, 101),
+            (a, b, 421),
+            (b, b, 101),
+            (b, a, 421),
+            (x, x, 101),
+            (x, y, 101),
+            (x, a, 421),
+            (a, x, 421),
+        ];
+        let mut got = Vec::new();
+        for (sni, host, _) in cases {
+            let status = ws_upgrade(&front, HTTPS_PORT, sni, host).await.unwrap();
+            println!("[{T}] WebSocket upgrade, SNI {sni}, Host {host}: {status}");
+            got.push(status);
+        }
+        let expected: Vec<u16> = cases.iter().map(|c| c.2).collect();
+        assert_eq!(got, expected);
+
+        // HTTP/1.1 keep-alive: one connection opened for `a`, then another listener's Host.
+        let mut cmd = vec!["curl".to_string()];
+        for (i, host) in [None, Some(b)].iter().enumerate() {
+            if i > 0 {
+                cmd.push("--next".into());
+            }
+            let mut args = reuse_args(&front, HTTPS_PORT, a, *host);
+            // reuse_args asks for HTTP/2; gw-https speaks HTTP/1.1 only.
+            for arg in args.iter_mut() {
+                if arg == "--http2" {
+                    *arg = "--http1.1".into();
+                }
+            }
+            cmd.extend(args);
+        }
+        let out = front
+            .kubectl
+            .exec(&front.namespace, &front.pod, None, &cmd)
+            .await
+            .unwrap();
+        let lines: Vec<&str> = out.stdout.lines().collect();
+        println!("[{T}] keep-alive, SNI {a}, Host {a} then {b}: {lines:?}");
+        assert_eq!(lines, ["200 1.1 1", "421 1.1 0"], "{:?}", out.stderr);
     })
     .await;
 }

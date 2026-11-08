@@ -187,10 +187,16 @@ pub fn route_location_name(
     build(&[&route.namespace, &route.name], &hash)
 }
 
-/// The certificate of one `kubernetes.io/tls` Secret, shared by every listener that
-/// names it: `k8s-<ns>-<secret>-<h8>`.
-pub fn certificate_name(secret: &SecretKey) -> String {
-    let hash = fnv1a(&["certificate", &secret.namespace, &secret.name]);
+/// The certificate of one `kubernetes.io/tls` Secret for one listener hostname
+/// (`None`: listeners without hostname), shared by every listener with that hostname
+/// that names it: `k8s-<ns>-<secret>-<h8>`. One entry per hostname gives every
+/// hostname its own certificate in Pingap, so `strict_sni` tells the listeners apart
+/// even when they share a Secret.
+pub fn certificate_name(secret: &SecretKey, hostname: Option<&str>) -> String {
+    let hash = match hostname {
+        None => fnv1a(&["certificate", &secret.namespace, &secret.name]),
+        Some(host) => fnv1a(&["certificate", &secret.namespace, &secret.name, "host", host]),
+    };
     build(&[&secret.namespace, &secret.name], &hash)
 }
 
@@ -446,12 +452,20 @@ mod tests {
 
     #[test]
     fn certificate_and_plugin_names() {
-        let c = certificate_name(&SecretKey::new("prod", "shop-tls"));
+        let c = certificate_name(&SecretKey::new("prod", "shop-tls"), None);
         assert!(c.starts_with("k8s-prod-shop-tls-"), "{c}");
         assert!(valid(&c), "{c}");
         assert_ne!(
-            certificate_name(&SecretKey::new("a-b", "c")),
-            certificate_name(&SecretKey::new("a", "b-c"))
+            certificate_name(&SecretKey::new("a-b", "c"), None),
+            certificate_name(&SecretKey::new("a", "b-c"), None)
+        );
+        let wild = certificate_name(&SecretKey::new("prod", "shop-tls"), Some("*.example.com"));
+        assert!(wild.starts_with("k8s-prod-shop-tls-"), "{wild}");
+        assert!(valid(&wild), "{wild}");
+        assert_ne!(wild, c);
+        assert_ne!(
+            wild,
+            certificate_name(&SecretKey::new("prod", "shop-tls"), Some("a.example.com"))
         );
         let p = plugin_name("request_headers", "set_headers = [\"a:b\"]\n");
         assert!(p.starts_with("k8s-request-headers-"), "{p}");

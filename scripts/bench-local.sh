@@ -34,7 +34,7 @@
 #        BENCH_SCALE_ROUNDS  (scale up+down rounds per phase, default 3)
 #        BENCH_PINGAP        (auto|off, default auto: needs Docker Desktop so the
 #                             container reaches the 127.0.0.1-bound etcd)
-#        PINGAP_IMAGE        (default vicanso/pingap:0.16.1)
+#        PINGAP_IMAGE        (default vicanso/pingap:0.16.2)
 #        BENCH_KEEP_RESULTS  (directory to copy raw results into, default
 #                             target/bench/<UTC timestamp>; "" to keep nothing)
 #        BENCH_LOAD_MAX      (host 1-minute load average limit, default 20: if it
@@ -50,7 +50,7 @@ R="${BENCH_POD_REPLICAS:-2}"
 SYN_STEPS="${BENCH_SYN_STEPS:-1.0 0.25}"
 SCALE_ROUNDS="${BENCH_SCALE_ROUNDS:-3}"
 PINGAP_MODE="${BENCH_PINGAP:-auto}"
-PINGAP_IMAGE="${PINGAP_IMAGE:-vicanso/pingap:0.16.1}"
+PINGAP_IMAGE="${PINGAP_IMAGE:-vicanso/pingap:0.16.2}"
 PINGAP_NAME="$CLUSTER-pingap"
 LOAD_MAX="${BENCH_LOAD_MAX:-20}"
 

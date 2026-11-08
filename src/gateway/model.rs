@@ -239,9 +239,13 @@ pub struct ExternalUpstream {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CertificateEntry {
     pub secret: SecretKey,
-    /// Listener hostnames; empty (a listener without hostname): Pingap takes the names
-    /// from the certificate and serves it as the default certificate.
+    /// The names Pingap serves it for: the listener hostname (one entry per Secret and
+    /// hostname), or for listeners without hostname the certificate's own names that no
+    /// listener hostname claims (possibly none).
     pub domains: Vec<String>,
+    /// Listeners without hostname: also the default certificate, for any other or no
+    /// SNI.
+    pub is_default: bool,
     pub tls_cert: String,
     pub tls_key: String,
 }

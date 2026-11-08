@@ -96,6 +96,7 @@ pingap:
       [servers.gw-443]
       addr = "[::]:443"
       global_certificates = true
+      strict_sni = true
 
       [servers.gw-8080]
       addr = "[::]:8080"

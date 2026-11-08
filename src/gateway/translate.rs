@@ -167,7 +167,7 @@ pub const KIND_SECRET: &str = "Secret";
 
 /// The features of the Gateway API conformance suite this provider implements, sorted
 /// as `status.supportedFeatures` must be.
-pub const SUPPORTED_FEATURES: [&str; 33] = [
+pub const SUPPORTED_FEATURES: [&str; 34] = [
     "BackendTLSPolicy",
     "GRPCRoute",
     "GRPCRouteNamedRouteRule",
@@ -175,6 +175,7 @@ pub const SUPPORTED_FEATURES: [&str; 33] = [
     "Gateway",
     "GatewayBackendClientCertificate",
     "GatewayHTTPListenerIsolation",
+    "GatewayHTTPSListenerDetectMisdirectedRequests",
     "GatewayPort8080",
     "GatewayStaticAddresses",
     "HTTPRoute",
@@ -766,33 +767,46 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
     }
 
     // ---- Gateway and listener statuses, certificates ----
-    let mut cert_domains: BTreeMap<SecretKey, (Option<BTreeSet<String>>, String, String)> =
-        BTreeMap::new();
+    // One certificate per (Secret, listener hostname): listeners with different
+    // hostnames get different certificates even from one Secret, so Pingap's
+    // `strict_sni` answers 421 for a request whose Host belongs to another listener.
+    let mut cert_hosts: BTreeMap<(SecretKey, Option<String>), (String, String)> = BTreeMap::new();
     for listener in &listeners {
         if !listener.programmed() {
             continue;
         }
         for (secret, cert, key) in &listener.certs {
-            let entry = cert_domains
-                .entry(secret.clone())
-                .or_insert_with(|| (Some(BTreeSet::new()), cert.clone(), key.clone()));
-            match (&listener.hostname, &mut entry.0) {
-                (Some(host), Some(domains)) => {
-                    domains.insert(host.clone());
-                }
-                (None, domains) => *domains = None,
-                (Some(_), None) => {}
-            }
+            cert_hosts
+                .entry((secret.clone(), listener.hostname.clone()))
+                .or_insert_with(|| (cert.clone(), key.clone()));
         }
     }
-    for (secret, (domains, tls_cert, tls_key)) in cert_domains {
+    // Pingap's certificate store is one for all servers, so every listener hostname
+    // counts. The default certificate (listeners without hostname) is served for its own
+    // names except those, so no name has two certificates.
+    let listener_hosts: BTreeSet<&str> = cert_hosts
+        .keys()
+        .filter_map(|(_, h)| h.as_deref())
+        .collect();
+    for ((secret, host), (tls_cert, tls_key)) in &cert_hosts {
+        let (domains, is_default) = match host {
+            Some(host) => (vec![host.clone()], false),
+            None => (
+                tls::certificate_names(tls_cert)
+                    .into_iter()
+                    .filter(|name| !listener_hosts.iter().any(|h| hostname_claims(h, name)))
+                    .collect(),
+                true,
+            ),
+        };
         desired.certificates.insert(
-            names::certificate_name(&secret),
+            names::certificate_name(secret, host.as_deref()),
             CertificateEntry {
-                secret,
-                domains: domains.map(|d| d.into_iter().collect()).unwrap_or_default(),
-                tls_cert,
-                tls_key,
+                secret: secret.clone(),
+                domains,
+                is_default,
+                tls_cert: tls_cert.clone(),
+                tls_key: tls_key.clone(),
             },
         );
     }
@@ -826,6 +840,22 @@ pub fn translate(input: &TranslateInput<'_>) -> Desired {
     }
     desired.status.policies = policies.statuses(&policy_uses, &options.controller_name);
     desired
+}
+
+/// Whether a request for the certificate name `name` goes to the listener with the
+/// hostname `listener` rather than to one without hostname: the same name, or a name
+/// below a wildcard listener hostname (`*.example.com` takes `a.example.com`,
+/// `a.b.example.com` and `*.a.example.com`, not `example.com`).
+fn hostname_claims(listener: &str, name: &str) -> bool {
+    if listener == name {
+        return true;
+    }
+    match listener.strip_prefix('*') {
+        Some(suffix) if suffix.starts_with('.') => {
+            name.len() > suffix.len() && name.ends_with(suffix)
+        }
+        _ => false,
+    }
 }
 
 /// A Gateway's backend client certificate (`tls.crt`, `tls.key`): `Ok(None)` when it has
@@ -3788,6 +3818,18 @@ mod tests {
                 Arc::new(tls_secret(ns, name, Some(cert_pem()), Some(key_pem()))),
             );
         }
+        /// A Secret with a self-signed certificate for `sans`.
+        fn secret_for(&mut self, ns: &str, name: &str, sans: &[&str]) {
+            let generated = rcgen::generate_simple_self_signed(
+                sans.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let (cert, key) = (generated.cert.pem(), generated.signing_key.serialize_pem());
+            self.secrets.insert(
+                SecretKey::new(ns, name),
+                Arc::new(tls_secret(ns, name, Some(&cert), Some(&key))),
+            );
+        }
         fn input(&self) -> TranslateInput<'_> {
             TranslateInput {
                 classes: &self.classes,
@@ -4888,10 +4930,14 @@ mod tests {
         w.secret("ns", "cert");
         w.secret("certs", "shared");
         let d = w.run();
-        assert_eq!(d.certificates.len(), 1);
-        let cert = &d.certificates[&names::certificate_name(&SecretKey::new("ns", "cert"))];
-        assert_eq!(cert.domains, vec!["a.example.com", "b.example.com"]);
-        assert_eq!(cert.tls_cert, cert_pem());
+        // One certificate per listener hostname, also from one Secret.
+        assert_eq!(d.certificates.len(), 2);
+        for host in ["a.example.com", "b.example.com"] {
+            let cert = &d.certificates
+                [&names::certificate_name(&SecretKey::new("ns", "cert"), Some(host))];
+            assert_eq!(cert.domains, vec![host]);
+            assert_eq!(cert.tls_cert, cert_pem());
+        }
         assert_eq!(
             listener_cond(&d, "gw", "missing", "ResolvedRefs"),
             tf("False", "InvalidCertificateRef")
@@ -4929,19 +4975,70 @@ mod tests {
             listener_cond(&d, "gw", "cross", "ResolvedRefs"),
             tf("True", "ResolvedRefs")
         );
-        assert_eq!(d.certificates.len(), 2);
+        assert_eq!(d.certificates.len(), 3);
     }
 
     #[test]
-    fn certificate_of_a_listener_without_hostname_has_no_domains() {
+    fn certificate_of_a_listener_without_hostname_is_the_default() {
         let gw = gateway("ns", "gw", 0, json!([https_listener("a", None, "cert")]));
         let mut w = World::new().gw(gw);
         w.secret("ns", "cert");
         let d = w.run();
-        assert_eq!(
-            d.certificates.values().next().unwrap().domains,
-            Vec::<String>::new()
+        let cert = d.certificates.values().next().unwrap();
+        // Its own names (the SAN of the fixture), explicitly.
+        assert_eq!(cert.domains, vec!["example.com"]);
+        assert!(cert.is_default);
+    }
+
+    #[test]
+    fn hostname_claims_names() {
+        assert!(hostname_claims("a.example.com", "a.example.com"));
+        assert!(!hostname_claims("a.example.com", "b.example.com"));
+        assert!(!hostname_claims("a.example.com", "*.example.com"));
+        assert!(hostname_claims("*.example.com", "*.example.com"));
+        assert!(hostname_claims("*.example.com", "a.example.com"));
+        assert!(hostname_claims("*.example.com", "a.b.example.com"));
+        assert!(hostname_claims("*.example.com", "*.a.example.com"));
+        assert!(!hostname_claims("*.example.com", "example.com"));
+        assert!(!hostname_claims("*.example.com", "aexample.com"));
+        assert!(!hostname_claims("*.example.com", "*"));
+    }
+
+    /// The listeners of the misdirected-request conformance test: one Secret for a
+    /// listener without hostname, an exact, a wildcard and an exact name inside the
+    /// wildcard. Each hostname gets its own certificate, so `strict_sni` can tell them
+    /// apart; the listener without hostname keeps the default certificate.
+    #[test]
+    fn listeners_sharing_a_secret_get_a_certificate_each() {
+        let gw = gateway(
+            "ns",
+            "gw",
+            0,
+            json!([
+                https_listener("https", None, "cert"),
+                https_listener("host", Some("second-example.org"), "cert"),
+                https_listener("wild", Some("*.wildcard.org"), "cert"),
+                https_listener("in-wild", Some("fourth-example.wildcard.org"), "cert"),
+            ]),
         );
+        let mut w = World::new().gw(gw);
+        // The SANs of the conformance suite's certificate.
+        w.secret_for("ns", "cert", &["*", "*.org", "*.wildcard.org"]);
+        let d = w.run();
+        let secret = SecretKey::new("ns", "cert");
+        let cert = |host: Option<&str>| &d.certificates[&names::certificate_name(&secret, host)];
+        assert_eq!(d.certificates.len(), 4);
+        // `*.wildcard.org` belongs to its listener: the default certificate keeps the rest.
+        assert_eq!(cert(None).domains, vec!["*", "*.org"]);
+        assert!(cert(None).is_default);
+        for host in [
+            "second-example.org",
+            "*.wildcard.org",
+            "fourth-example.wildcard.org",
+        ] {
+            assert_eq!(cert(Some(host)).domains, vec![host.to_string()]);
+            assert!(!cert(Some(host)).is_default);
+        }
     }
 
     // ---- listeners ----
@@ -7178,7 +7275,10 @@ mod tests {
             ls_cond(&d, "other", "denied", "Accepted"),
             tf("False", "ListenersNotValid")
         );
-        let cert = &d.certificates[&names::certificate_name(&SecretKey::new("certs", "cert"))];
+        let cert = &d.certificates[&names::certificate_name(
+            &SecretKey::new("certs", "cert"),
+            Some("granted.example.com"),
+        )];
         assert_eq!(cert.domains, vec!["granted.example.com".to_string()]);
     }
 

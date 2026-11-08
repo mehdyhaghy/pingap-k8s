@@ -33,7 +33,10 @@ Gateways, HTTPRoutes and GRPCRoutes into Pingap locations, plugins, certificates
   is back.
 
 Status: endpoint discovery, plus the [Gateway API provider](#gateway-api) (Gateway API v1.7.0
-Standard channel). The frozen Ingress API will not be supported.
+Standard channel, profiles GATEWAY-HTTP and GATEWAY-GRPC). The frozen Ingress API will not be
+supported. Before 1.0, the configuration and the chart values may still change between releases;
+the [CHANGELOG](CHANGELOG.md) says how to upgrade. Each release is tested with one Pingap
+version (see [Pingap side](#pingap-side)).
 
 ## How it works
 
@@ -354,8 +357,8 @@ docker run --rm -v "$PWD/config.toml:/config.toml:ro" ghcr.io/mehdyhaghy/pingap-
 
 ## Pingap side
 
-- Tested with Pingap 0.16.1 (the quickstart default). The controller version tells you the
-  Pingap version it was tested with: `0.16.1x` means Pingap 0.16.1
+- Tested with Pingap 0.16.2 (the quickstart default). The controller version tells you the
+  Pingap version it was tested with: `0.16.2x` means Pingap 0.16.2
   (see [CONTRIBUTING.md](CONTRIBUTING.md#releasing)).
 - Create each owned upstream once, in the admin UI or by hand, with the fields you want (health
   check, timeouts, algorithm). Leave `discovery` empty (static). Or let the controller create a
@@ -423,7 +426,8 @@ Conformance (v1.7.0): GATEWAY-HTTP core 40/40 and extended 46/46; GATEWAY-GRPC c
 | Gateway API | Pingap |
 |---|---|
 | Gateway listener (port, HTTP or HTTPS) | an **existing** Pingap server with that port in `addr` (HTTPS: `global_certificates = true`). The controller never creates servers (a new server needs a Pingap restart): a listener without one gets `Accepted=False` (`PortUnavailable`). |
-| HTTPS `certificateRefs` (a `kubernetes.io/tls` Secret) | a certificate with the listener hostname as `domains`, chosen by SNI; a Secret renewal rewrites it |
+| HTTPS `certificateRefs` (a `kubernetes.io/tls` Secret) | one certificate per Secret and listener hostname, with that hostname as `domains`, chosen by SNI; a listener without hostname gets the default certificate, with the certificate's own names that no listener hostname takes as `domains`. So every name has one certificate, and the TLS server name (SNI) picks the same listener as the `Host`. A Secret renewal rewrites it. |
+| Misdirected requests (HTTP/2 connection reuse) | `strict_sni = true` on HTTPS servers (Pingap 0.16.2): a request whose `Host` belongs to another listener than the TLS server name of its connection gets `421 Misdirected Request`. The chart sets it on the HTTPS servers of `gateway.groups`; add it to other HTTPS servers yourself. |
 | HTTPRoute rule match | one location per server, host and match: `Exact` → `=path`, `PathPrefix` → a segment-aware regex (`/foo` matches `/foo` and `/foo/x`, not `/foobar`), `RegularExpression` → an anchored regex, exact header and query matches → `match_headers` / `match_query`. Explicit location `weight`s encode Gateway API precedence. |
 | `backendRefs` (Services, weighted) | an upstream kept current by the endpoint writer; each Service gets its share of the weight. Backends that are missing, not permitted or of another kind get a 500 for their share (503 for GRPCRoutes); a new backend without endpoints gets a 503 until it has some. |
 | `RequestHeaderModifier`, `ResponseHeaderModifier` | `request_headers` / `response_headers` plugins (Host goes to `proxy_set_headers`) |
@@ -523,7 +527,8 @@ oldest first.
 `status.supportedFeatures` of the GatewayClass:
 
 `BackendTLSPolicy`, `GRPCRoute`, `GRPCRouteNamedRouteRule`, `GRPCRouteRequestHeaderModifier`,
-`Gateway`, `GatewayBackendClientCertificate`, `GatewayHTTPListenerIsolation`, `GatewayPort8080`,
+`Gateway`, `GatewayBackendClientCertificate`, `GatewayHTTPListenerIsolation`,
+`GatewayHTTPSListenerDetectMisdirectedRequests`, `GatewayPort8080`,
 `GatewayStaticAddresses`, `HTTPRoute`,
 `HTTPRoute303RedirectStatusCode`, `HTTPRoute307RedirectStatusCode`,
 `HTTPRoute308RedirectStatusCode`, `HTTPRouteBackendProtocolH2C`, `HTTPRouteBackendURLRewrite`,
@@ -535,12 +540,11 @@ oldest first.
 `HTTPRouteResponseHeaderModification`, `HTTPRouteRetryConnectionError`,
 `HTTPRouteSchemeRedirect`, `ListenerSet`, `ReferenceGrant`.
 
-Not supported: TCPRoute, UDPRoute and TLSRoute (passthrough and terminate; Pingap 0.16.1 is an
+Not supported: TCPRoute, UDPRoute and TLSRoute (passthrough and terminate; Pingap 0.16.2 is an
 HTTP-only L7 proxy, and L4 was declined upstream in
 [vicanso/pingap#159](https://github.com/vicanso/pingap/issues/159)), method matching and regex
 header or query matches, `HTTPRouteRetryCodes`, retry backoff, BackendTLSPolicy SAN validation,
-filters that differ between the weighted backendRefs of a rule, 421 detection of misdirected
-requests (Pingap does not expose the TLS SNI to routing), and session persistence.
+filters that differ between the weighted backendRefs of a rule, and session persistence.
 
 ## Graceful shutdown of application pods (preStop)
 

@@ -5,10 +5,6 @@ what has shipped. Ideas and priorities are discussed in issues: open one to prop
 
 ## Now (late 2026)
 
-- Follow the next Pingap release: `strict_sni` answers `421 Misdirected Request` when a
-  request's `Host` does not match the TLS SNI
-  ([vicanso/pingap#279](https://github.com/vicanso/pingap/issues/279)). Turn it on for Gateway
-  TLS listeners and claim `GatewayHTTPSListenerDetectMisdirectedRequests`.
 - Submit the Gateway API conformance report so the project is listed as a conformant
   implementation.
 - A long-running soak test (load plus pod, node, leader and etcd failures) to back the

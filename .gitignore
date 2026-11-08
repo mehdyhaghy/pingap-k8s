@@ -165,9 +165,16 @@ temp/
 # Local notes and the design spec, kept private (not in the repository).
 # No leading slash: these match in every folder, not only at the root.
 ISSUE-*-RESPONSE.md
+ISSUE-*.md
+PR-*.md
 SPEC.md
+SPEC.*.md
 notes/
+drafts/
+scratch/
+.scratch/
 *.private.md
+*.draft.md
 
 # ---------------------------------------------------------------------------
 # Editors and IDEs
@@ -182,6 +189,7 @@ notes/
 .zed/
 *.sublime-project
 *.sublime-workspace
+*.code-workspace
 .history/
 .direnv/
 .envrc

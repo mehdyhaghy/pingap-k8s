@@ -28,9 +28,9 @@ use tracing::warn;
 
 use crate::etcd::{SERVICE_UPDATE_FREQUENCY, check_name, entry_key};
 use crate::gateway::model::{
-    Deferred, Desired, Expect, Op, Plan, Step, Stored, StoredEntry, is_owned,
+    Deferred, Desired, Expect, Op, Plan, SecretKey, Step, Stored, StoredEntry, is_owned,
 };
-use crate::gateway::{names, render};
+use crate::gateway::render;
 
 /// Plugins Pingap provides without a stored entry.
 pub const BUILTIN_PLUGINS: &[&str] = &[
@@ -197,16 +197,24 @@ pub fn plan(input: &PlanInput<'_>) -> Plan {
         }
         step.push(put(&keys, &stored.plugins, "plugins", name, rendered));
     }
-    // Secrets still named by a listener keep their stored certificate, also while they
-    // are missing or invalid.
-    let named: BTreeSet<String> = desired
+    // A Secret still named by a listener keeps its stored certificates while it is
+    // missing or invalid (no desired certificate comes from it). Once it is usable, its
+    // desired certificates replace the stored ones. A stored entry's Secret is read from
+    // its remark.
+    let usable: BTreeSet<&SecretKey> = desired.certificates.values().map(|c| &c.secret).collect();
+    let broken: BTreeSet<String> = desired
         .referenced
         .secrets
         .iter()
-        .map(names::certificate_name)
+        .filter(|s| !usable.contains(s))
+        .map(render::secret_remark)
         .collect();
     for (name, entry) in &stored.certificates {
-        if is_owned(name) && !desired.certificates.contains_key(name) && !named.contains(name) {
+        if !is_owned(name) || desired.certificates.contains_key(name) {
+            continue;
+        }
+        let remark = render::certificate_remark(&entry.value, name);
+        if !remark.is_some_and(|r| broken.contains(&r)) {
             step.push(delete(entry));
         }
     }
@@ -425,6 +433,7 @@ mod tests {
     use crate::gateway::model::{
         CertificateEntry, ExternalUpstream, LocationEntry, PluginEntry, RouteKey, SecretKey,
     };
+    use crate::gateway::names;
     use crate::gateway::render::{render_location, server_locations};
     use crate::types::ServiceKey;
 
@@ -714,6 +723,7 @@ mod tests {
                     name: "tls".into(),
                 },
                 domains: s(&["shop.example.com"]),
+                is_default: false,
                 tls_cert: "cert".into(),
                 tls_key: "key".into(),
             },
@@ -756,7 +766,7 @@ mod tests {
             namespace: "shop".into(),
             name: "tls".into(),
         };
-        let name = names::certificate_name(&secret);
+        let name = names::certificate_name(&secret, Some("shop.example.com"));
         let mut fake = Fake::new();
         fake.server("http", &[]);
         let mut case = Case::new();
@@ -765,6 +775,7 @@ mod tests {
             CertificateEntry {
                 secret: secret.clone(),
                 domains: s(&["shop.example.com"]),
+                is_default: false,
                 tls_cert: "cert".into(),
                 tls_key: "key".into(),
             },
@@ -782,6 +793,42 @@ mod tests {
         // No listener names it any more: deleted.
         Case::new().converge(&mut fake);
         assert!(!fake.has("certificates", &name));
+    }
+
+    /// A usable Secret's desired certificates replace its stored ones: an entry left
+    /// from another hostname (or the one-per-Secret names of earlier releases) goes.
+    #[test]
+    fn stale_certificate_of_a_usable_secret_is_deleted() {
+        let secret = SecretKey {
+            namespace: "shop".into(),
+            name: "tls".into(),
+        };
+        let entry = |host: &str| CertificateEntry {
+            secret: secret.clone(),
+            domains: s(&[host]),
+            is_default: false,
+            tls_cert: "cert".into(),
+            tls_key: "key".into(),
+        };
+        let old = names::certificate_name(&secret, None);
+        let new = names::certificate_name(&secret, Some("b.example.com"));
+        let mut fake = Fake::new();
+        fake.server("http", &[]);
+        let mut case = Case::new();
+        case.desired
+            .certificates
+            .insert(old.clone(), entry("a.example.com"));
+        case.converge(&mut fake);
+        assert!(fake.has("certificates", &old));
+
+        let mut case = Case::new();
+        case.desired.referenced.secrets.insert(secret.clone());
+        case.desired
+            .certificates
+            .insert(new.clone(), entry("b.example.com"));
+        case.converge(&mut fake);
+        assert!(fake.has("certificates", &new));
+        assert!(!fake.has("certificates", &old));
     }
 
     #[test]

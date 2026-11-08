@@ -7,7 +7,7 @@ Please do not open a public issue. Report it privately through GitHub: the repos
 how to reproduce it, and the impact you see.
 
 You get an answer within 7 days. A fix is released as a new patch version (see
-[Releasing](README.md#releasing)) and credited in the CHANGELOG unless you ask otherwise.
+[Releasing](CONTRIBUTING.md#releasing)) and credited in the CHANGELOG unless you ask otherwise.
 
 ## Supported versions
 

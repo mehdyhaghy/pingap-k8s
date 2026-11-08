@@ -1,0 +1,20 @@
+name: Feature request
+description: Propose a new feature or a change in behavior.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and why it is hard or impossible today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: The proposal
+      description: How it could work. For Gateway API features, name the feature or the field.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered

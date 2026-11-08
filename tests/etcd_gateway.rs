@@ -184,6 +184,7 @@ async fn apply_creates_and_removes_entries() {
                 name: "tls".into(),
             },
             domains: s(&["shop.example.com"]),
+            is_default: false,
             tls_cert: "cert".into(),
             tls_key: "key".into(),
         },

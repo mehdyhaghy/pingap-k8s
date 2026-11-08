@@ -133,7 +133,7 @@ kind load docker-image "$IMAGE" "$RUNNER_IMAGE" --name "$CLUSTER"
 # Third-party images of the chart, loaded when already cached locally (only the
 # node's platform; see scripts/e2e-up.sh). The rest is pulled in the cluster.
 node="$CLUSTER-control-plane"
-for img in quay.io/coreos/etcd:v3.6.12 vicanso/pingap:0.16.1; do
+for img in quay.io/coreos/etcd:v3.6.12 vicanso/pingap:0.16.2; do
   if docker image inspect "$img" >/dev/null 2>&1; then
     docker save "$img" | docker exec -i "$node" \
         ctr -n k8s.io images import --platform "linux/$ARCH" --digests \

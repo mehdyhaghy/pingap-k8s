@@ -70,6 +70,48 @@ pub fn certificate_from_secret(secret: &Secret) -> Result<(String, String), Stri
     Ok((certs, tls_key))
 }
 
+/// The names Pingap serves a certificate for when its entry has no `domains`: the DNS
+/// names and IP addresses in the subject alternative names of the leaf (the first
+/// `CERTIFICATE` block), lowercase, sorted and without duplicates. Empty when the leaf
+/// does not parse or has no SAN.
+pub fn certificate_names(cert_pem: &str) -> Vec<String> {
+    use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
+    let Some(der) = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+        .next()
+        .and_then(Result::ok)
+    else {
+        return Vec::new();
+    };
+    let Ok((_, cert)) = X509Certificate::from_der(der.as_ref()) else {
+        return Vec::new();
+    };
+    let Ok(Some(san)) = cert.subject_alternative_name() else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = san
+        .value
+        .general_names
+        .iter()
+        .filter_map(|name| match name {
+            GeneralName::DNSName(dns) => Some(dns.to_ascii_lowercase()),
+            GeneralName::IPAddress(bytes) => ip_from_san(bytes).map(|ip| ip.to_string()),
+            _ => None,
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// An IPv4 or IPv6 address of a SAN `iPAddress` entry.
+fn ip_from_san(bytes: &[u8]) -> Option<std::net::IpAddr> {
+    match bytes.len() {
+        4 => <[u8; 4]>::try_from(bytes).ok().map(std::net::IpAddr::from),
+        16 => <[u8; 16]>::try_from(bytes).ok().map(std::net::IpAddr::from),
+        _ => None,
+    }
+}
+
 /// The `CERTIFICATE` blocks of a CA bundle (at least one), re-encoded, as the PEM text of a
 /// Pingap upstream `ca`. Pingap refuses an upstream whose `ca` does not parse, so every
 /// block must decode and hold a DER certificate structure; other blocks and text around
@@ -384,5 +426,34 @@ pub(crate) mod tests {
         assert!(ca_bundle(&pem_text("CERTIFICATE", "AAAA")).is_err());
         // Broken base64.
         assert!(ca_bundle(&pem_text("CERTIFICATE", "A*A=")).is_err());
+    }
+
+    #[test]
+    fn certificate_names_are_the_leaf_san() {
+        let sans = [
+            "*",
+            "*.org",
+            "B.Example.com",
+            "a.example.com",
+            "10.0.0.1",
+            "::1",
+        ];
+        let leaf = rcgen::generate_simple_self_signed(sans.map(String::from).to_vec()).unwrap();
+        let other = rcgen::generate_simple_self_signed(vec!["other.org".into()]).unwrap();
+        let chain = format!("{}{}", leaf.cert.pem(), other.cert.pem());
+        assert_eq!(
+            certificate_names(&chain),
+            [
+                "*",
+                "*.org",
+                "10.0.0.1",
+                "::1",
+                "a.example.com",
+                "b.example.com"
+            ]
+        );
+        assert_eq!(certificate_names(&fixture().cert), ["example.com"]);
+        assert!(certificate_names("").is_empty());
+        assert!(certificate_names(&pem_text("CERTIFICATE", "AAAA")).is_empty());
     }
 }

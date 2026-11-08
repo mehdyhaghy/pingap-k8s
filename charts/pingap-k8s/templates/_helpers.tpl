@@ -223,6 +223,10 @@ DNS name), ports ([{port, targetPort, tls, server}], server = "gw-<name>-<port>"
 addr = "[::]:{{ int .targetPort }}"
 {{- if .tls }}
 global_certificates = true
+{{- if not (hasKey .settings "strict_sni") }}
+# 421 Misdirected Request when the Host belongs to another listener than the SNI.
+strict_sni = true
+{{- end }}
 {{- end }}
 {{- with .settings }}
 {{- if or (hasKey . "addr") (hasKey . "global_certificates") (hasKey . "locations") }}

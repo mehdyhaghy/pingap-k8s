@@ -1755,7 +1755,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pingap-k8s"
-version = "0.16.10"
+version = "0.16.20"
 dependencies = [
  "anyhow",
  "axum",
@@ -1792,6 +1792,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "x509-parser",
 ]
 
 [[package]]

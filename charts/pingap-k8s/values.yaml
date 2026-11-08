@@ -94,7 +94,8 @@ gateway:
   #         targetPort: 9080  # port of the Pingap server
   #       - port: 443
   #         targetPort: 9443
-  #         tls: true         # HTTPS listeners (global_certificates server)
+  #         tls: true         # HTTPS listeners (global_certificates and
+  #                           # strict_sni server)
   #         settings: {}      # more fields of the Pingap server, e.g. enabled_h2
   #     addresses: []
   groups: []
@@ -346,7 +347,7 @@ pingap:
   image:
     # The Debian based image: the seed step below needs its shell.
     repository: vicanso/pingap
-    tag: "0.16.1"
+    tag: "0.16.2"
     pullPolicy: IfNotPresent
   # etcd URL for Pingap. Empty: the controller's URL (etcd.url, or the one built
   # for the bundled etcd). Pingap's client TLS Secret is mounted at the same
