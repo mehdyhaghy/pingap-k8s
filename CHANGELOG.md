@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.16.20 (unreleased)
+## 0.16.20 (2026-11-08)
 
 First public release. Tested with Pingap 0.16.2 (`pingap.image.tag`) on Kubernetes 1.37, IPv4
 and dual-stack. Versions follow Pingap: the Pingap version a release is tested with plus one
