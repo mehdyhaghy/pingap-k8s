@@ -2,8 +2,9 @@ name: release
 
 # Publishes a release from a `v<version>` tag: the multi-arch image, the Helm
 # chart (OCI) and a GitHub Release with the chart package, plain manifests, the
-# kubectl-pingap plugin (linux/darwin, amd64/arm64, with checksums) and a krew
-# manifest for it. The plugin is not part of the image.
+# kubectl-pingap plugin (linux/darwin amd64/arm64, windows amd64, with checksums)
+# and a krew manifest for it, then publishes the kubectl-pingap crate on crates.io
+# (trusted publishing). The plugin is not part of the image.
 # The image and the chart are signed with cosign (keyless, Sigstore), and so are
 # the release files (a .sigstore.json bundle next to each). The signer identity is
 # this workflow; Sigstore's public transparency log records it (repository name,
@@ -114,10 +115,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: test
-        run: cargo test --locked
+        run: cargo test --workspace --locked
 
   helm:
     name: helm lint and manifests
@@ -202,9 +203,9 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign sign --yes "$IMAGE@$DIGEST"
 
-  # kubectl plugin, built natively on each platform (protoc is needed by the
-  # crate's etcd-client build script even though the plugin does not use it).
-  # Linux builds use Ubuntu 22.04 for an older glibc baseline.
+  # kubectl plugin (the kubectl-pingap crate, which does not need protoc), built
+  # natively on each platform. Linux builds use Ubuntu 22.04 for an older glibc
+  # baseline.
   plugin:
     name: kubectl-pingap (${{ matrix.os }}/${{ matrix.arch }})
     needs: [ci, verify, rust]
@@ -217,6 +218,10 @@ jobs:
           - { os: linux, arch: arm64, runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
           - { os: darwin, arch: amd64, runner: macos-15-intel, target: x86_64-apple-darwin }
           - { os: darwin, arch: arm64, runner: macos-15, target: aarch64-apple-darwin }
+          - { os: windows, arch: amd64, runner: windows-2025, target: x86_64-pc-windows-msvc }
+    defaults:
+      run:
+        shell: bash
     env:
       VERSION: ${{ needs.verify.outputs.version }}
       OS: ${{ matrix.os }}
@@ -226,16 +231,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      - name: Install protoc (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
-
-      - name: Install protoc (macOS)
-        if: runner.os == 'macOS'
-        run: brew install protobuf
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
@@ -247,18 +242,29 @@ jobs:
           key: plugin-${{ matrix.target }}
 
       - name: build
-        run: cargo build --release --locked --bin kubectl-pingap --target "$TARGET"
+        run: cargo build --release --locked -p kubectl-pingap --target "$TARGET"
 
+      # A .tar.gz for Linux and macOS, a .zip for Windows (kubectl-pingap.exe).
       - name: package
         run: |
           set -euo pipefail
           name="kubectl-pingap_${VERSION}_${OS}_${ARCH}"
+          exe=kubectl-pingap
+          [ "$OS" = windows ] && exe=kubectl-pingap.exe
           mkdir -p staging dist
-          cp "target/$TARGET/release/kubectl-pingap" LICENSE staging/
-          ./staging/kubectl-pingap --version
-          tar -czf "dist/$name.tar.gz" -C staging kubectl-pingap LICENSE
-          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
-          cat "dist/$name.tar.gz.sha256"
+          cp "target/$TARGET/release/$exe" LICENSE staging/
+          "./staging/$exe" --version
+          if [ "$OS" = windows ]; then
+            archive="$name.zip"
+            (cd staging && 7z a -tzip "../dist/$archive" "$exe" LICENSE > /dev/null)
+          else
+            archive="$name.tar.gz"
+            tar -czf "dist/$archive" -C staging "$exe" LICENSE
+          fi
+          # "<sha256>  <file>" on every runner (shasum on macOS; no "*" binary marker).
+          if command -v sha256sum > /dev/null; then sum=$(sha256sum "dist/$archive"); else sum=$(shasum -a 256 "dist/$archive"); fi
+          echo "${sum%% *}  $archive" > "dist/$archive.sha256"
+          cat "dist/$archive.sha256"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -319,19 +325,21 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          cat kubectl-pingap_"$VERSION"_*.tar.gz.sha256 > "kubectl-pingap_${VERSION}_checksums.txt"
+          cat kubectl-pingap_"$VERSION"_*.sha256 > "kubectl-pingap_${VERSION}_checksums.txt"
+          rm kubectl-pingap_"$VERSION"_*.sha256
           sha256sum -c "kubectl-pingap_${VERSION}_checksums.txt"
-          sha() { cut -d' ' -f1 "kubectl-pingap_${VERSION}_$1.tar.gz.sha256"; }
-          SHA256_LINUX_AMD64=$(sha linux_amd64)
-          SHA256_LINUX_ARM64=$(sha linux_arm64)
-          SHA256_DARWIN_AMD64=$(sha darwin_amd64)
-          SHA256_DARWIN_ARM64=$(sha darwin_arm64)
-          export SHA256_LINUX_AMD64 SHA256_LINUX_ARM64 SHA256_DARWIN_AMD64 SHA256_DARWIN_ARM64
+          sha() { grep " kubectl-pingap_${VERSION}_$1\$" "kubectl-pingap_${VERSION}_checksums.txt" | cut -d' ' -f1; }
+          SHA256_LINUX_AMD64=$(sha linux_amd64.tar.gz)
+          SHA256_LINUX_ARM64=$(sha linux_arm64.tar.gz)
+          SHA256_DARWIN_AMD64=$(sha darwin_amd64.tar.gz)
+          SHA256_DARWIN_ARM64=$(sha darwin_arm64.tar.gz)
+          SHA256_WINDOWS_AMD64=$(sha windows_amd64.zip)
+          export SHA256_LINUX_AMD64 SHA256_LINUX_ARM64 SHA256_DARWIN_AMD64 SHA256_DARWIN_ARM64 SHA256_WINDOWS_AMD64
           # shellcheck disable=SC2016 # the variable names are envsubst's argument
-          envsubst '${VERSION} ${SHA256_LINUX_AMD64} ${SHA256_LINUX_ARM64} ${SHA256_DARWIN_AMD64} ${SHA256_DARWIN_ARM64}' \
+          envsubst '${VERSION} ${SHA256_LINUX_AMD64} ${SHA256_LINUX_ARM64} ${SHA256_DARWIN_AMD64} ${SHA256_DARWIN_ARM64} ${SHA256_WINDOWS_AMD64}' \
             < ../krew/pingap.yaml > pingap.yaml
           if grep -n '[$]{' pingap.yaml; then echo "::error::unfilled placeholder in pingap.yaml"; exit 1; fi
-          [ "$(grep -c 'sha256: [0-9a-f]\{64\}$' pingap.yaml)" = 4 ] || { echo "::error::expected 4 sha256 lines"; exit 1; }
+          [ "$(grep -c 'sha256: [0-9a-f]\{64\}$' pingap.yaml)" = 5 ] || { echo "::error::expected 5 sha256 lines"; exit 1; }
           ls -l
 
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -376,6 +384,7 @@ jobs:
             "dist/pingap-k8s-$VERSION.tgz" \
             "dist/pingap-k8s.yaml#pingap-k8s.yaml" \
             dist/kubectl-pingap_"$VERSION"_*.tar.gz \
+            dist/kubectl-pingap_"$VERSION"_*.zip \
             "dist/kubectl-pingap_${VERSION}_checksums.txt" \
             "dist/pingap.yaml#pingap.yaml (krew manifest)" \
             dist/*.sigstore.json
@@ -388,7 +397,8 @@ jobs:
             echo "- image: $IMAGE:$VERSION (built, not pushed)"
             echo "- chart: dist/pingap-k8s-$VERSION.tgz (not pushed to $CHART_REPO)"
             echo "- manifests: dist/pingap-k8s.yaml"
-            echo "- kubectl plugin: dist/kubectl-pingap_${VERSION}_*.tar.gz, krew manifest dist/pingap.yaml"
+            echo "- kubectl plugin: dist/kubectl-pingap_${VERSION}_*.{tar.gz,zip}, krew manifest dist/pingap.yaml"
+            echo "- crate: kubectl-pingap $VERSION (not published to crates.io)"
             echo "- signatures: none (cosign signs only on publish)"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -397,3 +407,47 @@ jobs:
           name: release-${{ env.VERSION }}
           path: dist/
           if-no-files-found: error
+
+  # The kubectl-pingap crate on crates.io, after the GitHub Release (cargo binstall
+  # downloads its archives). Trusted publishing: a short-lived token from GitHub's
+  # OIDC identity, no stored secret. crates.io allows it for this repository and
+  # workflow (crate settings > Trusted Publishing). A version that is already on
+  # crates.io is skipped, so a rerun or a version published by hand does not fail.
+  crate:
+    name: kubectl-pingap on crates.io
+    needs: [verify, release]
+    if: needs.verify.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: already published?
+        id: exists
+        run: |
+          set -euo pipefail
+          code=$(curl -s -o /dev/null -w '%{http_code}' -A "pingap-k8s release (github.com/mehdyhaghy/pingap-k8s)" \
+            "https://crates.io/api/v1/crates/kubectl-pingap/$VERSION")
+          echo "crates.io kubectl-pingap $VERSION: HTTP $code"
+          echo "skip=$([ "$code" = 200 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        if: steps.exists.outputs.skip != 'true'
+        with:
+          toolchain: stable
+
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+        if: steps.exists.outputs.skip != 'true'
+        id: auth
+
+      - name: cargo publish
+        if: steps.exists.outputs.skip != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish -p kubectl-pingap --locked

@@ -23,7 +23,7 @@ for tool in kind docker kubectl helm cargo curl; do
   command -v "$tool" >/dev/null || { echo "missing tool: $tool" >&2; exit 1; }
 done
 docker image inspect "$IMAGE" >/dev/null || { echo "image $IMAGE not found (make docker)" >&2; exit 1; }
-(cd "$ROOT" && cargo build --quiet --bin kubectl-pingap)
+(cd "$ROOT" && cargo build --quiet -p kubectl-pingap)
 PLUGIN="$ROOT/target/debug/kubectl-pingap"
 cat >"$S/plugin-values.yaml" <<EOF
 image:

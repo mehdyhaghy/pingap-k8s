@@ -11,7 +11,8 @@ cd "$(dirname "$0")/.."
 
 CHART=charts/pingap-k8s
 
-cargo_version=$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p && /^version *=/{gsub(/"/,"",$3); print $3; exit}' Cargo.toml)
+# The workspace version, shared by the controller and the kubectl-pingap crate.
+cargo_version=$(awk '/^\[workspace\.package\]/{p=1;next} /^\[/{p=0} p && /^version *=/{gsub(/"/,"",$3); print $3; exit}' Cargo.toml)
 chart_version=$(sed -n 's/^version: *//p' "$CHART/Chart.yaml" | tr -d "\"' ")
 app_version=$(sed -n 's/^appVersion: *//p' "$CHART/Chart.yaml" | tr -d "\"' ")
 # The first `tag:` under the top-level `pingap:` key.
@@ -20,7 +21,7 @@ pingap_version=$(awk '/^[^ #]/{p=($1=="pingap:")} p && $1=="tag:"{gsub(/"/,"",$2
 fail=0
 err() { echo "version check: $*" >&2; fail=1; }
 
-[ -n "$cargo_version" ] || err "no version in Cargo.toml [package]"
+[ -n "$cargo_version" ] || err "no version in Cargo.toml [workspace.package]"
 [ -n "$pingap_version" ] || err "no pingap.image.tag in $CHART/values.yaml"
 [ "$chart_version" = "$cargo_version" ] || err "$CHART/Chart.yaml version $chart_version does not match Cargo.toml $cargo_version"
 [ "$app_version" = "$cargo_version" ] || err "$CHART/Chart.yaml appVersion $app_version does not match Cargo.toml $cargo_version"

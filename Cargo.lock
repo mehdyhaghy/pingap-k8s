@@ -1354,6 +1354,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kubectl-pingap"
+version = "0.16.20"
+dependencies = [
+ "anyhow",
+ "clap",
+ "pingap-k8s",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1767,6 +1779,7 @@ dependencies = [
  "idna_adapter",
  "k8s-openapi",
  "kube",
+ "kubectl-pingap",
  "opentelemetry",
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",

@@ -666,11 +666,15 @@ status:
 ```
 
 Install the plugin from the [latest release](https://github.com/mehdyhaghy/pingap-k8s/releases/latest)
-(`kubectl-pingap_<version>_<os>_<arch>.tar.gz` for linux/darwin and amd64/arm64, checked against
-`kubectl-pingap_<version>_checksums.txt`) and put `kubectl-pingap` on your `PATH`, or with krew:
+(`kubectl-pingap_<version>_<os>_<arch>.tar.gz` for Linux and macOS on amd64 and arm64,
+`kubectl-pingap_<version>_windows_amd64.zip` for Windows, checked against
+`kubectl-pingap_<version>_checksums.txt`) and put `kubectl-pingap` on your `PATH`, or with krew or
+cargo:
 
 ```sh
 kubectl krew install --manifest-url=https://github.com/mehdyhaghy/pingap-k8s/releases/latest/download/pingap.yaml
+cargo binstall kubectl-pingap   # the release binary, with cargo-binstall
+cargo install kubectl-pingap    # build from source (crates.io)
 ```
 
 ```sh

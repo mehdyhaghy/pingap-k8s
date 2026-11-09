@@ -12,8 +12,12 @@ STATUS=1 scripts/smoke-local.sh          # local binary + local etcd + kind, inc
 make docker && scripts/plugin-kind.sh    # kubectl plugin against the chart on kind
 ```
 
-Building needs `protoc` and the protobuf well-known types (Debian/Ubuntu:
-`protobuf-compiler libprotobuf-dev`), used by `etcd-client`. The Docker build cross-compiles in the
+The repository is a Cargo workspace: the controller is the root package (`src/`, not published),
+the kubectl plugin is `crates/kubectl-pingap` (published on crates.io). The plugin crate also holds
+the `/status` document types, which the controller uses. Both share the workspace version.
+
+Building the controller needs `protoc` and the protobuf well-known types (Debian/Ubuntu:
+`protobuf-compiler libprotobuf-dev`), used by `etcd-client`; the plugin crate does not. The Docker build cross-compiles in the
 builder stage, so a multi-arch build needs no emulation.
 
 ## Tests
@@ -24,7 +28,7 @@ the fix. `make check` must pass before a pull request is merged.
 
 | Command | What it covers | CI job |
 | --- | --- | --- |
-| `cargo test` | unit tests (including Kubernetes Events against a mock API server), OTLP export to an in-process receiver, the kubectl plugin against a fake `kubectl` | `rust` |
+| `cargo test --workspace` | unit tests (including Kubernetes Events against a mock API server), OTLP export to an in-process receiver, the kubectl plugin against a fake `kubectl`; the plugin crate packaged alone | `rust`, `plugin-windows` (plugin unit tests on Windows) |
 | `scripts/test-etcd.sh` | `tests/etcd_*.rs` against a throwaway etcd on 127.0.0.1: CAS writes, owned-key watch, compaction, leader election, the Gateway writer | `integration` |
 | `scripts/test-kind.sh` | `tests/watch_kind.rs`: the Service and EndpointSlice watchers on a throwaway kind cluster | `integration` |
 | `scripts/e2e-run.sh` | the end-to-end suite with the chart, Pingap, etcd and the Gateway API CRDs on kind | `e2e` |
@@ -81,8 +85,9 @@ our own release number for that Pingap version. Releases tested with Pingap 0.16
 version is `pingap.image.tag` in the chart values (the quickstart default). `make version-check`
 (part of `make check` and CI) checks this.
 
-1. Bump the version in three places to the same value: `version` in `Cargo.toml`, and `version`
-   and `appVersion` in `charts/pingap-k8s/Chart.yaml`. For a new Pingap version, also set
+1. Bump the version in three places to the same value: `[workspace.package] version` in
+   `Cargo.toml` (the controller and the plugin crate), and `version` and `appVersion` in
+   `charts/pingap-k8s/Chart.yaml`. For a new Pingap version, also set
    `pingap.image.tag` in `charts/pingap-k8s/values.yaml` and start again at digit 0. Run
    `cargo check` to update `Cargo.lock`, then `make manifests` and `make check`. Move the
    CHANGELOG `Unreleased` entries under the new version.
@@ -99,7 +104,11 @@ passes. Then it pushes the `linux/amd64` + `linux/arm64` image to
 `ghcr.io/mehdyhaghy/pingap-k8s:<version>` and `:latest` (with SBOM and provenance attestations),
 pushes the chart to `oci://ghcr.io/mehdyhaghy/charts/pingap-k8s`, and creates a GitHub Release
 with generated notes, the chart package, `pingap-k8s.yaml` (plain manifests pinned to the release
-image) and the kubectl plugin archives and krew manifest. It signs the image, the chart and the
+image) and the kubectl plugin archives (Linux, macOS, Windows) and krew manifest, then publishes
+the `kubectl-pingap` crate on crates.io with trusted publishing (no stored token; a version
+already there is skipped). crates.io accepts it only after the crate exists and its settings
+(Trusted Publishing) allow this repository and the workflow `release.yml`; the first version
+was published by hand with `cargo publish -p kubectl-pingap`. It signs the image, the chart and the
 release files with cosign keyless signing; Sigstore's public transparency log records each
 signature with the repository name, workflow path and tag. To test the pipeline without
 publishing, run the workflow manually with `dry-run` checked (the default).

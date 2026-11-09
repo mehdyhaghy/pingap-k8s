@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- kubectl plugin on Windows: `kubectl-pingap_<version>_windows_amd64.zip` in every release and
+  in the krew manifest.
+- The plugin is its own crate, `kubectl-pingap`, published on crates.io: `cargo install
+  kubectl-pingap` builds it without `protoc`, and `cargo binstall kubectl-pingap` downloads the
+  release binary. The repository is now a Cargo workspace; the controller is not published.
+
 ## 0.16.20 (2026-11-08)
 
 First public release. Tested with Pingap 0.16.2 (`pingap.image.tag`) on Kubernetes 1.37, IPv4

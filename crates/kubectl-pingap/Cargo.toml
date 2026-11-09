@@ -1,0 +1,55 @@
+[package]
+name = "kubectl-pingap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "kubectl plugin for pingap-k8s: shows what the controller wrote to Pingap, per upstream"
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/mehdyhaghy/pingap-k8s"
+readme = "README.md"
+keywords = ["kubernetes", "kubectl", "kubectl-plugin", "pingap"]
+categories = ["command-line-utilities"]
+# Only what builds the plugin; the tests need the controller crate.
+include = ["src/**/*.rs", "README.md", "LICENSE"]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "kubectl-pingap"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The controller's real /status server, for the end-to-end tests (Unix only: they
+# run a shell script as a fake kubectl). Path only, so it is left out on publish.
+[target.'cfg(unix)'.dev-dependencies]
+pingap-k8s = { path = "../.." }
+tokio = { version = "~1.53", features = ["macros", "rt-multi-thread", "net"] }
+
+# cargo binstall: the release archives instead of a build from source.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/kubectl-pingap_{ version }_{ target }.tar.gz"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/kubectl-pingap_{ version }_linux_amd64.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/kubectl-pingap_{ version }_linux_arm64.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/kubectl-pingap_{ version }_darwin_amd64.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/kubectl-pingap_{ version }_darwin_arm64.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/kubectl-pingap_{ version }_windows_amd64.zip"
+pkg-fmt = "zip"

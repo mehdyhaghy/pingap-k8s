@@ -1,8 +1,9 @@
-# Allowlist: only Cargo.toml, Cargo.lock and src/ are needed to build the image.
+# Allowlist: only Cargo.toml, Cargo.lock, src/ and crates/ are needed to build the image.
 *
 !Cargo.toml
 !Cargo.lock
 !src/
+!crates/
 src/**/*.pem
 src/**/*.key
 src/**/*.crt

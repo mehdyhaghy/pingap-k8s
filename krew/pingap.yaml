@@ -68,3 +68,15 @@ spec:
           to: .
         - from: LICENSE
           to: .
+    - selector:
+        matchLabels:
+          os: windows
+          arch: amd64
+      uri: https://github.com/mehdyhaghy/pingap-k8s/releases/download/v${VERSION}/kubectl-pingap_${VERSION}_windows_amd64.zip
+      sha256: ${SHA256_WINDOWS_AMD64}
+      bin: kubectl-pingap.exe
+      files:
+        - from: kubectl-pingap.exe
+          to: .
+        - from: LICENSE
+          to: .

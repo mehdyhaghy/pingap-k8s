@@ -17,7 +17,7 @@ use anyhow::{Context, anyhow, bail};
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 
-use pingap_k8s::status::{STATUS_VERSION, StatusDoc, UpstreamStatus};
+use kubectl_pingap::{STATUS_VERSION, StatusDoc, UpstreamStatus};
 
 /// Pod annotation the chart sets when `status.enabled` is true.
 const STATUS_PORT_ANNOTATION: &str = "pingap-k8s/status-port";
@@ -678,7 +678,7 @@ fn admin_message(svc: &AdminService, port: u16, password: Option<&str>) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pingap_k8s::status::{ControllerInfo, EtcdInfo, LastWrite, WatchInfo, WatchersInfo};
+    use kubectl_pingap::{ControllerInfo, EtcdInfo, LastWrite, WatchInfo, WatchersInfo};
 
     fn pod() -> Pod {
         Pod {

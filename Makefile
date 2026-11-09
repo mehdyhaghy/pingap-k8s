@@ -16,10 +16,10 @@ fmt-check:
 	cargo fmt --all -- --check
 
 clippy:
-	cargo clippy --all-targets --locked -- -D warnings
+	cargo clippy --workspace --all-targets --locked -- -D warnings
 
 test:
-	cargo test --locked
+	cargo test --workspace --locked
 
 # Dependency licenses (CNCF allowlist) and sources; needs cargo-deny.
 deny:
