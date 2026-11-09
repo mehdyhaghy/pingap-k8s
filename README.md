@@ -71,8 +71,7 @@ a warning is logged: Pingap rejects an empty list, and its health checks mark th
 
 ### Prerequisites
 
-- Kubernetes 1.35 or newer. CI tests 1.35 (the oldest minor still supported upstream) and 1.37,
-  IPv4 and dual-stack.
+- Kubernetes 1.37 or newer. CI tests 1.37, IPv4 and dual-stack.
 - An etcd reachable from the cluster, on the private network only. You can reuse the etcd
   Pingap already uses, or let the chart deploy one (`etcd.deploy=true`).
 - Pingap running against that etcd with autoreload. It must reach pod IPs, so in practice it runs

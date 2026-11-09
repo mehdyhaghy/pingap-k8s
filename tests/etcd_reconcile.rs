@@ -65,7 +65,7 @@ impl SnapshotSource for Fixed {
             })),
             slices: vec![Arc::new(EndpointSlice {
                 address_type: "IPv4".into(),
-                endpoints: vec![ready("10.0.0.1"), ready("10.0.0.2")],
+                endpoints: Some(vec![ready("10.0.0.1"), ready("10.0.0.2")]),
                 ports: Some(vec![EndpointPort {
                     name: Some("http".into()),
                     port: Some(8080),

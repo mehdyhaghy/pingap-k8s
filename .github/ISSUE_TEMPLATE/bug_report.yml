@@ -23,7 +23,7 @@ body:
     id: kubernetes
     attributes:
       label: Kubernetes version and distribution
-      placeholder: "1.35.8, kind"
+      placeholder: "1.37.0, kind"
     validations:
       required: true
   - type: textarea

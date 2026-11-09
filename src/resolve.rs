@@ -348,7 +348,8 @@ pub fn resolve(inputs: &[ServiceInput<'_>], opts: &UpstreamOptions) -> Resolved 
 
         let mut port_missing = false;
         for (slice, ipv6) in slices {
-            if slice.endpoints.is_empty() {
+            let endpoints = slice.endpoints.as_deref().unwrap_or_default();
+            if endpoints.is_empty() {
                 continue;
             }
             let Some(port) = find_slice_port(slice, port_name) else {
@@ -356,7 +357,7 @@ pub fn resolve(inputs: &[ServiceInput<'_>], opts: &UpstreamOptions) -> Resolved 
                 continue;
             };
             let primary = ipv6 == primary_v6;
-            for endpoint in &slice.endpoints {
+            for endpoint in endpoints {
                 if dedupe_pods {
                     let pod = pod_identity(endpoint);
                     if primary {
@@ -543,6 +544,7 @@ fn has_endpoint(snapshot: &ServiceSnapshot, port_name: &str) -> bool {
             && slice
                 .endpoints
                 .iter()
+                .flatten()
                 .any(|e| classify(e.conditions.as_ref(), false) != Class::Excluded)
     })
 }
@@ -833,7 +835,7 @@ mod tests {
     ) -> Arc<EndpointSlice> {
         Arc::new(EndpointSlice {
             address_type: address_type.into(),
-            endpoints,
+            endpoints: Some(endpoints),
             ports: Some(
                 ports
                     .iter()

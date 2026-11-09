@@ -37,8 +37,8 @@ the fix. `make check` must pass before a pull request is merged.
 
 The `ci` workflow does not run on every push: run `make check` and the scripts above locally,
 and start it by hand for a clean run (`gh workflow run ci`, or Actions > ci > Run workflow; add
-`-f pingap-latest=true` to also test Pingap `latest`). The e2e job runs on kindest/node v1.35.8
-and v1.37.0, IPv4 and dual-stack. The `release` workflow runs all of it before it publishes
+`-f pingap-latest=true` to also test Pingap `latest`). The e2e job runs on kindest/node v1.37.0,
+IPv4 and dual-stack. The `release` workflow runs all of it before it publishes
 anything.
 
 Line coverage: `cargo llvm-cov --lib --bins` (add `--test 'etcd_*'` with `PINGAP_K8S_TEST_ETCD`

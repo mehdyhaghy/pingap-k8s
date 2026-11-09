@@ -7,7 +7,7 @@ description: >-
 type: application
 version: 0.16.20
 appVersion: "0.16.20"
-kubeVersion: ">=1.35.0-0"
+kubeVersion: ">=1.37.0-0"
 home: https://github.com/mehdyhaghy/pingap-k8s
 sources:
   - https://github.com/mehdyhaghy/pingap-k8s

@@ -78,7 +78,7 @@ pub async fn wait_deployment_rolled_out(
         POLL,
         || async {
             let d = api.get(name).await?;
-            let want = d.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
+            let want = d.spec.replicas.unwrap_or(1);
             let gen_ = d.metadata.generation.unwrap_or(0);
             let st = d.status.unwrap_or_default();
             let done = st.observed_generation.unwrap_or(0) >= gen_
@@ -106,7 +106,7 @@ pub async fn wait_statefulset_ready(
         POLL,
         || async {
             let s = api.get(name).await?;
-            let want = s.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
+            let want = s.spec.replicas.unwrap_or(1);
             let st = s.status.unwrap_or_default();
             let done = st.observed_generation.unwrap_or(0) >= s.metadata.generation.unwrap_or(0)
                 && st.replicas == want

@@ -29,7 +29,7 @@ const SVC: &str = "echo";
 fn ready_endpoints(snap: &ServiceSnapshot) -> usize {
     snap.slices
         .iter()
-        .flat_map(|s| s.endpoints.iter())
+        .flat_map(|s| s.endpoints.iter().flatten())
         .filter(|e| e.conditions.as_ref().and_then(|c| c.ready).unwrap_or(false))
         .map(|e| e.addresses.len().min(1))
         .sum()
@@ -85,7 +85,7 @@ fn deployment(image: &str, replicas: i32) -> Deployment {
             name: Some(SVC.to_string()),
             ..Default::default()
         },
-        spec: Some(DeploymentSpec {
+        spec: DeploymentSpec {
             replicas: Some(replicas),
             selector: LabelSelector {
                 match_labels: Some(labels.clone()),
@@ -108,7 +108,7 @@ fn deployment(image: &str, replicas: i32) -> Deployment {
                 }),
             },
             ..Default::default()
-        }),
+        },
         ..Default::default()
     }
 }
@@ -190,7 +190,7 @@ async fn run(client: Client, ns: &str, image: &str) -> anyhow::Result<()> {
     // Scale to 4: a notification arrives and the snapshot follows.
     while rx.try_recv().is_ok() {}
     let mut deploy = deployments.get(SVC).await?;
-    deploy.spec.as_mut().unwrap().replicas = Some(4);
+    deploy.spec.replicas = Some(4);
     deployments
         .replace(SVC, &PostParams::default(), &deploy)
         .await?;
@@ -201,7 +201,7 @@ async fn run(client: Client, ns: &str, image: &str) -> anyhow::Result<()> {
     // Scale down to 1.
     while rx.try_recv().is_ok() {}
     let mut deploy = deployments.get(SVC).await?;
-    deploy.spec.as_mut().unwrap().replicas = Some(1);
+    deploy.spec.replicas = Some(1);
     deployments
         .replace(SVC, &PostParams::default(), &deploy)
         .await?;

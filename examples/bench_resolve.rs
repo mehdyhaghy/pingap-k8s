@@ -80,10 +80,10 @@ fn slice(upstream: usize, count: usize, terminating: usize) -> Arc<EndpointSlice
                 ..Default::default()
             }
         })
-        .collect();
+        .collect::<Vec<_>>();
     Arc::new(EndpointSlice {
         address_type: "IPv4".into(),
-        endpoints,
+        endpoints: Some(endpoints),
         ports: Some(vec![slice_port("http", 8080), slice_port("metrics", 9090)]),
         ..Default::default()
     })

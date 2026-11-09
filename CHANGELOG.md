@@ -2,10 +2,10 @@
 
 ## 0.16.20 (unreleased)
 
-First public release. Tested with Pingap 0.16.2 (`pingap.image.tag`) on Kubernetes 1.35 and
-1.37, IPv4 and dual-stack. Versions follow Pingap: the Pingap version a release is tested with
-plus one digit for our own releases (Pingap 0.16.2: 0.16.20 to 0.16.29). Kubernetes 1.35 or
-newer is required.
+First public release. Tested with Pingap 0.16.2 (`pingap.image.tag`) on Kubernetes 1.37, IPv4
+and dual-stack. Versions follow Pingap: the Pingap version a release is tested with plus one
+digit for our own releases (Pingap 0.16.2: 0.16.20 to 0.16.29). Kubernetes 1.37 or newer is
+required.
 
 Endpoint discovery:
 - Watches the Services and EndpointSlices named in the config and writes the ready pod addresses

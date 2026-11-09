@@ -25,7 +25,7 @@
 #
 # Usage: scripts/bench-local.sh
 # Env:   KIND_CLUSTER        (default pk8s-bench)
-#        KIND_NODE_IMAGE     (default kindest/node:v1.35.8)
+#        KIND_NODE_IMAGE     (default kindest/node:v1.37.0)
 #        BENCH_PHASES        (default "synthetic pods")
 #        BENCH_UPSTREAMS     (default 50)
 #        BENCH_ENDPOINTS     (synthetic endpoints per Service, default 20)
@@ -42,7 +42,7 @@
 set -euo pipefail
 
 CLUSTER="${KIND_CLUSTER:-pk8s-bench}"
-NODE_IMAGE="${KIND_NODE_IMAGE:-kindest/node:v1.35.8}"
+NODE_IMAGE="${KIND_NODE_IMAGE:-kindest/node:v1.37.0}"
 PHASES="${BENCH_PHASES:-synthetic pods}"
 N="${BENCH_UPSTREAMS:-50}"
 E="${BENCH_ENDPOINTS:-20}"

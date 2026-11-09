@@ -1105,7 +1105,7 @@ mod tests {
                 })),
                 slices: vec![Arc::new(EndpointSlice {
                     address_type: "IPv4".into(),
-                    endpoints,
+                    endpoints: Some(endpoints),
                     ports: Some(vec![EndpointPort {
                         name: Some("http".into()),
                         port: Some(8080),

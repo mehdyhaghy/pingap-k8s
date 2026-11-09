@@ -227,9 +227,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Oldest Kubernetes minor still supported upstream, and the newest kindest/node.
+        # The supported Kubernetes minor (1.37), the newest kindest/node.
         node:
-          - kindest/node:v1.35.8
           - kindest/node:v1.37.0
         ipFamily: [ipv4]
         include:

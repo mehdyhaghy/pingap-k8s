@@ -1600,7 +1600,7 @@ async fn e2e_26_cross_namespace_reference_grant() {
         apply(
             &env,
             &json!({
-                "apiVersion": "gateway.networking.k8s.io/v1beta1", "kind": "ReferenceGrant",
+                "apiVersion": "gateway.networking.k8s.io/v1", "kind": "ReferenceGrant",
                 "metadata": { "name": "t26", "namespace": ns },
                 "spec": {
                     "from": [{ "group": GROUP, "kind": "HTTPRoute", "namespace": route_ns }],
