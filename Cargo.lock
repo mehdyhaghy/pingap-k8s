@@ -1355,7 +1355,7 @@ dependencies = [
 
 [[package]]
 name = "kubectl-pingap"
-version = "0.16.20"
+version = "0.16.21"
 dependencies = [
  "anyhow",
  "clap",
@@ -1766,7 +1766,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pingap-k8s"
-version = "0.16.20"
+version = "0.16.21"
 dependencies = [
  "anyhow",
  "axum",

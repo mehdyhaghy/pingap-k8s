@@ -33,7 +33,7 @@ const DISABLED_HINT: &str = "the status endpoint is disabled: enable status.enab
 
 /// Inspect pingap-k8s from kubectl.
 #[derive(Debug, Parser)]
-#[command(name = "kubectl pingap", version)]
+#[command(name = "kubectl pingap", bin_name = "kubectl pingap", version)]
 struct Cli {
     /// Namespace of the controller (default: the kubectl context's namespace).
     #[arg(short = 'n', long, global = true)]
