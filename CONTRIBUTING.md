@@ -74,7 +74,7 @@ Signed-off-by: Your Name <you@example.com>
   release; a vulnerable crate is updated (or replaced) before the next release, and in a patch
   release when the controller is affected.
 - Base images are pinned by tag and digest, GitHub Actions by commit SHA. Dependabot proposes
-  updates for both weekly; maintainers update the Rust crates by hand (`cargo update`) and
+  updates for both monthly; maintainers update the Rust crates by hand (`cargo update`) and
   review the changes.
 
 ## Releasing
