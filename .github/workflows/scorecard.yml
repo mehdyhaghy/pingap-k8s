@@ -4,9 +4,8 @@ name: scorecard
 # result for the README badge (api.scorecard.dev) and uploads it to code
 # scanning. Read-only on the repository; nothing here builds or runs project code.
 
+# Not run on every push: weekly, when branch protection changes, or by hand.
 on:
-  push:
-    branches: [main]
   schedule:
     - cron: "17 4 * * 1"
   branch_protection_rule:

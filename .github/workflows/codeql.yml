@@ -3,9 +3,15 @@ name: codeql
 # CodeQL code scanning of the Rust sources and the GitHub Actions workflows.
 # Results go to the repository's Security > Code scanning page.
 
+# A push to main is scanned only when it touches what CodeQL analyzes.
 on:
   push:
     branches: [main]
+    paths:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - Cargo.lock
+      - .github/workflows/**
   pull_request:
     branches: [main]
   schedule:
