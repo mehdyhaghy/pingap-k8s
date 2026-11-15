@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- etcd connections use a 10 s HTTP/2 keep-alive with a 5 s timeout (was 30 s + 10 s, as in
+  Pingap): a connection to an etcd member that stops answering is dropped and redialed within
+  about 15 s instead of 40 s. A paused node had stalled leader failover for up to a minute.
+
 ## 0.16.21 (2026-11-08)
 
 - kubectl plugin on Windows: `kubectl-pingap_<version>_windows_amd64.zip` in every release and

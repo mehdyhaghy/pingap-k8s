@@ -29,7 +29,7 @@ the fix. `make check` must pass before a pull request is merged.
 | Command | What it covers | CI job |
 | --- | --- | --- |
 | `cargo test --workspace` | unit tests (including Kubernetes Events against a mock API server), OTLP export to an in-process receiver, the kubectl plugin against a fake `kubectl`; the plugin crate packaged alone | `rust`, `plugin-windows` (plugin unit tests on Windows) |
-| `scripts/test-etcd.sh` | `tests/etcd_*.rs` against a throwaway etcd on 127.0.0.1: CAS writes, owned-key watch, compaction, leader election, the Gateway writer | `integration` |
+| `scripts/test-etcd.sh` | `tests/etcd_*.rs` against a throwaway etcd on 127.0.0.1: CAS writes, owned-key watch, compaction, leader election, the Gateway writer, redial of a silent connection | `integration` |
 | `scripts/test-kind.sh` | `tests/watch_kind.rs`: the Service and EndpointSlice watchers on a throwaway kind cluster | `integration` |
 | `scripts/e2e-run.sh` | the end-to-end suite with the chart, Pingap, etcd and the Gateway API CRDs on kind | `e2e` |
 | `scripts/conformance.sh` | the Gateway API conformance suite on its own kind cluster (`CONF_PROFILES`, default `GATEWAY-HTTP,GATEWAY-GRPC`); report in `target/conformance/report.yaml` | no |
