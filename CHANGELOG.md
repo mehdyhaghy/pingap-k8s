@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Error messages no longer show the etcd password when the URL writes the parameter name
+  encoded (`pass%77ord=...`): the name is now decoded before it is redacted, as the parser
+  reads it.
+
 ## 0.16.21 (2026-11-08)
 
 - kubectl plugin on Windows: `kubectl-pingap_<version>_windows_amd64.zip` in every release and

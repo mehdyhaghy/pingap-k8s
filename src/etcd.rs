@@ -319,14 +319,17 @@ fn form_decode(input: &str) -> Result<String, EtcdError> {
 }
 
 /// The URL with the value of every `password` parameter replaced, for error messages.
+/// The name is compared after decoding, as [`parse_etcd_url`] reads it, so an encoded
+/// name (`pass%77ord`) is redacted too.
 pub fn redact_url(url: &str) -> String {
     let Some((base, query)) = url.split_once('?') else {
         return url.to_string();
     };
+    let is_password = |name: &str| form_decode(name).is_ok_and(|n| n == "password");
     let query: Vec<String> = query
         .split('&')
         .map(|pair| match pair.split_once('=') {
-            Some((name, value)) if name == "password" && !value.is_empty() => {
+            Some((name, value)) if is_password(name) && !value.is_empty() => {
                 format!("{name}=<redacted>")
             }
             _ => pair.to_string(),
@@ -1168,6 +1171,33 @@ mod tests {
         );
         assert_eq!(redact_url("etcd://h:2379/p"), "etcd://h:2379/p");
         assert_eq!(redact_url("etcd://h/p?password="), "etcd://h/p?password=");
+    }
+
+    /// Found by fuzzing: the parser decodes parameter names, so an encoded `password`
+    /// name sets the password and must be redacted as well.
+    #[test]
+    fn redact_url_hides_encoded_password_names() {
+        for url in [
+            "etcd://h:2379/p?pass%77ord=s3cret",
+            "etcd://h:2379/p?%70%61%73%73%77%6F%72%64=s3cret&tls=true",
+            "etcd:///p?pass%77ord=s3cret",
+        ] {
+            let redacted = redact_url(url);
+            assert!(!redacted.contains("s3cret"), "{url} -> {redacted}");
+            assert!(redacted.contains("=<redacted>"), "{url} -> {redacted}");
+        }
+        assert_eq!(
+            parse_etcd_url("etcd://h:2379/p?pass%77ord=s3cret")
+                .unwrap()
+                .password
+                .as_deref(),
+            Some("s3cret")
+        );
+        // The host check fails first; the error must not carry the password.
+        let err = parse_etcd_url("etcd:///p?pass%77ord=s3cret")
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("s3cret"), "{err}");
     }
 
     #[test]
