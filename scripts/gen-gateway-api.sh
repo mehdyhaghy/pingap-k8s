@@ -6,6 +6,11 @@
 # Needs kopium (cargo install kopium --version 0.24.1 --locked) and yq. The generated files
 # are committed; bump GATEWAY_API_VERSION, run this, review the diff and update the
 # e2e manifests (tests/e2e) to the same release.
+#
+# On top of the Standard channel, the rules of HTTPRoutes and GRPCRoutes get the
+# Experimental-channel field `sessionPersistence`, typed by the hand-written
+# src/gateway/api/experimental.rs (check it against the experimental CRDs of a new
+# release).
 set -euo pipefail
 
 GATEWAY_API_VERSION="${1:-v1.7.0}"
@@ -38,6 +43,21 @@ for r in "${RESOURCES[@]}"; do
     echo
     cat "$work/$r.rs"
   } >"$out/$r.rs"
+done
+
+# The Experimental-channel rule field `sessionPersistence` (see the header).
+for pair in httproutes:HttpRouteRules grpcroutes:GrpcRouteRules; do
+  file="$out/${pair%%:*}.rs"
+  struct="${pair#*:}"
+  grep -q "^pub struct $struct {" "$file" || { echo "no struct $struct in $file" >&2; exit 1; }
+  awk -v s="pub struct $struct {" '
+    { print }
+    $0 == s {
+      print "    /// Experimental channel: see `super::experimental`."
+      print "    #[serde(default, skip_serializing_if = \"Option::is_none\", rename = \"sessionPersistence\")]"
+      print "    pub session_persistence: Option<super::experimental::SessionPersistence>,"
+    }' "$file" >"$work/patched.rs"
+  mv "$work/patched.rs" "$file"
 done
 rustfmt --edition 2024 "$out"/*.rs
 echo "generated ${RESOURCES[*]} from ${GATEWAY_API_VERSION} into $out"

@@ -164,6 +164,19 @@ pub enum WriteOutcome {
     Created { revision: i64 },
 }
 
+/// The fields besides `addrs` an owned upstream entry gets when the controller creates
+/// it. An existing entry keeps its own: these are never updated in place (the
+/// generated upstream names change with them).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NewUpstream<'a> {
+    /// Pingap `health_check`, already validated.
+    pub health_check: Option<&'a str>,
+    /// TLS to the backends.
+    pub tls: Option<&'a UpstreamTls>,
+    /// Pingap `algo`: `sticky:<cookie>` for Gateway API session persistence.
+    pub algo: Option<&'a str>,
+}
+
 /// Writes an upstream's `addrs` into Pingap's config storage.
 /// `etcd::EtcdWriter` is the only production implementation.
 pub trait AddrsWriter: Send + Sync + 'static {
@@ -174,8 +187,8 @@ pub trait AddrsWriter: Send + Sync + 'static {
         addrs: &[String],
     ) -> impl Future<Output = anyhow::Result<WriteOutcome>> + Send;
 
-    /// [`AddrsWriter::write_addrs`]; an entry it creates also gets `health_check`
-    /// (already validated) and the TLS fields of `tls`. An existing entry's fields other
+    /// [`AddrsWriter::write_addrs`]; an entry it creates also gets the fields of `new`.
+    /// An existing entry's fields other
     /// than `addrs` are left alone, except `alpn` (Pingap's `"H2"` for HTTP/2 backends):
     /// it is written into an entry that is created or has no `alpn`; an `alpn` already
     /// stored is left alone.
@@ -183,11 +196,10 @@ pub trait AddrsWriter: Send + Sync + 'static {
         &self,
         upstream: &str,
         addrs: &[String],
-        health_check: Option<&str>,
-        tls: Option<&UpstreamTls>,
+        new: NewUpstream<'_>,
         alpn: Option<&str>,
     ) -> impl Future<Output = anyhow::Result<WriteOutcome>> + Send {
-        let _ = (health_check, tls, alpn);
+        let _ = (new, alpn);
         self.write_addrs(upstream, addrs)
     }
 }

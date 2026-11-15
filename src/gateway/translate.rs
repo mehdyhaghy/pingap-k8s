@@ -147,8 +147,9 @@ use super::extended;
 use super::grpc;
 use super::model::{
     BackendKind, CertificateEntry, Desired, ExternalUpstream, GATEWAY_GROUP, GatewayKey,
-    ListenerSetKey, LocationEntry, LocationOptions, ObjectKey, PluginEntry, Referenced, RouteKey,
-    RouteKind, SecretKey, ServerInfo, TranslateInput, TranslateOptions,
+    GeneratedServer, ListenerSetKey, LocationEntry, LocationOptions, ObjectKey, PluginEntry,
+    Referenced, RouteKey, RouteKind, SecretKey, ServerGeneration, ServerInfo, TranslateInput,
+    TranslateOptions, is_owned,
 };
 use super::names;
 use super::tls;
@@ -349,6 +350,105 @@ pub fn referenced(input: &TranslateInput<'_>) -> Referenced {
 /// Everything the Gateways and routes of our classes want stored, their statuses and
 /// what they refer to.
 pub fn translate(input: &TranslateInput<'_>) -> Desired {
+    // Stored generated servers that are no longer wanted take no listener; wanted ones
+    // that are not stored yet are planned like stored ones, and not live.
+    let wanted = match &input.options.generate_servers {
+        Some(generation) => wanted_servers(input, generation),
+        None => BTreeMap::new(),
+    };
+    let mut servers: Vec<ServerInfo> = input
+        .servers
+        .iter()
+        .filter(|s| !is_owned(&s.name) || wanted.contains_key(&s.name))
+        .cloned()
+        .collect();
+    for (name, server) in &wanted {
+        if !servers.iter().any(|s| &s.name == name) {
+            servers.push(ServerInfo {
+                name: name.clone(),
+                ports: BTreeSet::from([server.port]),
+                tls: server.tls,
+                h2: true,
+                live: false,
+            });
+        }
+    }
+    let input = TranslateInput {
+        servers: &servers,
+        ..*input
+    };
+    let mut desired = translate_on(&input);
+    desired.servers = wanted;
+    desired
+}
+
+/// The servers to generate: one per port of a listener of the shared group (Gateway
+/// or accepted ListenerSet, HTTP or HTTPS) that no hand-made server listens on, in any
+/// group and with either TLS setting, and that is not excluded. When listeners want a
+/// port both with and without TLS, the oldest Gateway's listener decides.
+fn wanted_servers(
+    input: &TranslateInput<'_>,
+    generation: &ServerGeneration,
+) -> BTreeMap<String, GeneratedServer> {
+    let options = input.options;
+    let taken: BTreeSet<u16> = input
+        .servers
+        .iter()
+        .filter(|s| !is_owned(&s.name))
+        .flat_map(|s| s.ports.iter().copied())
+        .collect();
+    let mut gateways = our_gateways(input);
+    gateways.sort_by_cached_key(|g| age_key(&g.metadata));
+    let assigned = assign_groups(options, &gateways);
+    let keys: BTreeSet<GatewayKey> = gateways.iter().map(|g| object_key(&g.metadata)).collect();
+    let sets = our_listener_sets(input, &keys);
+    let mut ports: BTreeMap<u16, bool> = BTreeMap::new();
+    for (gateway, assigned) in gateways.iter().zip(&assigned) {
+        if assigned.placement != Placement::Shared {
+            continue;
+        }
+        let key = object_key(&gateway.metadata);
+        let from_sets: Vec<GatewayListeners> = sets
+            .iter()
+            .filter(|s| parent_gateway_key(s) == key)
+            .filter(|s| {
+                let namespace = s.metadata.namespace.as_deref().unwrap_or_default();
+                listener_sets_allowed(input, gateway, namespace)
+            })
+            .flat_map(|s| s.spec.listeners.iter().map(gateway_listener))
+            .collect();
+        for spec in gateway.spec.listeners.iter().chain(&from_sets) {
+            let tls = match spec.protocol.as_str() {
+                "HTTPS" => true,
+                "HTTP" => false,
+                _ => continue,
+            };
+            let Ok(port) = u16::try_from(spec.port) else {
+                continue;
+            };
+            if port == 0 || taken.contains(&port) || generation.exclude_ports.contains(&port) {
+                continue;
+            }
+            ports.entry(port).or_insert(tls);
+        }
+    }
+    ports
+        .into_iter()
+        .map(|(port, tls)| {
+            (
+                names::generated_server_name(port, tls),
+                GeneratedServer {
+                    port,
+                    tls,
+                    listen: generation.listen.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
+/// [`translate`] on servers that include the generated ones.
+fn translate_on(input: &TranslateInput<'_>) -> Desired {
     let options = input.options;
     let mut desired = Desired {
         referenced: referenced(input),
@@ -928,6 +1028,94 @@ fn backend_client_certificate(input: &TranslateInput<'_>, gateway: &Gateway) -> 
         })
 }
 
+/// The cookie Pingap keeps a rule's clients on their backend with (`algo =
+/// "sticky:<cookie>"`), from its `sessionPersistence` (Experimental channel); `None`
+/// when it has none. Pingap gives the client a session cookie with `Path=/` (plus
+/// `HttpOnly`, `SameSite=Lax` and `Secure` over TLS) and no expiry, so only that is
+/// supported: header sessions, permanent cookies, another path and `absoluteTimeout`
+/// drop the rule. An unnamed cookie is named after the route and the rule.
+fn session_cookie(
+    options: &TranslateOptions,
+    kind: RouteKind,
+    route: &RouteKey,
+    index: usize,
+    rule: &HttpRouteRules,
+) -> Result<Option<String>, String> {
+    let Some(session) = &rule.session_persistence else {
+        return Ok(None);
+    };
+    if !options.session_persistence {
+        return Err(
+            "sessionPersistence is not enabled in this controller (gateway.session_persistence)"
+                .into(),
+        );
+    }
+    match session.r#type.as_deref().unwrap_or("Cookie") {
+        "Cookie" => {}
+        "Header" => {
+            return Err(
+                "sessionPersistence type Header is not supported (Pingap keeps sessions by cookie)"
+                    .into(),
+            );
+        }
+        other => {
+            return Err(format!(
+                "sessionPersistence type {other:?} is not supported"
+            ));
+        }
+    }
+    if session.absolute_timeout.is_some() {
+        return Err(
+            "sessionPersistence absoluteTimeout is not supported (Pingap sets session cookies \
+             without expiry)"
+                .into(),
+        );
+    }
+    let cookie = session.cookie.as_ref();
+    match cookie
+        .and_then(|c| c.lifetime_type.as_deref())
+        .unwrap_or("Session")
+    {
+        "Session" => {}
+        other => {
+            return Err(format!(
+                "sessionPersistence cookie lifetimeType {other} is not supported (Pingap sets \
+                 session cookies)"
+            ));
+        }
+    }
+    if let Some(path) = cookie.and_then(|c| c.path.as_deref())
+        && path != "/"
+    {
+        return Err(format!(
+            "sessionPersistence cookie path {path:?} is not supported (Pingap sets Path=/)"
+        ));
+    }
+    let name = match cookie.and_then(|c| c.name.as_deref()) {
+        Some(name) => {
+            check_token(name, "sessionPersistence cookie name")?;
+            name.to_string()
+        }
+        None => names::session_cookie_name(kind, route, rule.name.as_deref(), index),
+    };
+    Ok(Some(name))
+}
+
+/// The variant of a rule's upstream that keeps each client on one backend by `cookie`:
+/// its own name ([`names::sticky_upstream_name`]) and `algo = "sticky:<cookie>"`.
+fn sticky_variant(name: &str, kind: UpstreamKind, cookie: &str) -> (String, UpstreamKind) {
+    let algo = Some(format!("sticky:{cookie}"));
+    let kind = match kind {
+        UpstreamKind::Generated(config) => {
+            UpstreamKind::Generated(UpstreamConfig { algo, ..config })
+        }
+        UpstreamKind::External(external) => {
+            UpstreamKind::External(ExternalUpstream { algo, ..external })
+        }
+    };
+    (names::sticky_upstream_name(name, cookie), kind)
+}
+
 /// The upstream a location of a Gateway uses: `name` and `kind` as the rule resolved
 /// them, or for a TLS upstream with the Gateway's client certificate (`None`: none) its
 /// own TLS variant.
@@ -1265,9 +1453,9 @@ fn assign_groups(options: &TranslateOptions, gateways: &[&Arc<Gateway>]) -> Vec<
 }
 
 /// Whether a stored server belongs to the shared group: listed in `servers` (every
-/// server when empty) and in no group.
+/// server when empty) or generated, and in no group.
 fn shared_server(options: &TranslateOptions, name: &str) -> bool {
-    (options.servers.is_empty() || options.servers.iter().any(|s| s == name))
+    (options.servers.is_empty() || options.servers.iter().any(|s| s == name) || is_owned(name))
         && !options
             .groups
             .iter()
@@ -1336,6 +1524,9 @@ struct Listener<'a> {
     resolved: Result<(), (&'static str, String)>,
     /// The usable certificates: Secret, `tls.crt`, `tls.key`.
     certs: Vec<(SecretKey, String, String)>,
+    /// Generated servers of `servers` Pingap does not listen with yet (it binds them
+    /// when it starts).
+    pending: Vec<String>,
     attached: BTreeSet<(RouteKind, RouteKey)>,
     /// The accepted routes attached so far (oldest first) and their hosts here.
     served: Vec<(RouteKind, RouteKey, Vec<Option<String>>)>,
@@ -1399,6 +1590,7 @@ fn evaluate_listener<'a>(
         conflicted: None,
         resolved: Ok(()),
         certs: Vec::new(),
+        pending: Vec::new(),
         attached: BTreeSet::new(),
         served: Vec::new(),
     };
@@ -1493,6 +1685,11 @@ fn evaluate_listener<'a>(
     }
 
     listener.servers = matching.iter().map(|s| s.name.clone()).collect();
+    listener.pending = matching
+        .iter()
+        .filter(|s| !s.live)
+        .map(|s| s.name.clone())
+        .collect();
     if place.is_some() && listener.servers.is_empty() {
         listener.accepted = Err((
             "PortUnavailable",
@@ -1873,7 +2070,19 @@ fn listener_conditions(l: &Listener<'_>, generation: Option<i64>) -> Vec<Conditi
         ),
         Err((reason, message)) => cond("ResolvedRefs", false, reason, message, generation),
     });
-    conditions.push(if l.programmed() {
+    conditions.push(if l.programmed() && !l.pending.is_empty() {
+        cond(
+            "Programmed",
+            false,
+            "Pending",
+            &format!(
+                "Pingap server(s) {} were generated for this listener; Pingap listens on a \
+                 new server once it restarts: restart the Pingap pods",
+                l.pending.join(", ")
+            ),
+            generation,
+        )
+    } else if l.programmed() {
         cond(
             "Programmed",
             true,
@@ -2494,6 +2703,7 @@ fn compile_rule(
     }
 
     let options = extended::location_options(rule)?;
+    let session_cookie = session_cookie(input.options, kind, route, index, rule)?;
     let mut plugins = Vec::new();
     let mut host_header = None;
     let mut rewrite = None;
@@ -2544,6 +2754,11 @@ fn compile_rule(
 
     let mut backends = resolve_backends(input, policies, kind, route, rule);
     backends.issues.extend(mirror_issues);
+    if let Some(cookie) = &session_cookie {
+        backends.upstream = backends
+            .upstream
+            .map(|(name, kind)| sticky_variant(&name, kind, cookie));
+    }
     Ok(Rule {
         index,
         matches,
@@ -3227,6 +3442,7 @@ fn resolve_backends(
                 health_check: health_check.map(String::from),
                 h2c,
                 tls,
+                algo: None,
             }),
         ));
         return out;
@@ -3271,6 +3487,7 @@ fn resolve_backends(
             health_check: health_check.map(String::from),
             h2c,
             tls,
+            algo: None,
         }),
     ));
     out
@@ -3620,6 +3837,8 @@ mod tests {
             servers: Vec::new(),
             addresses: vec!["192.0.2.1".into()],
             groups: Vec::new(),
+            session_persistence: false,
+            generate_servers: None,
         }
     }
 
@@ -3629,6 +3848,7 @@ mod tests {
             ports: ports.iter().copied().collect(),
             tls,
             h2: false,
+            live: true,
         }
     }
 
@@ -8041,5 +8261,332 @@ mod tests {
             .map(|k| k.kind.as_str())
             .collect();
         assert_eq!(kinds, vec!["HTTPRoute", "GRPCRoute"]);
+    }
+
+    // ---- session persistence ----
+
+    fn sticky_world(session: Value) -> World {
+        let mut w = World::new().gw(basic_gateway()).rt(route(
+            "ns",
+            "r",
+            0,
+            json!({"rules": [
+                {"backendRefs": [backend("web", 80)], "sessionPersistence": session},
+                {"matches": [{"path": {"type": "PathPrefix", "value": "/plain"}}],
+                 "backendRefs": [backend("web", 80)]}
+            ]}),
+        ));
+        w.options.session_persistence = true;
+        w
+    }
+
+    fn upstream_of(d: &Desired, path: &str) -> String {
+        locations(d, "http")
+            .into_iter()
+            .find(|l| l.path == path)
+            .and_then(|l| l.upstream.clone())
+            .unwrap_or_else(|| panic!("no location {path}"))
+    }
+
+    #[test]
+    fn session_persistence_cookie_becomes_a_sticky_upstream() {
+        let d = sticky_world(json!({"type": "Cookie", "cookie": {"name": "shop-session"}})).run();
+        let r = rkey("ns", "r");
+        assert_eq!(route_cond(&d, &r, "Accepted"), tf("True", "Accepted"));
+        let sticky = upstream_of(&d, "");
+        let plain = upstream_of(&d, "~^/plain(/|$)");
+        assert_ne!(sticky, plain, "the rules must not share an upstream");
+        assert!(sticky.contains("-sticky-"), "{sticky}");
+        assert_eq!(
+            d.upstreams[&sticky].algo.as_deref(),
+            Some("sticky:shop-session")
+        );
+        assert_eq!(d.upstreams[&plain].algo, None);
+        assert_eq!(d.upstreams[&sticky].services, d.upstreams[&plain].services);
+    }
+
+    #[test]
+    fn session_persistence_defaults() {
+        // No type, no cookie name: a cookie named after the route and the rule.
+        let d = sticky_world(json!({"cookie": {}})).run();
+        let sticky = upstream_of(&d, "");
+        let cookie = names::session_cookie_name(RouteKind::Http, &rkey("ns", "r"), None, 0);
+        assert!(cookie.starts_with("k8s-session-"), "{cookie}");
+        assert_eq!(
+            d.upstreams[&sticky].algo.as_deref(),
+            Some(format!("sticky:{cookie}").as_str())
+        );
+        // Session lifetime and path "/" are what Pingap does.
+        let d = sticky_world(json!({"type": "Cookie", "cookie": {
+            "name": "s", "lifetimeType": "Session", "path": "/"}}))
+        .run();
+        assert_eq!(
+            d.upstreams[&upstream_of(&d, "")].algo.as_deref(),
+            Some("sticky:s")
+        );
+    }
+
+    #[test]
+    fn unsupported_session_persistence_drops_the_rule() {
+        for (session, message) in [
+            (
+                json!({"type": "Header", "header": {"name": "x-session"}}),
+                "type Header",
+            ),
+            (
+                json!({"type": "Cookie", "cookie": {"name": "s", "lifetimeType": "Permanent"},
+                       "absoluteTimeout": "1h"}),
+                "absoluteTimeout",
+            ),
+            (
+                json!({"type": "Cookie", "cookie": {"name": "s", "lifetimeType": "Permanent"}}),
+                "lifetimeType Permanent",
+            ),
+            (
+                json!({"cookie": {"name": "s", "path": "/app"}}),
+                "cookie path",
+            ),
+            (json!({"cookie": {"name": "a b"}}), "cookie name"),
+        ] {
+            let d = sticky_world(session.clone()).run();
+            let r = rkey("ns", "r");
+            assert_eq!(route_cond(&d, &r, "Accepted"), tf("True", "Accepted"));
+            let pi = condition(
+                &d.status.routes[&r].parents[0].conditions,
+                "PartiallyInvalid",
+            );
+            assert!(
+                pi.message.contains("rule 0") && pi.message.contains(message),
+                "{session}: {}",
+                pi.message
+            );
+            let locs = locations(&d, "http");
+            assert_eq!(locs.len(), 1, "{session}");
+            assert!(d.upstreams.values().all(|u| u.algo.is_none()), "{session}");
+        }
+    }
+
+    #[test]
+    fn session_persistence_needs_the_option() {
+        let mut w = sticky_world(json!({"cookie": {"name": "s"}}));
+        w.options.session_persistence = false;
+        let d = w.run();
+        let pi = condition(
+            &d.status.routes[&rkey("ns", "r")].parents[0].conditions,
+            "PartiallyInvalid",
+        );
+        assert!(
+            pi.message.contains("gateway.session_persistence"),
+            "{}",
+            pi.message
+        );
+        assert_eq!(locations(&d, "http").len(), 1);
+    }
+
+    #[test]
+    fn grpc_session_persistence() {
+        let mut w = World::new().gw(gateway(
+            "ns",
+            "gw",
+            0,
+            json!([http_listener("http", 80, None)]),
+        ));
+        w.servers = vec![ServerInfo {
+            h2: true,
+            ..server("http", &[80], false)
+        }];
+        w.service(service("ns", "grpc", &[9000]));
+        w.grpc_routes.push(Arc::new(grpc_route(
+            "ns",
+            "g",
+            0,
+            json!({"rules": [{"backendRefs": [backend("grpc", 9000)],
+                              "sessionPersistence": {"cookie": {"name": "g"}}}]}),
+        )));
+        w.options.session_persistence = true;
+        let d = w.run();
+        let upstream = locations(&d, "http")[0].upstream.clone().unwrap();
+        assert_eq!(d.upstreams[&upstream].algo.as_deref(), Some("sticky:g"));
+        assert!(d.upstreams[&upstream].h2c);
+    }
+
+    // ---- generated servers ----
+
+    fn generating_world() -> World {
+        let mut w = World::new();
+        w.options.generate_servers = Some(ServerGeneration {
+            listen: "[::]".into(),
+            exclude_ports: BTreeSet::from([3018]),
+        });
+        w
+    }
+
+    fn on_port(name: &str, listeners: Value) -> Gateway {
+        gateway("ns", name, 0, listeners)
+    }
+
+    #[test]
+    fn listener_without_server_gets_a_generated_one() {
+        let mut w = generating_world()
+            .gw(on_port("gw", json!([http_listener("alt", 8081, None)])))
+            .rt(catch_all("r", "gw", 0, "web"));
+        w.secret("ns", "tls");
+        let d = w.run();
+        assert_eq!(
+            d.servers["k8s-http-8081"],
+            GeneratedServer {
+                port: 8081,
+                tls: false,
+                listen: "[::]".into()
+            }
+        );
+        assert_eq!(
+            listener_cond(&d, "gw", "alt", "Accepted"),
+            tf("True", "Accepted")
+        );
+        // Not stored yet: Pingap does not listen on it until it restarts.
+        assert_eq!(
+            listener_cond(&d, "gw", "alt", "Programmed"),
+            tf("False", "Pending")
+        );
+        let message = condition(&listener_status(&d, "gw", "alt").conditions, "Programmed")
+            .message
+            .clone();
+        assert!(message.contains("restart the Pingap pods"), "{message}");
+        // Its locations are written already, so they serve once Pingap listens.
+        assert_eq!(locations(&d, "k8s-http-8081").len(), 1);
+        assert_eq!(
+            route_cond(&d, &rkey("ns", "r"), "Accepted"),
+            tf("True", "Accepted")
+        );
+    }
+
+    #[test]
+    fn live_generated_server_is_programmed() {
+        let mut w = generating_world()
+            .gw(on_port(
+                "gw",
+                json!([https_listener("tls", Some("a.example.com"), "tls")]),
+            ))
+            .rt(catch_all("r", "gw", 0, "web"));
+        w.secret("ns", "tls");
+        // https_listener is on 443, which the hand-made `https` server has: move it.
+        w.servers.retain(|s| s.name != "https");
+        w.servers.push(ServerInfo {
+            h2: true,
+            live: true,
+            ..server("k8s-https-443", &[443], true)
+        });
+        let d = w.run();
+        assert!(d.servers["k8s-https-443"].tls);
+        assert_eq!(
+            listener_cond(&d, "gw", "tls", "Programmed"),
+            tf("True", "Programmed")
+        );
+        assert_eq!(locations(&d, "k8s-https-443").len(), 1);
+    }
+
+    #[test]
+    fn ports_with_hand_made_or_excluded_servers_are_not_generated() {
+        let w = generating_world().gw(on_port(
+            "gw",
+            json!([
+                // `http` listens on 80: used, nothing generated.
+                http_listener("plain", 80, None),
+                // `https` listens on 443 with TLS: a plain listener there conflicts.
+                http_listener("other-kind", 443, None),
+                // The excluded admin port.
+                http_listener("admin", 3018, None),
+                // Not HTTP.
+                {"name": "tcp", "port": 9000, "protocol": "TCP"}
+            ]),
+        ));
+        let d = w.run();
+        assert!(d.servers.is_empty(), "{:?}", d.servers);
+        assert_eq!(
+            listener_cond(&d, "gw", "plain", "Programmed"),
+            tf("True", "Programmed")
+        );
+        for listener in ["other-kind", "admin"] {
+            assert_eq!(
+                listener_cond(&d, "gw", listener, "Accepted"),
+                tf("False", "PortUnavailable"),
+                "{listener}"
+            );
+        }
+    }
+
+    #[test]
+    fn oldest_gateway_decides_the_tls_of_a_generated_port() {
+        let mut w = generating_world()
+            .gw(gateway(
+                "ns",
+                "old",
+                0,
+                json!([http_listener("p", 8443, None)]),
+            ))
+            .gw(gateway(
+                "ns",
+                "young",
+                1,
+                json!([{"name": "s", "port": 8443, "protocol": "HTTPS",
+                        "tls": {"certificateRefs": [{"name": "tls"}]}}]),
+            ));
+        w.secret("ns", "tls");
+        let d = w.run();
+        assert_eq!(d.servers.len(), 1);
+        assert!(!d.servers["k8s-http-8443"].tls);
+        assert_eq!(
+            listener_cond(&d, "young", "s", "Accepted"),
+            tf("False", "PortUnavailable")
+        );
+    }
+
+    #[test]
+    fn grouped_gateways_get_no_generated_servers() {
+        let mut w = grouped_world().gw(port_80("gw", 0));
+        w.options.generate_servers = generating_world().options.generate_servers;
+        let d = w.run();
+        assert!(d.servers.is_empty(), "{:?}", d.servers);
+    }
+
+    #[test]
+    fn stale_generated_servers_take_no_listener() {
+        // Generation off: a stored generated server is not mapped onto, and the
+        // desired servers are empty (the plan deletes it).
+        let mut w = World::new().gw(on_port("gw", json!([http_listener("alt", 8081, None)])));
+        w.servers.push(server("k8s-http-8081", &[8081], false));
+        let d = w.run();
+        assert!(d.servers.is_empty());
+        assert!(!d.server_locations.contains_key("k8s-http-8081"));
+        assert_eq!(
+            listener_cond(&d, "gw", "alt", "Accepted"),
+            tf("False", "PortUnavailable")
+        );
+    }
+
+    #[test]
+    fn listener_sets_get_generated_servers() {
+        let mut w = generating_world().gw(gateway(
+            "ns",
+            "gw",
+            0,
+            json!([http_listener("http", 80, None)]),
+        ));
+        let mut g = (*w.gateways[0]).clone();
+        g.spec.allowed_listeners =
+            serde_json::from_value(json!({"namespaces": {"from": "Same"}})).unwrap();
+        w.gateways[0] = Arc::new(g);
+        w = w.ls(serde_json::from_value(json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "ListenerSet",
+            "metadata": {"namespace": "ns", "name": "set", "generation": 1,
+                         "creationTimestamp": ts(1)},
+            "spec": {"parentRef": {"name": "gw"},
+                     "listeners": [{"name": "extra", "port": 9090, "protocol": "HTTP"}]}
+        }))
+        .unwrap());
+        let d = w.run();
+        assert!(d.servers.contains_key("k8s-http-9090"), "{:?}", d.servers);
     }
 }

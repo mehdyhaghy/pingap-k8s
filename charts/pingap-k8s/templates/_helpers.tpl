@@ -300,9 +300,46 @@ its config is reloaded live), put on the pod template so a change restarts the p
 {{- define "pingap-k8s.restartChecksum" -}}
 {{- $restart := dict "events" (.Values.events.enabled | default false) "server" (.Values.config.server | default dict) -}}
 {{- if .Values.gateway.enabled -}}
-{{- $_ := set $restart "gateway" (dict "controllerName" .Values.gateway.controllerName "maxTxnOps" (.Values.gateway.maxTxnOps | default 64 | int)) -}}
+{{- $_ := set $restart "gateway" (dict "controllerName" .Values.gateway.controllerName "maxTxnOps" (.Values.gateway.maxTxnOps | default 64 | int) "generateServers" (include "pingap-k8s.generateServers" . | fromJson)) -}}
 {{- end -}}
 {{- $restart | toJson | sha256sum | trunc 16 -}}
+{{- end }}
+
+{{/*
+gateway.generateServers, filled in, as JSON ({} when gateway or generation is off):
+enabled, listen, excludePorts (plus the admin port with pingap.deploy), namespace,
+selector (the quickstart Pingap's labels by default) and ports.
+*/}}
+{{- define "pingap-k8s.generateServers" -}}
+{{- $g := .Values.gateway.generateServers | default dict }}
+{{- if and .Values.gateway.enabled $g.enabled }}
+{{- $exclude := $g.excludePorts | default (list) }}
+{{- $selector := $g.pingapSelector | default "" }}
+{{- if .Values.pingap.deploy }}
+{{- $exclude = append $exclude (int .Values.pingap.admin.port) | uniq }}
+{{- if not $selector }}
+{{- $labels := list }}
+{{- range $line := splitList "\n" (include "pingap-k8s.pingap.selectorLabels" .) }}
+{{- $labels = append $labels (replace ": " "=" (trim $line)) }}
+{{- end }}
+{{- $selector = join "," $labels }}
+{{- end }}
+{{- end }}
+{{- if not $selector }}
+{{- fail "gateway.generateServers.pingapSelector is required without pingap.deploy: the label selector of your Pingap pods" }}
+{{- end }}
+{{- if and ($g.ports | default (list)) (not .Values.pingap.deploy) }}
+{{- fail "gateway.generateServers.ports needs pingap.deploy (open the ports on your own Pingap Service)" }}
+{{- end }}
+{{- range $g.ports | default (list) }}
+{{- if or (eq (int .) (int $.Values.pingap.admin.port)) (eq (int .) (int $.Values.pingap.httpPort)) }}
+{{- fail "gateway.generateServers.ports must not contain pingap.httpPort or the admin port" }}
+{{- end }}
+{{- end }}
+{{- dict "enabled" true "listen" ($g.listen | default "[::]") "excludePorts" $exclude "namespace" ($g.pingapNamespace | default .Release.Namespace) "selector" $selector "ports" ($g.ports | default (list)) | toJson }}
+{{- else }}
+{{- dict | toJson }}
+{{- end }}
 {{- end }}
 
 {{/* ---------------- TOML rendering ---------------- */}}
@@ -388,6 +425,19 @@ addresses = {{ include "pingap-k8s.tomlValue" (.Values.gateway.addresses | defau
 health_check = {{ include "pingap-k8s.tomlString" . }}
 {{- end }}
 max_txn_ops = {{ .Values.gateway.maxTxnOps | default 64 | int }}
+{{- if .Values.gateway.sessionPersistence }}
+session_persistence = true
+{{- end }}
+{{- $gen := include "pingap-k8s.generateServers" . | fromJson }}
+{{- if $gen.enabled }}
+
+[gateway.generate_servers]
+enabled = true
+listen = {{ include "pingap-k8s.tomlString" $gen.listen }}
+exclude_ports = [{{ range $i, $p := $gen.excludePorts }}{{ if $i }}, {{ end }}{{ int $p }}{{ end }}]
+pingap_namespace = {{ include "pingap-k8s.tomlString" $gen.namespace }}
+pingap_selector = {{ include "pingap-k8s.tomlString" $gen.selector }}
+{{- end }}
 {{- range (include "pingap-k8s.gatewayGroups" . | fromJsonArray) }}
 
 [[gateway.groups]]

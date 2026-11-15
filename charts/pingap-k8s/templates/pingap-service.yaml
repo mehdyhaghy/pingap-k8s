@@ -38,6 +38,13 @@ spec:
       {{- if and (has $svc.type (list "LoadBalancer" "NodePort")) $svc.nodePort }}
       nodePort: {{ $svc.nodePort }}
       {{- end }}
+    {{- range ((include "pingap-k8s.generateServers" .) | fromJson).ports | default (list) }}
+    # Generated server port {{ int . }}.
+    - name: gen-{{ int . }}
+      port: {{ int . }}
+      targetPort: {{ int . }}
+      protocol: TCP
+    {{- end }}
 {{- range (include "pingap-k8s.gatewayGroups" . | fromJsonArray) }}
 ---
 # Gateway server group {{ .name }}: the address of the Gateway that has the group.

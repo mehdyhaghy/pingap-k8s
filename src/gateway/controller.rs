@@ -42,7 +42,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow, bail};
-use k8s_openapi::api::core::v1::Service;
+use k8s_openapi::api::core::v1::{Pod, Service};
+use k8s_openapi::jiff::Timestamp;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::{Instant, MissedTickBehavior, sleep_until};
 use tracing::{debug, info, warn};
@@ -50,8 +51,8 @@ use tracing::{debug, info, warn};
 use crate::config::{Config, UpstreamConfig};
 use crate::gateway::model::{
     ApplyOutcome, Desired, GatewaySource, GeneratedUpstreams, ObjectKey, PingapStore, Plan,
-    Referenced, SecretSource, ServerInfo, StatusPublisher, Stored, TranslateInput,
-    TranslateOptions,
+    Referenced, SecretSource, ServerGeneration, ServerInfo, StatusPublisher, Stored,
+    TranslateInput, TranslateOptions, is_owned,
 };
 use crate::gateway::{plan, render, translate};
 use crate::metrics::{GatewaySyncResult, Metrics};
@@ -97,6 +98,11 @@ impl ControllerSettings {
                 servers: gateway.servers.clone(),
                 addresses: gateway.addresses.clone(),
                 groups: gateway.groups.clone(),
+                session_persistence: gateway.session_persistence,
+                generate_servers: gateway.generate_servers.as_ref().map(|g| ServerGeneration {
+                    listen: g.listen.clone(),
+                    exclude_ports: g.exclude_ports.clone(),
+                }),
             },
         })
     }
@@ -113,6 +119,8 @@ impl PartialEq for ControllerSettings {
             && a.servers == b.servers
             && a.addresses == b.addresses
             && a.groups == b.groups
+            && a.session_persistence == b.session_persistence
+            && a.generate_servers == b.generate_servers
     }
 }
 
@@ -146,6 +154,7 @@ impl Logic for Wired {
             desired,
             stored,
             keep_upstreams,
+            now: k8s_openapi::jiff::Timestamp::now(),
         })
     }
 }
@@ -532,7 +541,7 @@ where
                 .await
                 .context("reading the Pingap entries")?;
             let plugins = plugin_names(&stored);
-            let servers = server_infos(&stored);
+            let servers = server_infos(&stored, &self.parts.gateways.pingap_pods());
             let services: BTreeMap<ServiceKey, Arc<Service>> = referenced
                 .services
                 .iter()
@@ -766,22 +775,63 @@ fn plugin_names(stored: &Stored) -> BTreeSet<String> {
         .collect()
 }
 
-/// The stored servers a listener can be mapped onto.
-fn server_infos(stored: &Stored) -> Vec<ServerInfo> {
+/// The stored servers a listener can be mapped onto. A generated one is live once
+/// every Ready Pingap pod started after it was written (see [`pods_started_after`]).
+fn server_infos(stored: &Stored, pingap_pods: &[Arc<Pod>]) -> Vec<ServerInfo> {
     stored
         .servers
         .iter()
         .filter_map(|(name, entry)| {
-            let info = render::server_info(&entry.value, name);
-            if info.is_none() {
-                debug!(
+            let mut info = render::server_info(&entry.value, name);
+            match &mut info {
+                None => debug!(
                     server = name,
                     "server has no readable addr; not used for listeners"
-                );
+                ),
+                Some(info) if is_owned(name) => {
+                    info.live = render::server_written_at(&entry.value, name)
+                        .is_none_or(|written| pods_started_after(pingap_pods, written));
+                }
+                Some(_) => {}
             }
             info
         })
         .collect()
+}
+
+/// Whether there is a Ready Pingap pod and every Ready one (each of its running
+/// containers) started at or after `written` (seconds, as Kubernetes reports them;
+/// `written` is rounded up). A pod that is not Ready yet does not count: it serves no
+/// traffic.
+fn pods_started_after(pods: &[Arc<Pod>], written: Timestamp) -> bool {
+    let ready: Vec<&Pod> = pods
+        .iter()
+        .map(Arc::as_ref)
+        .filter(|pod| {
+            pod.metadata.deletion_timestamp.is_none()
+                && pod
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.conditions.as_ref())
+                    .is_some_and(|c| c.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
+        })
+        .collect();
+    !ready.is_empty()
+        && ready.iter().all(|pod| {
+            let containers = pod
+                .status
+                .as_ref()
+                .and_then(|s| s.container_statuses.as_deref())
+                .unwrap_or_default();
+            !containers.is_empty()
+                && containers.iter().all(|c| {
+                    c.state
+                        .as_ref()
+                        .and_then(|s| s.running.as_ref())
+                        .and_then(|r| r.started_at.as_ref())
+                        .is_some_and(|started| started.0 >= written)
+                })
+        })
 }
 
 /// True when the signal means "something changed"; a closed channel is dropped.
@@ -1106,6 +1156,8 @@ mod tests {
                 servers: vec![],
                 addresses: vec!["203.0.113.7".into()],
                 groups: vec![],
+                session_persistence: false,
+                generate_servers: None,
             },
         }
     }
@@ -1136,6 +1188,7 @@ mod tests {
             health_check: None,
             h2c: false,
             tls: None,
+            algo: None,
         }
     }
 
@@ -1471,5 +1524,92 @@ mod tests {
         // The retry after the backoff succeeds.
         sleep_ms(1_000).await;
         assert_eq!(h.store.applies(), 1);
+    }
+
+    fn pingap_pod(ready: bool, started: &[&str]) -> Arc<Pod> {
+        let statuses: Vec<serde_json::Value> = started
+            .iter()
+            .map(|t| {
+                serde_json::json!({"name": "c", "image": "i", "imageID": "", "ready": ready,
+                "restartCount": 0, "state": {"running": {"startedAt": t}}})
+            })
+            .collect();
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "metadata": {"name": "p", "namespace": "edge"},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": if ready { "True" } else { "False" }}],
+                    "containerStatuses": statuses
+                }
+            }))
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn generated_servers_are_live_once_every_ready_pod_restarted() {
+        let written: Timestamp = "2026-11-15T10:00:01Z".parse().unwrap();
+        let before = "2026-11-15T10:00:00Z";
+        let after = "2026-11-15T10:00:01Z";
+        assert!(!pods_started_after(&[], written), "no Pingap pod");
+        assert!(pods_started_after(&[pingap_pod(true, &[after])], written));
+        assert!(!pods_started_after(&[pingap_pod(true, &[before])], written));
+        assert!(
+            !pods_started_after(
+                &[pingap_pod(true, &[after]), pingap_pod(true, &[before])],
+                written
+            ),
+            "one old pod still serves"
+        );
+        assert!(
+            pods_started_after(
+                &[pingap_pod(true, &[after]), pingap_pod(false, &[before])],
+                written
+            ),
+            "a pod that is not Ready serves nothing"
+        );
+        assert!(
+            !pods_started_after(&[pingap_pod(true, &[after, before])], written),
+            "every container counts"
+        );
+
+        // Through server_infos: hand-made servers are live, generated ones by time.
+        let mut stored = Stored::default();
+        let entry = |value: String| crate::gateway::model::StoredEntry {
+            key: String::new(),
+            value,
+            mod_revision: 1,
+        };
+        stored.servers.insert(
+            "http".into(),
+            entry("[servers.http]\naddr = \"[::]:80\"\n".into()),
+        );
+        stored.servers.insert(
+            "k8s-http-8081".into(),
+            entry(render::render_server(
+                "k8s-http-8081",
+                &crate::gateway::model::GeneratedServer {
+                    port: 8081,
+                    tls: false,
+                    listen: "[::]".into(),
+                },
+                &[],
+                written,
+            )),
+        );
+        let live = |pods: &[Arc<Pod>]| -> Vec<(String, bool)> {
+            server_infos(&stored, pods)
+                .into_iter()
+                .map(|s| (s.name, s.live))
+                .collect()
+        };
+        assert_eq!(
+            live(&[pingap_pod(true, &[before])]),
+            vec![("http".into(), true), ("k8s-http-8081".into(), false)]
+        );
+        assert_eq!(
+            live(&[pingap_pod(true, &[after])]),
+            vec![("http".into(), true), ("k8s-http-8081".into(), true)]
+        );
     }
 }

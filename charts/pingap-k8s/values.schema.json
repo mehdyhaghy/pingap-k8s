@@ -109,6 +109,19 @@
         "addresses": { "$ref": "#/$defs/stringList" },
         "healthCheck": { "type": "string" },
         "maxTxnOps": { "type": "integer", "minimum": 2, "maximum": 1024 },
+        "sessionPersistence": { "type": "boolean" },
+        "generateServers": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "listen": { "type": "string", "minLength": 1 },
+            "excludePorts": { "type": "array", "items": { "$ref": "#/$defs/port" } },
+            "pingapNamespace": { "type": "string" },
+            "pingapSelector": { "type": "string" },
+            "ports": { "type": "array", "items": { "$ref": "#/$defs/port" } }
+          }
+        },
         "groups": {
           "type": "array",
           "items": {

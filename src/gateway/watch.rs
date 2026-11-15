@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::Namespace;
+use k8s_openapi::api::core::v1::{Namespace, Pod};
 use kube::runtime::reflector::Store;
 use kube::runtime::reflector::store::Writer;
 use kube::runtime::watcher::{self, DefaultBackoff, Event};
@@ -151,6 +151,29 @@ pub(crate) fn strip_namespace(ns: &mut Namespace) {
     ns.metadata.finalizers = None;
     ns.spec = None;
     ns.status = None;
+}
+
+/// Keeps only what tells when a Pingap pod started: name, namespace, uid and the
+/// status conditions and container states.
+pub(crate) fn strip_pod(pod: &mut Pod) {
+    pod.metadata.managed_fields = None;
+    pod.metadata.annotations = None;
+    pod.metadata.owner_references = None;
+    pod.spec = None;
+    if let Some(status) = &mut pod.status {
+        status.init_container_statuses = None;
+        status.ephemeral_container_statuses = None;
+        status.pod_ips = None;
+        status.host_ips = None;
+    }
+}
+
+/// The Pingap pods, by namespace and label selector: a generated server is live once
+/// every Ready one started after it was written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PingapPods {
+    pub namespace: String,
+    pub selector: String,
 }
 
 /// Where a watch looks, for the 403 message.
@@ -456,6 +479,8 @@ struct Inner {
     grants: ResourceWatch<ReferenceGrant>,
     policies: ResourceWatch<BackendTlsPolicy>,
     namespaces: ResourceWatch<Namespace>,
+    /// With `[gateway.generate_servers]`.
+    pingap_pods: Option<ResourceWatch<Pod>>,
 }
 
 impl Inner {
@@ -514,8 +539,9 @@ pub struct GatewayWatch {
 }
 
 impl GatewayWatch {
-    /// Starts the eight watches. Must be called inside a Tokio runtime.
-    pub fn new(client: Client) -> Self {
+    /// Starts the eight watches, and the Pingap pod watch with `pingap_pods`. Must be
+    /// called inside a Tokio runtime.
+    pub fn new(client: Client, pingap_pods: Option<PingapPods>) -> Self {
         let (changes, _) = broadcast::channel(CHANGE_CHANNEL_CAPACITY);
         let inner = Inner {
             classes: start_cluster(&client, WatchedKind::GatewayClass, strip_metadata, &changes),
@@ -541,6 +567,25 @@ impl GatewayWatch {
                 &changes,
             ),
             namespaces: start_cluster(&client, WatchedKind::Namespace, strip_namespace, &changes),
+            pingap_pods: pingap_pods.map(|p| {
+                info!(
+                    namespace = %p.namespace,
+                    selector = %p.selector,
+                    "watching the Pingap pods (generated servers)"
+                );
+                ResourceWatch::start(
+                    Api::namespaced(client.clone(), &p.namespace),
+                    watcher::Config::default().labels(&p.selector),
+                    WatchTarget {
+                        what: format!("Pingap pods ({})", p.selector),
+                        scope: Scope::Namespace(p.namespace.clone()),
+                        rbac: "get/list/watch on pods",
+                        crd: None,
+                    },
+                    strip_pod,
+                    changes.clone(),
+                )
+            }),
             changes,
         };
         info!(
@@ -637,6 +682,19 @@ impl GatewaySource for GatewayWatch {
     /// partial view. A kind whose CRD is missing counts as listed and empty.
     fn is_synced(&self) -> bool {
         self.inner.flags().iter().all(|(_, synced, ..)| *synced)
+            && self
+                .inner
+                .pingap_pods
+                .as_ref()
+                .is_none_or(ResourceWatch::is_synced)
+    }
+
+    fn pingap_pods(&self) -> Vec<Arc<Pod>> {
+        self.inner
+            .pingap_pods
+            .as_ref()
+            .map(|w| w.store().state())
+            .unwrap_or_default()
     }
 
     /// Fires on every apply, delete, completed (re-)list and CRD found missing.
@@ -789,7 +847,7 @@ mod tests {
 
     #[tokio::test]
     async fn watch_against_unreachable_apiserver() {
-        let watch = GatewayWatch::new(unreachable_client());
+        let watch = GatewayWatch::new(unreachable_client(), None);
         assert!(!GatewaySource::is_synced(&watch));
         assert!(!watch.wait_ready(Duration::from_millis(200)).await);
         assert!(watch.classes().is_empty());

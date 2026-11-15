@@ -14,7 +14,9 @@
 //!    API asks for a backend without endpoints). One that names a missing hand-made
 //!    plugin is deferred too (a stored version is kept, a new one waits);
 //! 3. set the owned part of every stored server's `locations`: each server lists its live
-//!    generated locations, highest weight first; other servers lose every owned name;
+//!    generated locations, highest weight first; other servers lose every owned name.
+//!    Generated servers (`k8s-`) are written whole when new or when their settings
+//!    changed, with their locations, and deleted when no longer wanted;
 //! 4. delete stale owned locations;
 //! 5. delete stale owned plugins that no remaining location names;
 //! 6. delete stale owned upstreams that no remaining location or plugin names.
@@ -24,6 +26,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use k8s_openapi::jiff::Timestamp;
 use tracing::warn;
 
 use crate::etcd::{SERVICE_UPDATE_FREQUENCY, check_name, entry_key};
@@ -49,6 +52,9 @@ pub struct PlanInput<'a> {
     pub stored: &'a Stored,
     /// Owned upstreams that must not be deleted (those the endpoint writer manages).
     pub keep_upstreams: &'a BTreeSet<String>,
+    /// The time written into a generated server that is (re)written, rounded up to
+    /// the second (pod start times have seconds).
+    pub now: Timestamp,
 }
 
 /// Collects the ops of one step; RequireExists compares are kept once per key.
@@ -132,7 +138,10 @@ pub fn plan(input: &PlanInput<'_>) -> Plan {
         desired,
         stored,
         keep_upstreams,
+        now,
     } = *input;
+    let written = Timestamp::from_second(now.as_second() + i64::from(now.subsec_nanosecond() > 0))
+        .unwrap_or(now);
     let keys = Keys { prefix };
     let mut out = Plan::default();
 
@@ -282,21 +291,13 @@ pub fn plan(input: &PlanInput<'_>) -> Plan {
     }
     step.finish("locations", &mut out.steps);
 
-    // 3. Server location lists.
+    // 3. Server location lists, and generated servers.
     let mut step = StepOps::default();
     // Owned names listed by some server once the plan is applied; `None` when a server
     // could not be read.
     let mut listed: Option<BTreeSet<String>> = Some(BTreeSet::new());
-    for (server, entry) in &stored.servers {
-        let current = match render::server_locations(&entry.value, server) {
-            Ok(current) => current,
-            Err(e) => {
-                warn!(server, error = %e, "can not read the locations of a server");
-                listed = None;
-                continue;
-            }
-        };
-        let wanted: Vec<String> = desired
+    let wanted_of = |server: &str| -> Vec<String> {
+        desired
             .server_locations
             .get(server)
             .map(|names| {
@@ -306,7 +307,58 @@ pub fn plan(input: &PlanInput<'_>) -> Plan {
                     .cloned()
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+    };
+    for (name, server) in &desired.servers {
+        if !is_owned(name) || check_name(name).is_err() {
+            warn!(server = name, "skipping a server with an invalid name");
+            continue;
+        }
+        let stored_entry = stored.servers.get(name);
+        if stored_entry.is_some_and(|e| render::same_server_settings(&e.value, name, server)) {
+            continue;
+        }
+        let wanted = wanted_of(name);
+        for location in &wanted {
+            step.require(keys.of(&stored.locations, "locations", location));
+        }
+        step.push(put(
+            &keys,
+            &stored.servers,
+            "servers",
+            name,
+            render::render_server(name, server, &wanted, written),
+        ));
+        if let Some(listed) = &mut listed {
+            listed.extend(wanted);
+        }
+    }
+    for (server, entry) in &stored.servers {
+        if is_owned(server) {
+            match desired.servers.get(server) {
+                // Stale: deleted; its locations go in step 4.
+                None => {
+                    step.push(delete(entry));
+                    continue;
+                }
+                // Rewritten whole above.
+                Some(generated)
+                    if !render::same_server_settings(&entry.value, server, generated) =>
+                {
+                    continue;
+                }
+                Some(_) => {}
+            }
+        }
+        let current = match render::server_locations(&entry.value, server) {
+            Ok(current) => current,
+            Err(e) => {
+                warn!(server, error = %e, "can not read the locations of a server");
+                listed = None;
+                continue;
+            }
+        };
+        let wanted = wanted_of(server);
         match render::replace_owned_locations(&entry.value, server, &wanted) {
             Ok(Some(updated)) => {
                 for name in wanted.iter().filter(|n| !current.contains(n)) {
@@ -639,6 +691,7 @@ mod tests {
                 desired: &self.desired,
                 stored: &stored,
                 keep_upstreams: &self.keep,
+                now: k8s_openapi::jiff::Timestamp::UNIX_EPOCH,
             })
         }
 
@@ -711,6 +764,7 @@ mod tests {
             health_check: None,
             h2c: false,
             tls: None,
+            algo: None,
         };
         case.desired
             .external
@@ -1069,6 +1123,106 @@ mod tests {
                 .first()
                 .map(String::as_str),
             Some("a")
+        );
+    }
+
+    fn generated(port: u16, tls: bool) -> crate::gateway::model::GeneratedServer {
+        crate::gateway::model::GeneratedServer {
+            port,
+            tls,
+            listen: "[::]".into(),
+        }
+    }
+
+    #[test]
+    fn generated_server_is_written_with_its_locations_then_deleted() {
+        let mut fake = Fake::new();
+        fake.upstream("k8s-shop-api-80-aaaa");
+        let mut case = Case::new();
+        let mut entry = loc("r", "k8s-shop-api-80-aaaa");
+        entry.server = "k8s-http-8081".into();
+        case.location("k8s-loc-1", entry);
+        case.desired
+            .servers
+            .insert("k8s-http-8081".into(), generated(8081, false));
+        let plan = case.converge(&mut fake);
+        assert_eq!(whats(&plan), vec!["locations", "servers"]);
+        let server = fake.get("servers", "k8s-http-8081").unwrap().clone();
+        assert_eq!(
+            server_locations(&server, "k8s-http-8081").unwrap(),
+            s(&["k8s-loc-1"])
+        );
+        assert!(server.contains("addr = \"[::]:8081\""), "{server}");
+        assert_eq!(
+            render::server_written_at(&server, "k8s-http-8081"),
+            Some(k8s_openapi::jiff::Timestamp::UNIX_EPOCH)
+        );
+
+        // A new location only changes the list, not the rest (nor the time written).
+        let mut more = loc("r2", "k8s-shop-api-80-aaaa");
+        more.server = "k8s-http-8081".into();
+        more.weight = 50000;
+        case.location("k8s-loc-2", more);
+        case.converge(&mut fake);
+        let server = fake.get("servers", "k8s-http-8081").unwrap().clone();
+        assert_eq!(
+            server_locations(&server, "k8s-http-8081").unwrap(),
+            s(&["k8s-loc-1", "k8s-loc-2"])
+        );
+
+        // No longer wanted: the server goes, then its locations.
+        let mut gone = Case::new();
+        gone.keep = BTreeSet::new();
+        let plan = gone.converge(&mut fake);
+        assert_eq!(whats(&plan)[..2], ["servers", "stale locations"]);
+        assert!(!fake.has("servers", "k8s-http-8081"));
+        assert!(!fake.has("locations", "k8s-loc-1"));
+    }
+
+    #[test]
+    fn changed_generated_server_settings_rewrite_it() {
+        let mut fake = Fake::new();
+        let mut case = Case::new();
+        case.desired
+            .servers
+            .insert("k8s-https-8443".into(), generated(8443, true));
+        case.converge(&mut fake);
+        let server = fake.get("servers", "k8s-https-8443").unwrap().clone();
+        assert!(server.contains("global_certificates = true"), "{server}");
+        assert!(server.contains("strict_sni = true"), "{server}");
+        case.desired
+            .servers
+            .get_mut("k8s-https-8443")
+            .unwrap()
+            .listen = "0.0.0.0".into();
+        let plan = case.converge(&mut fake);
+        assert_eq!(whats(&plan), vec!["servers"]);
+        let server = fake.get("servers", "k8s-https-8443").unwrap();
+        assert!(server.contains("addr = \"0.0.0.0:8443\""), "{server}");
+    }
+
+    #[test]
+    fn written_time_is_rounded_up_to_the_second() {
+        let fake = Fake::new();
+        let mut case = Case::new();
+        case.desired
+            .servers
+            .insert("k8s-http-8081".into(), generated(8081, false));
+        let stored = fake.stored();
+        let now: k8s_openapi::jiff::Timestamp = "2026-11-15T10:00:00.4Z".parse().unwrap();
+        let plan = plan(&PlanInput {
+            prefix: PREFIX,
+            desired: &case.desired,
+            stored: &stored,
+            keep_upstreams: &case.keep,
+            now,
+        });
+        let Op::Put { value, .. } = &plan.steps[0].ops[0] else {
+            panic!("{plan:?}");
+        };
+        assert_eq!(
+            render::server_written_at(value, "k8s-http-8081").map(|t| t.to_string()),
+            Some("2026-11-15T10:00:01Z".to_string())
         );
     }
 }

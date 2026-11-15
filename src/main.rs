@@ -28,7 +28,7 @@ use pingap_k8s::gateway::model::{
 };
 use pingap_k8s::gateway::secrets::SecretRegistry;
 use pingap_k8s::gateway::status::KubeStatus;
-use pingap_k8s::gateway::watch::GatewayWatch;
+use pingap_k8s::gateway::watch::{GatewayWatch, PingapPods};
 use pingap_k8s::gateway::writer::{GatewayWriter, TxnLimits};
 use pingap_k8s::leader;
 use pingap_k8s::metrics::{EtcdHealth, Metrics};
@@ -562,6 +562,14 @@ async fn run(
             resync: config.defaults.resync,
             shutdown: shutdown_rx.clone(),
             max_txn_ops: config.gateway.as_ref().map_or(0, |g| g.max_txn_ops),
+            pingap_pods: config
+                .gateway
+                .as_ref()
+                .and_then(|g| g.generate_servers.as_ref())
+                .map(|g| PingapPods {
+                    namespace: g.pingap_namespace.clone(),
+                    selector: g.pingap_selector.clone(),
+                }),
         };
         match start_gateway(start).await {
             Some(task) => {
@@ -619,12 +627,17 @@ struct GatewayStart {
     resync: Duration,
     shutdown: watch::Receiver<bool>,
     max_txn_ops: usize,
+    /// The Pingap pods to watch, with generated servers.
+    pingap_pods: Option<PingapPods>,
 }
 
 /// Builds the Kubernetes and etcd parts of the Gateway API provider and spawns its
 /// controller. `None` when shutdown comes first.
 async fn start_gateway(start: GatewayStart) -> Option<JoinHandle<()>> {
-    let gateways = Arc::new(GatewayWatch::new(start.client.clone()));
+    let gateways = Arc::new(GatewayWatch::new(
+        start.client.clone(),
+        start.pingap_pods.clone(),
+    ));
     let secrets = Arc::new(SecretRegistry::new(start.client.clone()));
     let status = Arc::new(KubeStatus::new(
         start.client.clone(),
@@ -1060,7 +1073,12 @@ impl Controller {
         }
         if let (Some(tx), Some(settings)) = (
             &self.gateway_settings,
-            ControllerSettings::from_config(&new),
+            ControllerSettings::from_config(&new).map(|mut settings| {
+                // Read at startup only (the Pingap pod watch): keep the running value.
+                settings.translate.generate_servers = ControllerSettings::from_config(&self.boot)
+                    .and_then(|boot| boot.translate.generate_servers);
+                settings
+            }),
         ) {
             tx.send_if_modified(|current| {
                 let changed = *current != settings;
@@ -1234,6 +1252,12 @@ fn restart_required(boot: &Config, new: &Config) -> Vec<&'static str> {
         && a.controller_name != b.controller_name
     {
         fields.push("[gateway] controller_name");
+    }
+    // The Pingap pod watch is started with the provider.
+    if let (Some(a), Some(b)) = (&boot.gateway, &new.gateway)
+        && a.generate_servers != b.generate_servers
+    {
+        fields.push("[gateway.generate_servers]");
     }
     fields
 }
@@ -1476,6 +1500,22 @@ services = ["api.prod:http"]
 
     fn cfg(extra: &str) -> Config {
         Config::from_toml_str(&format!("{BASE}{extra}"), "default").unwrap()
+    }
+
+    #[test]
+    fn restart_required_generate_servers() {
+        let gw = "[gateway]\nenabled = true\n";
+        let base = cfg(gw);
+        let generated = cfg(&format!(
+            "{gw}[gateway.generate_servers]\nenabled = true\npingap_selector = \"app=pingap\"\n"
+        ));
+        assert_eq!(
+            restart_required(&base, &generated),
+            vec!["[gateway.generate_servers]"]
+        );
+        assert!(
+            restart_required(&base, &cfg(&format!("{gw}session_persistence = true\n"))).is_empty()
+        );
     }
 
     #[test]

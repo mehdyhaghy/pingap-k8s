@@ -71,8 +71,8 @@ gateway:
   # namespaces.
   configMapNames: []
   # Pingap servers (already in etcd) listeners may be mapped onto, by port and
-  # TLS (global_certificates). Empty: every stored server. The controller never
-  # creates servers.
+  # TLS (global_certificates). Empty: every stored server. Servers the
+  # controller generates (generateServers) are always mapped onto.
   servers: []
   # Allow ExternalName Service backends (Pingap DNS discovery on the external
   # name).
@@ -107,6 +107,33 @@ gateway:
   # max_txn_ops, 2 to 1024). Keep it below the etcd server's --max-txn-ops
   # (128 by default).
   maxTxnOps: 64
+  # Honor the Experimental-channel sessionPersistence of HTTPRoute and GRPCRoute
+  # rules (needs the experimental-install.yaml CRDs): cookie sessions become
+  # Pingap sticky upstreams (README, "Session persistence"). Off, a rule with
+  # sessionPersistence is dropped.
+  sessionPersistence: false
+  # Generate a Pingap server ("k8s-http-<port>", "k8s-https-<port>") for each
+  # listener port of the shared servers that no Pingap server listens on
+  # (README, "Generated servers"). Pingap binds a new server only when it
+  # starts: the listener reports Programmed=False (Pending) until every Ready
+  # Pingap pod has restarted after the server was written. Changing this
+  # restarts the controller pods.
+  generateServers:
+    enabled: false
+    # Host part of the generated addr: "[::]" or an IP address.
+    listen: "[::]"
+    # Ports never generated. With pingap.deploy the admin port is added.
+    excludePorts: []
+    # The Pingap pods, watched to tell when they restarted (the chart adds a
+    # Role with get/list/watch on pods there). Empty: the release namespace
+    # and, with pingap.deploy, the quickstart Pingap's labels (required
+    # otherwise), e.g. "app.kubernetes.io/name=pingap".
+    pingapNamespace: ""
+    pingapSelector: ""
+    # With pingap.deploy: listener ports of generated servers to open on the
+    # proxy Service and its NetworkPolicy (Service port = server port), e.g.
+    # [8443].
+    ports: []
 
 etcd:
   # Pingap's etcd URL, the same string Pingap gets with --conf:

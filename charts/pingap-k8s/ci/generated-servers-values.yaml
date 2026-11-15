@@ -1,0 +1,17 @@
+# CI render check for generated Gateway servers and session persistence with the
+# quickstart Pingap: the [gateway.generate_servers] table (selector and admin port
+# filled in), the pods Role in the release namespace, and the extra ports on the
+# proxy Service and its NetworkPolicy.
+etcd:
+  deploy: true
+pingap:
+  deploy: true
+gateway:
+  enabled: true
+  namespaces: ["web"]
+  addresses: ["203.0.113.10"]
+  sessionPersistence: true
+  generateServers:
+    enabled: true
+    excludePorts: [9090]
+    ports: [8443, 9000]

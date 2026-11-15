@@ -5,7 +5,7 @@ use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 
-use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Pod, Secret, Service};
 use tokio::sync::{broadcast, oneshot};
 
 use crate::config::{GatewayGroup, UpstreamConfig};
@@ -102,6 +102,31 @@ pub struct ServerInfo {
     /// `enabled_h2 = true`: HTTP/2 by ALPN on a TLS server, h2c with prior knowledge on a
     /// plain one. GRPCRoutes need it.
     pub h2: bool,
+    /// Pingap listens with it. Always true for a hand-made server; a generated one is
+    /// live once every Ready Pingap pod started after it was written (Pingap binds
+    /// new servers only when it starts).
+    pub live: bool,
+}
+
+/// How listener ports without a Pingap server get one (`[gateway.generate_servers]`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerGeneration {
+    /// Host part of the `addr`: `[::]` or an IP address.
+    pub listen: String,
+    /// Ports never generated.
+    pub exclude_ports: BTreeSet<u16>,
+}
+
+/// A Pingap server generated for the listeners on one port of the shared group:
+/// `k8s-http-<port>` or `k8s-https-<port>` (TLS, `global_certificates` and
+/// `strict_sni`), both with `enabled_h2` for GRPCRoutes. Its `locations` are set like
+/// those of any other server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GeneratedServer {
+    pub port: u16,
+    pub tls: bool,
+    /// Host part of the `addr`.
+    pub listen: String,
 }
 
 #[derive(Clone, Debug)]
@@ -124,6 +149,11 @@ pub struct TranslateOptions {
     pub addresses: Vec<String>,
     /// Server groups given to one Gateway each.
     pub groups: Vec<GatewayGroup>,
+    /// Honor `sessionPersistence` of route rules (Experimental channel).
+    pub session_persistence: bool,
+    /// Generate Pingap servers for listener ports of the shared group without one;
+    /// `None`: never (stored generated servers are deleted).
+    pub generate_servers: Option<ServerGeneration>,
 }
 
 /// A consistent snapshot to translate. Lists are in no particular order; the
@@ -233,6 +263,8 @@ pub struct ExternalUpstream {
     pub h2c: bool,
     /// TLS to the backend (BackendTLSPolicy).
     pub tls: Option<UpstreamTls>,
+    /// Pingap `algo` (`sticky:<cookie>` for session persistence).
+    pub algo: Option<String>,
 }
 
 /// A certificate from a `kubernetes.io/tls` Secret named by an HTTPS listener.
@@ -287,6 +319,9 @@ pub struct Desired {
     pub external: BTreeMap<String, ExternalUpstream>,
     pub certificates: BTreeMap<String, CertificateEntry>,
     pub plugins: BTreeMap<String, PluginEntry>,
+    /// Pingap servers the provider generates, stored or to be written; every other
+    /// stored `k8s-` server is deleted.
+    pub servers: BTreeMap<String, GeneratedServer>,
     pub status: DesiredStatus,
     pub referenced: Referenced,
 }
@@ -386,6 +421,10 @@ pub trait GatewaySource: Send + Sync + 'static {
     fn grants(&self) -> Vec<Arc<ReferenceGrant>>;
     fn backend_tls_policies(&self) -> Vec<Arc<BackendTlsPolicy>>;
     fn namespaces(&self) -> BTreeMap<String, Arc<Namespace>>;
+    /// The Pingap pods, when generated servers are on (empty otherwise).
+    fn pingap_pods(&self) -> Vec<Arc<Pod>> {
+        Vec::new()
+    }
     /// Every watch listed once.
     fn is_synced(&self) -> bool;
     fn changes(&self) -> broadcast::Receiver<()>;
@@ -472,6 +511,9 @@ impl<T: GatewaySource> GatewaySource for Arc<T> {
     }
     fn namespaces(&self) -> BTreeMap<String, Arc<Namespace>> {
         (**self).namespaces()
+    }
+    fn pingap_pods(&self) -> Vec<Arc<Pod>> {
+        (**self).pingap_pods()
     }
     fn is_synced(&self) -> bool {
         (**self).is_synced()

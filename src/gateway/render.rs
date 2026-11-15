@@ -4,18 +4,21 @@
 //! Generated entries (`render_*`) are whole documents holding one `[<category>.<name>]`
 //! table, with the field names of Pingap 0.16 (`LocationConf`, `CertificateConf`,
 //! `UpstreamConf`, `PluginConf`). Stored entries are compared by value ([`same_entry`]), so a
-//! reformatted entry is not rewritten. Servers are never generated: only their
+//! reformatted entry is not rewritten. Hand-made servers are never rewritten: only their
 //! `locations` list is edited ([`replace_owned_locations`]), with `toml_edit` so comments
-//! and the hand-made part of the list stay as they are.
+//! and the hand-made part of the list stay as they are. Generated servers
+//! ([`render_server`]) are written whole once, then only their `locations` change.
 
 use std::collections::BTreeSet;
 use std::net::IpAddr;
 
 use toml_edit::{Array, DocumentMut, Item, Table, TableLike, Value};
 
+use k8s_openapi::jiff::Timestamp;
+
 use crate::gateway::model::{
-    CertificateEntry, ExternalUpstream, LocationEntry, PluginEntry, REMARK_PREFIX, RouteKey,
-    RouteKind, SecretKey, ServerInfo, is_owned,
+    CertificateEntry, ExternalUpstream, GeneratedServer, LocationEntry, PluginEntry, REMARK_PREFIX,
+    RouteKey, RouteKind, SecretKey, ServerInfo, is_owned,
 };
 use crate::types::ServiceKey;
 
@@ -70,6 +73,72 @@ pub fn secret_remark(key: &SecretKey) -> String {
 /// `remark` of the upstream of an `ExternalName` Service: "pingap-k8s service <ns>/<name>".
 pub fn service_remark(key: &ServiceKey) -> String {
     format!("{REMARK_PREFIX} service {key}")
+}
+
+/// `remark` of a generated server: "pingap-k8s server for Gateway listeners on port
+/// <port>, written <RFC 3339 time>". The time tells when Pingap pods that started
+/// later listen with it ([`server_written_at`]).
+pub fn server_remark(port: u16, written: Timestamp) -> String {
+    format!(
+        "{REMARK_PREFIX} server for Gateway listeners on port {port}, written {}",
+        written.strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+}
+
+/// `[servers.<name>]` of a generated server: `addr` on its port, `enabled_h2`, with TLS
+/// `global_certificates` and `strict_sni`, `locations` and the remark with `written`.
+pub fn render_server(
+    name: &str,
+    server: &GeneratedServer,
+    locations: &[String],
+    written: Timestamp,
+) -> String {
+    let mut entry = Table::new();
+    entry.insert(
+        "addr",
+        toml_edit::value(format!("{}:{}", server.listen, server.port)),
+    );
+    entry.insert("enabled_h2", toml_edit::value(true));
+    if server.tls {
+        entry.insert("global_certificates", toml_edit::value(true));
+        entry.insert("strict_sni", toml_edit::value(true));
+    }
+    if !locations.is_empty() {
+        entry.insert("locations", toml_edit::value(strings(locations)));
+    }
+    entry.insert(
+        "remark",
+        toml_edit::value(server_remark(server.port, written).as_str()),
+    );
+    document("servers", name, entry)
+}
+
+/// Whether a stored generated server has the settings of `server`: everything
+/// [`render_server`] writes but `locations` and `remark`.
+pub fn same_server_settings(toml: &str, name: &str, server: &GeneratedServer) -> bool {
+    let Ok(Some(mut stored)) = entry_table(toml, "servers", name) else {
+        return false;
+    };
+    let Ok(Some(mut rendered)) = entry_table(
+        &render_server(name, server, &[], Timestamp::UNIX_EPOCH),
+        "servers",
+        name,
+    ) else {
+        return false;
+    };
+    for table in [&mut stored, &mut rendered] {
+        table.remove("locations");
+        table.remove("remark");
+    }
+    stored == rendered
+}
+
+/// When a stored generated server was written, from its remark ([`server_remark`]);
+/// `None` when the remark is not one (edited by hand).
+pub fn server_written_at(toml: &str, name: &str) -> Option<Timestamp> {
+    let remark = entry_string(toml, "servers", name, "remark").ok()??;
+    let (_, time) = remark.rsplit_once(", written ")?;
+    time.parse().ok()
 }
 
 /// A document holding only `[<category>.<name>]` = `entry`.
@@ -186,6 +255,7 @@ pub fn server_info(toml: &str, name: &str) -> Option<ServerInfo> {
         ports,
         tls: flag("global_certificates"),
         h2: flag("enabled_h2"),
+        live: true,
     })
 }
 
@@ -276,6 +346,9 @@ pub fn render_external_upstream(
     }
     if let Some(health_check) = &upstream.health_check {
         entry.insert("health_check", toml_edit::value(health_check.as_str()));
+    }
+    if let Some(algo) = &upstream.algo {
+        entry.insert("algo", toml_edit::value(algo.as_str()));
     }
     if upstream.h2c {
         entry.insert("alpn", toml_edit::value(H2C_ALPN));
@@ -777,7 +850,20 @@ mod tests {
             health_check: None,
             h2c: false,
             tls: None,
+            algo: None,
         }
+    }
+
+    #[test]
+    fn external_upstream_with_algo() {
+        let mut upstream = external("shop.example.com:443");
+        upstream.algo = Some("sticky:s".into());
+        let out = render_external_upstream("k8s-x", &upstream, "5s").unwrap();
+        let value: toml::Table = toml::from_str(&out).unwrap();
+        assert_eq!(
+            value["upstreams"]["k8s-x"]["algo"].as_str(),
+            Some("sticky:s")
+        );
     }
 
     #[test]
@@ -1128,6 +1214,7 @@ global_certificates = true
                 ports: BTreeSet::from([80]),
                 tls: true,
                 h2: false,
+                live: true,
             })
         );
         let doc = "[servers.web]\naddr = \"0.0.0.0:8080,[::]:8080, 127.0.0.1:9000\"\n";

@@ -117,6 +117,7 @@ fn convert_rule(rule: &GrpcRouteRules) -> Result<HttpRouteRules, String> {
         filters: recast(&rule.filters).map_err(|_| invalid("filters"))?,
         matches,
         name: rule.name.clone(),
+        session_persistence: rule.session_persistence.clone(),
         ..Default::default()
     })
 }

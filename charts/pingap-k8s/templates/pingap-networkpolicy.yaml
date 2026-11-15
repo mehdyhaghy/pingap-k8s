@@ -39,6 +39,11 @@ spec:
           protocol: TCP
         {{- end }}
         {{- end }}
+        {{- range ((include "pingap-k8s.generateServers" $ | fromJson).ports | default (list)) }}
+        # Generated server port {{ int . }}.
+        - port: {{ int . }}
+          protocol: TCP
+        {{- end }}
     {{- with $np.adminFrom }}
     # Admin UI.
     - from:

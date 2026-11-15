@@ -189,6 +189,30 @@ pub struct GatewaySettings {
     /// of Gateways with a group are never mixed with routes of other Gateways.
     /// `servers` and `addresses` above are the shared group of the other Gateways.
     pub groups: Vec<GatewayGroup>,
+    /// Honor the Experimental-channel `sessionPersistence` of route rules (cookie
+    /// stickiness); off, a rule with it is dropped.
+    pub session_persistence: bool,
+    /// `[gateway.generate_servers]` when enabled: Pingap servers created for listener
+    /// ports of the shared group that no stored server listens on.
+    pub generate_servers: Option<GenerateServers>,
+}
+
+/// `[gateway.generate_servers]`: a listener port of the shared group without a Pingap
+/// server gets one (`k8s-http-<port>`, `k8s-https-<port>`). Pingap binds a new server
+/// only when it starts, so a listener on a generated server is `Programmed` once every
+/// Ready Pingap pod (`pingap_namespace`, `pingap_selector`) has started after the
+/// server was written. `pingap_namespace` and `pingap_selector` need a restart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenerateServers {
+    /// The host part of the generated `addr` (`[::]` or an IP address).
+    pub listen: String,
+    /// Ports never generated (the Pingap admin port, ports of other software in the
+    /// Pingap pods).
+    pub exclude_ports: BTreeSet<u16>,
+    /// Namespace of the Pingap pods.
+    pub pingap_namespace: String,
+    /// Label selector of the Pingap pods.
+    pub pingap_selector: String,
 }
 
 /// `[[gateway.groups]]`: Pingap servers reached on addresses of their own (in
@@ -218,6 +242,30 @@ struct RawGateway {
     max_txn_ops: usize,
     health_check: String,
     groups: Vec<RawGatewayGroup>,
+    session_persistence: bool,
+    generate_servers: RawGenerateServers,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawGenerateServers {
+    enabled: bool,
+    listen: String,
+    exclude_ports: Vec<u16>,
+    pingap_namespace: String,
+    pingap_selector: String,
+}
+
+impl Default for RawGenerateServers {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: DEFAULT_GENERATED_LISTEN.to_string(),
+            exclude_ports: Vec::new(),
+            pingap_namespace: String::new(),
+            pingap_selector: String::new(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -243,6 +291,8 @@ impl Default for RawGateway {
             max_txn_ops: DEFAULT_MAX_TXN_OPS,
             health_check: String::new(),
             groups: Vec::new(),
+            session_persistence: false,
+            generate_servers: RawGenerateServers::default(),
         }
     }
 }
@@ -309,6 +359,10 @@ pub struct UpstreamConfig {
     /// TLS to the backends, written when the controller creates the entry (generated
     /// Gateway upstreams only; like `health_check`, never updated in place).
     pub tls: Option<UpstreamTls>,
+    /// Pingap `algo`, written when the controller creates the entry (generated Gateway
+    /// upstreams with session persistence: `sticky:<cookie>`; like `health_check`,
+    /// never updated in place).
+    pub algo: Option<String>,
 }
 
 // ---- raw (serde) layer ----
@@ -438,7 +492,7 @@ impl Config {
         }
 
         let gateway = match raw.gateway {
-            Some(raw_gateway) => build_gateway(raw_gateway)?,
+            Some(raw_gateway) => build_gateway(raw_gateway, pod_namespace)?,
             None => None,
         };
 
@@ -567,12 +621,116 @@ fn build_upstream(
         health_check: None,
         h2c: false,
         tls: None,
+        algo: None,
     })
 }
 
+/// Host part of the `addr` of generated Pingap servers: IPv6 and, unless the node sets
+/// `net.ipv6.bindv6only=1`, IPv4 too (what the quickstart Pingap listens on).
+pub const DEFAULT_GENERATED_LISTEN: &str = "[::]";
+
+/// Validates `[gateway.generate_servers]`; `None` when it is off. `pod_namespace` is
+/// the namespace of an empty `pingap_namespace`.
+fn build_generate_servers(
+    raw: RawGenerateServers,
+    pod_namespace: &str,
+) -> Result<Option<GenerateServers>, String> {
+    let listen = raw.listen.trim();
+    let valid_listen = match listen.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+        Some(v6) => v6.parse::<std::net::Ipv6Addr>().is_ok(),
+        None => listen.parse::<std::net::Ipv4Addr>().is_ok(),
+    };
+    if !valid_listen {
+        return Err(format!(
+            "listen: {listen:?} must be an IPv4 address or an IPv6 address in brackets, \
+             e.g. \"[::]\" or \"0.0.0.0\""
+        ));
+    }
+    let mut exclude_ports = BTreeSet::new();
+    for port in &raw.exclude_ports {
+        if *port == 0 || !exclude_ports.insert(*port) {
+            return Err(format!(
+                "exclude_ports: {port} is 0 or listed more than once"
+            ));
+        }
+    }
+    let namespace = match raw.pingap_namespace.trim() {
+        "" => pod_namespace,
+        ns => ns,
+    };
+    validate_namespace(namespace).map_err(|r| format!("pingap_namespace: {namespace:?}: {r}"))?;
+    let selector = raw.pingap_selector.trim();
+    if raw.enabled && selector.is_empty() {
+        return Err(
+            "pingap_selector: required: the label selector of the Pingap pods, to tell when \
+             they restarted onto a generated server"
+                .into(),
+        );
+    }
+    if !selector.is_empty() {
+        validate_label_selector(selector).map_err(|r| format!("pingap_selector: {r}"))?;
+    }
+    if !raw.enabled {
+        return Ok(None);
+    }
+    Ok(Some(GenerateServers {
+        listen: listen.to_string(),
+        exclude_ports,
+        pingap_namespace: namespace.to_string(),
+        pingap_selector: selector.to_string(),
+    }))
+}
+
+/// An equality-based label selector, `key=value` or `key!=value` terms (also `==`,
+/// a bare `key` and `!key`) separated by commas: what the Pingap pods are found by.
+/// Set-based terms (`in`, `notin`) are not accepted.
+fn validate_label_selector(selector: &str) -> Result<(), String> {
+    for term in selector.split(',') {
+        let term = term.trim();
+        let (key, value) = if let Some((k, v)) = term.split_once("!=") {
+            (k, Some(v))
+        } else if let Some((k, v)) = term.split_once("==") {
+            (k, Some(v))
+        } else if let Some((k, v)) = term.split_once('=') {
+            (k, Some(v))
+        } else {
+            (term.strip_prefix('!').unwrap_or(term), None)
+        };
+        let key = key.trim();
+        let (prefix, name) = match key.rsplit_once('/') {
+            Some((prefix, name)) => (Some(prefix), name),
+            None => (None, key),
+        };
+        let label_ok = |s: &str, allow_empty: bool| {
+            (allow_empty || !s.is_empty())
+                && s.len() <= 63
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+                && s.bytes().next().is_none_or(|b| b.is_ascii_alphanumeric())
+                && s.bytes().last().is_none_or(|b| b.is_ascii_alphanumeric())
+        };
+        if !label_ok(name, false) || prefix.is_some_and(|p| validate_cluster_domain(p).is_err()) {
+            return Err(format!("{term:?}: {key:?} is not a valid label key"));
+        }
+        if let Some(value) = value
+            && !label_ok(value.trim(), true)
+        {
+            return Err(format!(
+                "{term:?}: {:?} is not a valid label value",
+                value.trim()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validates `[gateway]`. Every field is checked even when it is disabled, so a typo
-/// shows before it is turned on. `None` when disabled.
-fn build_gateway(raw: RawGateway) -> Result<Option<GatewaySettings>, ConfigError> {
+/// shows before it is turned on. `None` when disabled. `pod_namespace` is the
+/// namespace of an empty `generate_servers.pingap_namespace`.
+fn build_gateway(
+    raw: RawGateway,
+    pod_namespace: &str,
+) -> Result<Option<GatewaySettings>, ConfigError> {
     let fail = |reason: String| ConfigError::Invalid(format!("gateway.{reason}"));
 
     validate_controller_name(&raw.controller_name)
@@ -618,6 +776,8 @@ fn build_gateway(raw: RawGateway) -> Result<Option<GatewaySettings>, ConfigError
             .map_err(|r| fail(format!("health_check: {health_check:?}: {r}")))?;
     }
     let health_check = (!health_check.is_empty()).then(|| health_check.to_string());
+    let generate_servers = build_generate_servers(raw.generate_servers, pod_namespace)
+        .map_err(|r| fail(format!("generate_servers.{r}")))?;
     if !raw.enabled {
         return Ok(None);
     }
@@ -629,6 +789,8 @@ fn build_gateway(raw: RawGateway) -> Result<Option<GatewaySettings>, ConfigError
         max_txn_ops: raw.max_txn_ops,
         health_check,
         groups,
+        session_persistence: raw.session_persistence,
+        generate_servers,
     }))
 }
 
@@ -1563,6 +1725,8 @@ target = "service"
                 max_txn_ops: 64,
                 health_check: None,
                 groups: vec![],
+                session_persistence: false,
+                generate_servers: None,
             })
         );
     }
@@ -1789,5 +1953,62 @@ addresses = ["192.0.2.9"]
             .unwrap_err()
             .to_string();
         assert!(m.contains("missing.toml"), "{m}");
+    }
+
+    #[test]
+    fn gateway_generate_servers() {
+        let base = "[etcd]\nurl = \"etcd://e:2379/p\"\n[gateway]\nenabled = true\n";
+        let parse = |body: &str| Config::from_toml_str(&format!("{base}{body}"), "edge");
+        let c = parse(
+            "[gateway.generate_servers]\nenabled = true\nexclude_ports = [3018]\n\
+             pingap_selector = \"app.kubernetes.io/name=pingap,app.kubernetes.io/component=proxy\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.gateway.unwrap().generate_servers,
+            Some(GenerateServers {
+                listen: "[::]".into(),
+                exclude_ports: BTreeSet::from([3018]),
+                pingap_namespace: "edge".into(),
+                pingap_selector: "app.kubernetes.io/name=pingap,app.kubernetes.io/component=proxy"
+                    .into(),
+            })
+        );
+        // Off: None, but still validated.
+        let c = parse("[gateway.generate_servers]\nlisten = \"0.0.0.0\"\n").unwrap();
+        assert_eq!(c.gateway.unwrap().generate_servers, None);
+        for (body, needle) in [
+            ("enabled = true\n", "pingap_selector: required"),
+            ("listen = \"localhost\"\n", "generate_servers.listen"),
+            ("listen = \"::\"\n", "generate_servers.listen"),
+            ("exclude_ports = [80, 80]\n", "exclude_ports"),
+            ("pingap_selector = \"a in (b)\"\n", "pingap_selector"),
+            ("pingap_selector = \"=x\"\n", "pingap_selector"),
+            ("pingap_namespace = \"Bad\"\n", "pingap_namespace"),
+            ("unknown = 1\n", "unknown"),
+        ] {
+            let err = parse(&format!("[gateway.generate_servers]\n{body}"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "{body}: {err}");
+        }
+        for selector in [
+            "app=pingap",
+            "app==pingap,tier!=x",
+            "!legacy",
+            "example.com/role=edge",
+        ] {
+            assert!(validate_label_selector(selector).is_ok(), "{selector}");
+        }
+    }
+
+    #[test]
+    fn gateway_session_persistence() {
+        let c = Config::from_toml_str(
+            "[etcd]\nurl = \"etcd://e:2379/p\"\n[gateway]\nenabled = true\nsession_persistence = true\n",
+            "edge",
+        )
+        .unwrap();
+        assert!(c.gateway.unwrap().session_persistence);
     }
 }

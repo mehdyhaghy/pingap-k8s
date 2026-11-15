@@ -861,14 +861,18 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
         let upstream = name.to_string();
         let health_check = st.config.health_check.clone();
         let tls = st.config.tls.clone();
+        let algo = st.config.algo.clone();
         let alpn = h2c.then_some(crate::gateway::render::H2C_ALPN);
         let handle = self.inflight.spawn(async move {
             let result = writer
                 .write_upstream(
                     &upstream,
                     &desired,
-                    health_check.as_deref(),
-                    tls.as_ref(),
+                    crate::types::NewUpstream {
+                        health_check: health_check.as_deref(),
+                        tls: tls.as_ref(),
+                        algo: algo.as_deref(),
+                    },
                     alpn,
                 )
                 .await;
@@ -1149,8 +1153,7 @@ mod tests {
             &self,
             upstream: &str,
             addrs: &[String],
-            _health_check: Option<&str>,
-            _tls: Option<&crate::types::UpstreamTls>,
+            _new: crate::types::NewUpstream<'_>,
             alpn: Option<&str>,
         ) -> impl Future<Output = anyhow::Result<WriteOutcome>> + Send {
             lock(&self.alpns).push((upstream.to_string(), alpn.map(String::from)));
@@ -1238,6 +1241,7 @@ mod tests {
             health_check: None,
             h2c: false,
             tls: None,
+            algo: None,
         }
     }
 

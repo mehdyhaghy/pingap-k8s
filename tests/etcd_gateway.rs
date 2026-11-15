@@ -98,6 +98,7 @@ async fn plan_for(w: &GatewayWriter, desired: &Desired) -> Plan {
         desired,
         stored: &stored,
         keep_upstreams: &BTreeSet::new(),
+        now: k8s_openapi::jiff::Timestamp::UNIX_EPOCH,
     })
 }
 
@@ -174,6 +175,7 @@ async fn apply_creates_and_removes_entries() {
             health_check: None,
             h2c: false,
             tls: None,
+            algo: None,
         },
     );
     want.certificates.insert(
@@ -390,6 +392,7 @@ async fn every_intermediate_revision_is_valid() {
         desired: &want,
         stored: &stored,
         keep_upstreams: &BTreeSet::new(),
+        now: k8s_openapi::jiff::Timestamp::UNIX_EPOCH,
     });
     let outcome = w.apply(&plan).await.unwrap();
     let ApplyOutcome::Applied { revision: last, .. } = outcome else {

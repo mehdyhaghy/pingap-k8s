@@ -126,6 +126,54 @@ pub fn h2c_upstream_name(name: &str) -> String {
     format!("{OWNED_PREFIX}{readable}-h2c-{}", fnv1a(&["h2c", name]))
 }
 
+/// The session persistence variant of a generated upstream name: `<name without its
+/// hash>-sticky-<h8>`, hashed over `name` and the cookie, so rules with the same
+/// backends but another cookie (or none) never share an upstream.
+pub fn sticky_upstream_name(name: &str, cookie: &str) -> String {
+    let readable = name
+        .strip_prefix(OWNED_PREFIX)
+        .and_then(|rest| rest.rsplit_once('-'))
+        .map_or("x", |(readable, _)| readable);
+    format!(
+        "{OWNED_PREFIX}{readable}-sticky-{}",
+        fnv1a(&["sticky", name, cookie])
+    )
+}
+
+/// The cookie name of a `sessionPersistence` without one: `k8s-session-<h8>`, hashed
+/// over the route and the rule (its name, else its index), so each rule keeps its own
+/// sessions.
+pub fn session_cookie_name(
+    kind: RouteKind,
+    route: &RouteKey,
+    rule_name: Option<&str>,
+    index: usize,
+) -> String {
+    let index = index.to_string();
+    let rule = match rule_name {
+        Some(name) => ["name", name],
+        None => ["index", index.as_str()],
+    };
+    let hash = fnv1a(&[
+        "session",
+        kind.as_str(),
+        &route.namespace,
+        &route.name,
+        rule[0],
+        rule[1],
+    ]);
+    format!("{OWNED_PREFIX}session-{hash}")
+}
+
+/// The Pingap server generated for the listeners on `port`: `k8s-http-<port>` or
+/// `k8s-https-<port>`. A server is never renamed: its port and TLS setting are fixed.
+pub fn generated_server_name(port: u16, tls: bool) -> String {
+    format!(
+        "{OWNED_PREFIX}{}-{port}",
+        if tls { "https" } else { "http" }
+    )
+}
+
 /// The location of one HTTPRoute match on one Pingap server and host:
 /// `k8s-<ns>-<route>-<h8>`. The hash covers the server, the host and the match as Pingap
 /// sees it (path, header and query conditions), not the rule's position, so reordering

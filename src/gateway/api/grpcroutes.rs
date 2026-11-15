@@ -52,6 +52,13 @@ pub struct GrpcRouteParentRefs {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct GrpcRouteRules {
+    /// Experimental channel: see `super::experimental`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "sessionPersistence"
+    )]
+    pub session_persistence: Option<super::experimental::SessionPersistence>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
