@@ -27,8 +27,10 @@
 #                        (default 1; 0 skips it, e.g. to debug a broken controller)
 #   E2E_TIMEOUT          per-wait timeout (default 300s)
 #   E2E_PRELOAD          1 (default): load the third-party images that exist in the
-#                        local Docker cache into kind instead of pulling them in the
-#                        cluster (slow, and rate-limited on Docker Hub); 0: always pull
+#                        local Docker cache into every kind node instead of pulling them
+#                        in the cluster (slow, and rate-limited on Docker Hub); 0: always pull
+#   E2E_EXTRA_VALUES     extra Helm values files (space-separated), applied after
+#                        tests/e2e/values.yaml (scripts/soak.sh uses tests/soak/values.yaml)
 #   E2E_CERT_MANAGER=1   also install cert-manager with its Gateway API integration
 #                        (e2e tests 36 and 37; default 0: they skip)
 set -euo pipefail
@@ -85,19 +87,20 @@ kind load docker-image "$IMAGE" --name "$CLUSTER"
 # --all-platforms, which fails for a multi-platform image pulled for one platform.
 # A failed import falls back to the in-cluster pull.
 if [[ "${E2E_PRELOAD:-1}" == "1" ]]; then
-  node="$CLUSTER-control-plane"
   platform="linux/$(docker version -f '{{.Server.Arch}}')"
-  for img in quay.io/coreos/etcd:v3.6.12 vicanso/pingap:0.16.2 \
+  for img in quay.io/coreos/etcd:v3.7.3 vicanso/pingap:0.16.2 \
       registry.k8s.io/e2e-test-images/agnhost:2.66.1 jmalloc/echo-server:v0.3.7 \
       fortio/fortio:1.75.3 ghcr.io/stefanprodan/podinfo:6.15.0 \
       mccutchen/go-httpbin:2.25.0 registry.k8s.io/gateway-api/conformance/echo-basic:v0.1.0 \
       ghcr.io/letsencrypt/pebble:2.10.3; do
     if docker image inspect "$img" >/dev/null 2>&1; then
-      log "preloading $img ($platform)"
-      docker save "$img" | docker exec -i "$node" \
-          ctr -n k8s.io images import --platform "$platform" --digests \
-          --snapshotter=overlayfs - >/dev/null 2>&1 \
-        || log "preloading $img failed; it will be pulled"
+      for node in $(kind get nodes --name "$CLUSTER"); do
+        log "preloading $img ($platform) into $node"
+        docker save "$img" | docker exec -i "$node" \
+            ctr -n k8s.io images import --platform "$platform" --digests \
+            --snapshotter=overlayfs - >/dev/null 2>&1 \
+          || log "preloading $img into $node failed; it will be pulled"
+      done
     fi
   done
 fi
@@ -174,12 +177,17 @@ log "installing the chart"
 # catch storage-format changes early). It must be a Debian-based tag:
 # the seed init container needs a shell.
 pingap_tag=()
+extra_values=()
+for f in ${E2E_EXTRA_VALUES:-}; do
+  extra_values+=(-f "$f")
+done
 if [[ -n "${E2E_PINGAP_TAG:-}" ]]; then
   pingap_tag=(--set "pingap.image.tag=$E2E_PINGAP_TAG")
 fi
 helm upgrade --install "$RELEASE" "$ROOT/charts/pingap-k8s" \
   --namespace "$NS" --create-namespace \
   -f "$ROOT/tests/e2e/values.yaml" \
+  "${extra_values[@]}" \
   --set "image.repository=${IMAGE%:*}" \
   --set "image.tag=${IMAGE##*:}" \
   "${pingap_tag[@]}"

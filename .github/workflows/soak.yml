@@ -1,0 +1,84 @@
+name: soak
+
+# Long-running soak test (scripts/soak.sh, docs/soak.md): steady load through Pingap
+# on a 4-node kind cluster while pods, the controller leader, etcd members, Pingap
+# pods and nodes fail. Started by hand only: Actions > soak > Run workflow, or
+# `gh workflow run soak -f duration=60m`.
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: Load duration (e.g. 30m, 60m, 2h)
+        type: string
+        default: 60m
+
+permissions:
+  contents: read
+
+concurrency:
+  group: soak-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  HELM_VERSION: v4.3.1
+
+jobs:
+  soak:
+    name: soak (${{ inputs.duration }})
+    runs-on: ubuntu-24.04
+    # The hosted-runner maximum; the run itself takes the duration plus about 10 minutes.
+    timeout-minutes: 360
+    env:
+      KIND_VERSION: v0.33.0
+      # kind-linux-amd64.sha256sum of that release.
+      KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+      E2E_IMAGE: pingap-k8s:e2e
+      # Built below with the gha cache; e2e-up.sh only loads it into kind.
+      E2E_SKIP_BUILD: "1"
+      SOAK_DURATION: ${{ inputs.duration }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Install kind
+        run: |
+          curl -fsSLo kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          echo "${KIND_SHA256}  kind" | sha256sum -c -
+          chmod +x kind
+          sudo mv kind /usr/local/bin/kind
+          kind version
+          kubectl version --client
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: build controller image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.E2E_IMAGE }}
+          cache-from: type=gha
+
+      - name: soak
+        run: scripts/soak.sh
+
+      - name: job summary
+        if: always()
+        run: |
+          if [[ -f target/soak/report.md ]]; then cat target/soak/report.md >>"$GITHUB_STEP_SUMMARY"; fi
+
+      - name: upload report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: soak-report
+          path: target/soak/
+          if-no-files-found: warn
+          retention-days: 30

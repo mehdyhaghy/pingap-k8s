@@ -1,0 +1,45 @@
+# Helm values for scripts/soak.sh, applied on top of tests/e2e/values.yaml.
+# Production-like shape: 2 controller replicas, a 3-member bundled etcd, 3 Pingap
+# replicas (spread over the 3 workers), and one owned upstream "echo" set up as the
+# README production checklist says (HTTP health check, short connect timeout).
+
+replicaCount: 2
+
+gateway:
+  enabled: false
+
+etcd:
+  replicas: 3
+
+pingap:
+  replicas: 3
+  seed:
+    config: |
+      # Same shutdown budget as the chart default seed: preStop 15s + 30s + 10s < 60s.
+      [basic]
+      grace_period = "30s"
+      graceful_shutdown_timeout = "10s"
+
+      [servers.e2e]
+      addr = "[::]:8080"
+      locations = ["echo"]
+
+      [locations.echo]
+      upstream = "echo"
+
+      # Health check as in the production checklist: an HTTP path the app serves,
+      # 1 s connect timeout. The controller only writes addrs.
+      [upstreams.echo]
+      addrs = ["127.0.0.1:9"]
+      connection_timeout = "1s"
+      health_check = "http://echo/hostname?connection_timeout=1s&read_timeout=1s&check_frequency=2s"
+
+# Only "echo" is owned; null removes the other e2e upstreams from the merged values.
+config:
+  upstreams:
+    echo-ws: null
+    httpbin: null
+    grpc: null
+    echo-sticky: null
+    echo-svc: null
+    ext: null

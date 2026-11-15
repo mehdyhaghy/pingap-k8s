@@ -44,9 +44,14 @@ pub const ETCD_PROTOCOL: &str = "etcd://";
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Connect timeout when the URL sets none (Pingap `DEFAULT_CONNECT_TIMEOUT`).
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// HTTP/2 keep-alive, as Pingap sets it (not configurable in the URL).
-const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
-const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// HTTP/2 keep-alive of every etcd connection (not configurable in the URL). Shorter
+/// than Pingap's 30 s + 10 s: a member that stops answering (a hung or partitioned node)
+/// leaves the TCP connection open, so it is only dropped and redialed when a ping times
+/// out; until then lease keep-alives and writes on it hang. 10 s + 5 s bounds that to
+/// about 15 s, near the 10 s election lease TTL. 10 s stays above etcd's default
+/// `--grpc-keepalive-min-time` (5 s), below which etcd closes the connection.
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How many times a failed compare-and-swap is retried.
 pub const MAX_CAS_RETRIES: u32 = 5;

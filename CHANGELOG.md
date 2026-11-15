@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Soak test: `scripts/soak.sh` (and the manual `soak` workflow) runs load through Pingap for an
+  hour while pods, the controller leader, etcd members, Pingap pods and nodes fail, and writes
+  a report; results in [docs/soak.md](docs/soak.md).
+- etcd connections use a 10 s HTTP/2 keep-alive with a 5 s timeout (was 30 s + 10 s, as in
+  Pingap): a connection to an etcd member that stops answering is dropped and redialed within
+  about 15 s instead of 40 s. Found by the soak test, where a paused node stalled leader
+  failover for up to a minute.
 - Gateway API: generated servers (`[gateway.generate_servers]`, chart
   `gateway.generateServers`, off by default). A listener port of the shared servers without a
   Pingap server gets `k8s-http-<port>` or `k8s-https-<port>`; the listener reports

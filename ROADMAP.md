@@ -7,18 +7,26 @@ what has shipped. Ideas and priorities are discussed in issues: open one to prop
 
 - Submit the Gateway API conformance report so the project is listed as a conformant
   implementation.
-- A long-running soak test (load plus pod, node, leader and etcd failures) to back the
-  production checklist with numbers.
-- Document and test TLS certificates issued by cert-manager for Gateways.
 - The OpenSSF Best Practices badge.
 
 ## Next (first half of 2027)
 
-- Generate the Pingap servers for Gateway listeners, so a listener does not need a server
-  configured by hand.
-- Session persistence and the remaining Extended HTTPRoute features Pingap can support.
-- Fuzzing of the Gateway API translation and the config parsing.
-- Track each new Gateway API release within a month.
+- A check in the etcd write transaction that the writer still holds the leader key, so a
+  leader that was paused cannot write once more after it resumes.
+- Header-based session persistence and session timeouts, if Pingap gains them.
+- Turn session persistence on by default once `sessionPersistence` reaches the Standard
+  channel, and program generated servers without a Pingap restart if Pingap can bind new
+  servers live.
+
+## Done
+
+- Soak test with load and pod, leader, etcd and node failures ([docs/soak.md](docs/soak.md)).
+- TLS certificates issued by cert-manager for Gateways, documented and tested end to end.
+- Pingap servers generated for Gateway listeners (`[gateway.generate_servers]`).
+- Cookie session persistence (Experimental-channel `sessionPersistence`).
+- Fuzzing of the Gateway API translation and the config parsing (`fuzz/`, weekly).
+- Each new Gateway API and Pingap release is flagged by the weekly `upstream-releases`
+  workflow and picked up within a month.
 
 ## Later
 
