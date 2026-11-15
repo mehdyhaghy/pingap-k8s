@@ -29,6 +29,8 @@
 #   E2E_PRELOAD          1 (default): load the third-party images that exist in the
 #                        local Docker cache into kind instead of pulling them in the
 #                        cluster (slow, and rate-limited on Docker Hub); 0: always pull
+#   E2E_CERT_MANAGER=1   also install cert-manager with its Gateway API integration
+#                        (e2e tests 36 and 37; default 0: they skip)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -88,7 +90,8 @@ if [[ "${E2E_PRELOAD:-1}" == "1" ]]; then
   for img in quay.io/coreos/etcd:v3.6.12 vicanso/pingap:0.16.2 \
       registry.k8s.io/e2e-test-images/agnhost:2.66.1 jmalloc/echo-server:v0.3.7 \
       fortio/fortio:1.75.3 ghcr.io/stefanprodan/podinfo:6.15.0 \
-      mccutchen/go-httpbin:2.25.0 registry.k8s.io/gateway-api/conformance/echo-basic:v0.1.0; do
+      mccutchen/go-httpbin:2.25.0 registry.k8s.io/gateway-api/conformance/echo-basic:v0.1.0 \
+      ghcr.io/letsencrypt/pebble:2.10.3; do
     if docker image inspect "$img" >/dev/null 2>&1; then
       log "preloading $img ($platform)"
       docker save "$img" | docker exec -i "$node" \
@@ -118,6 +121,29 @@ kubectl apply --server-side -f "$gateway_crds" >/dev/null
 kubectl wait --for=condition=Established --timeout=60s \
   crd/gatewayclasses.gateway.networking.k8s.io crd/gateways.gateway.networking.k8s.io \
   crd/httproutes.gateway.networking.k8s.io crd/referencegrants.gateway.networking.k8s.io
+
+# --- cert-manager (opt-in, E2E_CERT_MANAGER=1; after the Gateway API CRDs) ----------
+# The release manifest, checked against its pinned digest, with the Gateway API
+# integration on (--enable-gateway-api). Only e2e tests 36 and 37 use it; they skip without it.
+if [[ "${E2E_CERT_MANAGER:-0}" == "1" ]]; then
+  CERT_MANAGER_VERSION=v1.21.3
+  CERT_MANAGER_SHA256=c04a51295adda2b1a775146751f973e787190778c7f35180861d9678876e5c74
+  cm_manifest="$ROOT/target/e2e/cert-manager-$CERT_MANAGER_VERSION.yaml"
+  if [[ ! -s "$cm_manifest" ]] || ! echo "$CERT_MANAGER_SHA256  $cm_manifest" | shasum -a 256 -c - >/dev/null 2>&1; then
+    log "downloading cert-manager $CERT_MANAGER_VERSION"
+    curl -fsSL -o "$cm_manifest.tmp" \
+      "https://github.com/cert-manager/cert-manager/releases/download/$CERT_MANAGER_VERSION/cert-manager.yaml"
+    echo "$CERT_MANAGER_SHA256  $cm_manifest.tmp" | shasum -a 256 -c - >/dev/null
+    mv "$cm_manifest.tmp" "$cm_manifest"
+  fi
+  log "installing cert-manager $CERT_MANAGER_VERSION"
+  kubectl apply --server-side -f "$cm_manifest" >/dev/null
+  kubectl -n cert-manager patch deployment cert-manager --type=json \
+    -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--enable-gateway-api"}]' >/dev/null
+  for d in cert-manager cert-manager-cainjector cert-manager-webhook; do
+    kubectl -n cert-manager rollout status "deployment/$d" --timeout "$TIMEOUT"
+  done
+fi
 
 # --- test app (before the chart: its RoleBinding goes into e2e-app) -------------
 log "applying the test app"
