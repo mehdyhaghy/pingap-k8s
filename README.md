@@ -303,7 +303,7 @@ drain_terminating = true # every [defaults] key but resync can be set per upstre
 
 | Key | Default | Meaning |
 |---|---|---|
-| `etcd.url` | (required) | Pingap's etcd URL. The path is the key prefix, the same one Pingap uses. TLS parameters: `ca`, `cert`, `key`, `server_name`, `tls=true`. Prefer client certificates over `user`/`password`, which would sit in the ConfigMap. |
+| `etcd.url` | (required) | Pingap's etcd URL. The path is the key prefix, the same one Pingap uses. TLS parameters: `ca`, `cert`, `key`, `server_name`, `tls=true`. Prefer client certificates over `user`/`password`, which would sit in the ConfigMap. With several `host:port` members, the controller probes each one every 2 s and sends requests only to those that answer. Pingap's own etcd client does not, so give Pingap a single Service address. |
 | `kubernetes.kubeconfig` / `context` | `""` | kubeconfig path (empty: in-cluster, then `$KUBECONFIG`, then `~/.kube/config`) and context |
 | `kubernetes.default_namespace` | `""` | namespace for `services` entries without one; empty: the controller pod's namespace (`POD_NAMESPACE`) |
 | `kubernetes.cluster_domain` | `cluster.local` | DNS domain of the `target = "service"` address of a headless Service |

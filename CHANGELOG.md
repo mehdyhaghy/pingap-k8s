@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- An etcd URL listing several members works when some of them do not answer: the controller
+  probes every member every 2 s and keeps requests on those that answer. Before, requests
+  went to every listed member, so writes failed at random while one was down, and on a
+  fresh install (member names not resolvable yet) until a restart.
 - Every etcd write of the leader (upstream addrs and Gateway entries) is fenced: its Txn also
   compares the create revision of the leader's election key, so a leader that was paused (a
   frozen node, a long stall) and resumes after its lease ended cannot write once more; etcd

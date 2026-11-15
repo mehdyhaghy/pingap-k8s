@@ -1,5 +1,6 @@
 pub mod config;
 pub mod etcd;
+pub mod etcd_members;
 pub mod events;
 pub mod gateway;
 pub mod health_check;

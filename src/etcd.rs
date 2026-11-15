@@ -770,6 +770,7 @@ impl EtcdWriter {
         let client = Client::connect(&target.endpoints, Some(options))
             .await
             .with_context(|| format!("connecting to etcd {:?}", target.endpoints))?;
+        crate::etcd_members::spawn(&client, target)?;
         Ok(Self {
             client,
             prefix: target.prefix.clone(),
@@ -788,9 +789,11 @@ impl EtcdWriter {
     /// [`EtcdTarget::election_connect_options`]). Not for KV writes.
     pub async fn connect_election(target: &EtcdTarget) -> anyhow::Result<Client> {
         let options = target.election_connect_options()?;
-        Client::connect(&target.endpoints, Some(options))
+        let client = Client::connect(&target.endpoints, Some(options))
             .await
-            .with_context(|| format!("connecting to etcd {:?} (election)", target.endpoints))
+            .with_context(|| format!("connecting to etcd {:?} (election)", target.endpoints))?;
+        crate::etcd_members::spawn(&client, target)?;
+        Ok(client)
     }
 
     /// The owned-key watches started after this report etcd reachability
