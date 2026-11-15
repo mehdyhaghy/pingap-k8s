@@ -27,13 +27,14 @@ use std::time::Duration;
 use anyhow::Context as _;
 use etcd_client::{
     Certificate, Client, Compare, CompareOp, ConnectOptions, EventType, GetOptions, Identity,
-    TlsOptions, Txn, TxnOp, WatchOptions, WatchStream,
+    TlsOptions, Txn, TxnOp, TxnOpResponse, TxnResponse, WatchOptions, WatchStream,
 };
 use rand::RngExt as _;
 use tokio::sync::{RwLock, mpsc};
 use toml_edit::{Array, DocumentMut, Item, Table, TableLike, Value};
 use tracing::{debug, info, warn};
 
+use crate::leader::{FenceKey, LeaderFence, NotLeader};
 use crate::metrics::EtcdHealth;
 use crate::types::{AddrsWriter, ForeignWrite, NewUpstream, WriteOutcome};
 
@@ -119,7 +120,8 @@ fn grpc_code_unreachable(code: i32) -> bool {
 /// unclassified errors) counts as unreachable.
 pub fn is_unreachable(err: &anyhow::Error) -> bool {
     for cause in err.chain() {
-        if cause.downcast_ref::<EtcdError>().is_some() {
+        // A fenced write: etcd answered, or the write never left this process.
+        if cause.downcast_ref::<EtcdError>().is_some() || cause.is::<NotLeader>() {
             return false;
         }
         if let Some(e) = cause.downcast_ref::<etcd_client::Error>() {
@@ -695,6 +697,48 @@ impl OwnWrites {
     }
 }
 
+/// The fence key for the next Txn: `None` when the writer has no fence (tests, tools),
+/// [`NotLeader`] when it has one and this process does not lead.
+pub(crate) fn fence_key(fence: Option<&LeaderFence>) -> Result<Option<FenceKey>, NotLeader> {
+    match fence {
+        None => Ok(None),
+        Some(fence) => fence.get().map(Some).ok_or(NotLeader),
+    }
+}
+
+/// A Txn of `compares` then `writes`, plus the fence compare when there is a key. On
+/// failure it reads the fence key, for [`fence_lost`].
+pub(crate) fn fenced_txn(
+    mut compares: Vec<Compare>,
+    writes: Vec<TxnOp>,
+    fence: Option<&FenceKey>,
+) -> Txn {
+    let mut or_else = Vec::new();
+    if let Some(fence) = fence {
+        compares.push(Compare::create_revision(
+            fence.key.clone(),
+            CompareOp::Equal,
+            fence.revision,
+        ));
+        or_else.push(TxnOp::get(fence.key.clone(), None));
+    }
+    Txn::new().when(compares).and_then(writes).or_else(or_else)
+}
+
+/// For a failed [`fenced_txn`]: whether the fence compare is what failed.
+pub(crate) fn fence_lost(resp: &TxnResponse, fence: Option<&FenceKey>) -> bool {
+    let Some(fence) = fence else {
+        return false;
+    };
+    !resp.op_responses().iter().any(|op| match op {
+        TxnOpResponse::Get(get) => get
+            .kvs()
+            .iter()
+            .any(|kv| kv.key() == fence.key.as_slice() && kv.create_revision() == fence.revision),
+        _ => false,
+    })
+}
+
 /// Called after the GET and before the Txn of each attempt (tests only).
 type PreCommitHook = Arc<dyn Fn(u32) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
@@ -708,6 +752,8 @@ pub struct EtcdWriter {
     pre_commit_hook: Option<PreCommitHook>,
     /// Where the owned-key watch reports etcd reachability.
     health: Option<EtcdHealth>,
+    /// Every write is fenced with the election key (see `leader`); none in tests.
+    fence: Option<LeaderFence>,
 }
 
 impl fmt::Debug for EtcdWriter {
@@ -730,6 +776,7 @@ impl EtcdWriter {
             own: Arc::default(),
             pre_commit_hook: None,
             health: None,
+            fence: None,
         })
     }
 
@@ -752,6 +799,17 @@ impl EtcdWriter {
     pub fn with_etcd_health(mut self, health: EtcdHealth) -> Self {
         self.health = Some(health);
         self
+    }
+
+    /// Refuses every write unless `fence` holds the election key, and makes etcd refuse
+    /// it when that key is gone ([`NotLeader`]).
+    pub fn with_fence(mut self, fence: LeaderFence) -> Self {
+        self.fence = Some(fence);
+        self
+    }
+
+    pub(crate) fn fence(&self) -> Option<&LeaderFence> {
+        self.fence.as_ref()
     }
 
     /// `"/" + <url path>` as Pingap keeps it.
@@ -796,7 +854,7 @@ impl EtcdWriter {
                 .get(key.as_str(), None)
                 .await
                 .with_context(|| format!("etcd get {key}"))?;
-            let (txn, created) = match resp.kvs().first() {
+            let txn = match resp.kvs().first() {
                 Some(current) => {
                     let text = std::str::from_utf8(current.value())
                         .map_err(|_| EtcdError::NotUtf8(key.clone()))?;
@@ -810,26 +868,26 @@ impl EtcdWriter {
                     let Some(updated) = with_alpn.or(replaced) else {
                         return Ok(WriteOutcome::Unchanged);
                     };
-                    let txn = Txn::new()
-                        .when([Compare::mod_revision(
-                            key.as_str(),
-                            CompareOp::Equal,
-                            current.mod_revision(),
-                        )])
-                        .and_then([TxnOp::put(key.as_str(), updated, None)]);
-                    (txn, false)
+                    let compare = Compare::mod_revision(
+                        key.as_str(),
+                        CompareOp::Equal,
+                        current.mod_revision(),
+                    );
+                    (compare, TxnOp::put(key.as_str(), updated, None), false)
                 }
-                None => {
-                    let txn = Txn::new()
-                        .when([Compare::create_revision(key.as_str(), CompareOp::Equal, 0)])
-                        .and_then([TxnOp::put(
-                            key.as_str(),
-                            minimal_upstream(upstream, addrs, new, alpn),
-                            None,
-                        )]);
-                    (txn, true)
-                }
+                None => (
+                    Compare::create_revision(key.as_str(), CompareOp::Equal, 0),
+                    TxnOp::put(
+                        key.as_str(),
+                        minimal_upstream(upstream, addrs, new, alpn),
+                        None,
+                    ),
+                    true,
+                ),
             };
+            let (compare, put, created) = txn;
+            let fence = fence_key(self.fence.as_ref())?;
+            let txn = fenced_txn(vec![compare], vec![put], fence.as_ref());
             if let Some(hook) = &self.pre_commit_hook {
                 hook(attempt).await;
             }
@@ -856,6 +914,9 @@ impl EtcdWriter {
                 return Ok(WriteOutcome::Updated { revision });
             }
             drop(gate);
+            if fence_lost(&resp, fence.as_ref()) {
+                return Err(NotLeader.into());
+            }
             debug!(
                 upstream,
                 key, attempt, "etcd compare-and-swap conflict, retrying"

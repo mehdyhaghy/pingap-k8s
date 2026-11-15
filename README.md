@@ -64,6 +64,8 @@ version (see [Pingap side](#pingap-side)).
    permission needed); only the leader writes, the follower keeps its watches warm. A deleted
    leader resigns and the follower takes over within a second; when the leader's node stops
    answering, its 10 s lease has to expire first (13 to 16 s in the [soak test](docs/soak.md)).
+   Every write is fenced with the leader's election key, so a leader that was paused and
+   resumes after losing its lease cannot write: etcd refuses the transaction.
 
 If an owned upstream does not exist yet in etcd, the controller creates a minimal one (only
 `addrs`) and logs it. If an upstream would end up with zero addresses, the last list is kept and

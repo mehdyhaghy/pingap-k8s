@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Every etcd write of the leader (upstream addrs and Gateway entries) is fenced: its Txn also
+  compares the create revision of the leader's election key, so a leader that was paused (a
+  frozen node, a long stall) and resumes after its lease ended cannot write once more; etcd
+  refuses it and the write is logged as `not_leader`. Found by the soak test.
 - Soak test: `scripts/soak.sh` (and the manual `soak` workflow) runs load through Pingap for an
   hour while pods, the controller leader, etcd members, Pingap pods and nodes fail, and writes
   a report; results in [docs/soak.md](docs/soak.md).

@@ -501,12 +501,16 @@ async fn run(
         return finish(server_task, None, None, None).await;
     };
     let (leader_tx, leader_rx) = watch::channel(false);
-    let election = tokio::spawn(leader::run_election_with_health(
+    // Every write (endpoint and Gateway writers) is fenced with the election key.
+    let fence = leader::LeaderFence::default();
+    let writer = writer.with_fence(fence.clone());
+    let election = tokio::spawn(leader::run_election_fenced(
         election_client,
         election_name(writer.prefix()),
         leader::DEFAULT_TTL,
         detect_identity(std::env::var_os("POD_NAME"), hostname),
         leader_tx,
+        fence,
         shutdown_signal(shutdown_rx.clone()),
         Some(etcd_health),
     ));

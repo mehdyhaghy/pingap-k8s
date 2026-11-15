@@ -11,8 +11,6 @@ what has shipped. Ideas and priorities are discussed in issues: open one to prop
 
 ## Next (first half of 2027)
 
-- A check in the etcd write transaction that the writer still holds the leader key, so a
-  leader that was paused cannot write once more after it resumes.
 - Header-based session persistence and session timeouts, if Pingap gains them.
 - Turn session persistence on by default once `sessionPersistence` reaches the Standard
   channel, and program generated servers without a Pingap restart if Pingap can bind new
@@ -20,6 +18,8 @@ what has shipped. Ideas and priorities are discussed in issues: open one to prop
 
 ## Done
 
+- etcd writes fenced with the leader's election key, so a leader that was paused cannot write
+  after it resumes.
 - Soak test with load and pod, leader, etcd and node failures ([docs/soak.md](docs/soak.md)).
 - TLS certificates issued by cert-manager for Gateways, documented and tested end to end.
 - Pingap servers generated for Gateway listeners (`[gateway.generate_servers]`).

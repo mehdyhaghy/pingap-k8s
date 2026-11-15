@@ -20,9 +20,12 @@ use rand::RngExt as _;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::etcd::{EtcdWriter, client_error_unreachable, path_join};
+use crate::etcd::{
+    EtcdWriter, client_error_unreachable, fence_key, fence_lost, fenced_txn, path_join,
+};
 use crate::gateway::model::{ApplyOutcome, Expect, Op, PingapStore, Plan, Stored, StoredEntry};
 use crate::gateway::render::upstream_without_addrs;
+use crate::leader::{FenceKey, LeaderFence, NotLeader};
 
 /// The categories of Pingap entries, as in their keys.
 pub const CATEGORIES: [&str; 5] = [
@@ -91,7 +94,7 @@ pub fn chunk_ops<'a>(ops: &'a [Op], limits: &TxnLimits) -> Vec<&'a [Op]> {
     chunks
 }
 
-fn txn_for(ops: &[Op]) -> Txn {
+fn txn_for(ops: &[Op], fence: Option<&FenceKey>) -> Txn {
     let mut compares = Vec::new();
     let mut writes = Vec::new();
     for op in ops {
@@ -114,7 +117,7 @@ fn txn_for(ops: &[Op]) -> Txn {
             None => Compare::create_revision(key.as_str(), CompareOp::Greater, 0),
         });
     }
-    Txn::new().when(compares).and_then(writes)
+    fenced_txn(compares, writes, fence)
 }
 
 /// `(category, name)` of a key `<prefix>/<category>/<name>.toml`.
@@ -134,6 +137,8 @@ pub struct GatewayWriter {
     client: Client,
     prefix: String,
     limits: TxnLimits,
+    /// Every Txn is fenced with the election key (see `leader`); none in tests.
+    fence: Option<LeaderFence>,
 }
 
 impl std::fmt::Debug for GatewayWriter {
@@ -146,9 +151,11 @@ impl std::fmt::Debug for GatewayWriter {
 }
 
 impl GatewayWriter {
-    /// Shares the connection and prefix of the endpoint writer.
+    /// Shares the connection, prefix and fence of the endpoint writer.
     pub fn new(writer: &EtcdWriter, limits: TxnLimits) -> Self {
-        Self::with_client(writer.client(), writer.prefix(), limits)
+        let mut gateway = Self::with_client(writer.client(), writer.prefix(), limits);
+        gateway.fence = writer.fence().cloned();
+        gateway
     }
 
     pub fn with_client(client: Client, prefix: &str, limits: TxnLimits) -> Self {
@@ -156,7 +163,14 @@ impl GatewayWriter {
             client,
             prefix: prefix.to_string(),
             limits,
+            fence: None,
         }
+    }
+
+    /// See [`EtcdWriter::with_fence`].
+    pub fn with_fence(mut self, fence: LeaderFence) -> Self {
+        self.fence = Some(fence);
+        self
     }
 
     pub fn prefix(&self) -> &str {
@@ -229,11 +243,15 @@ impl GatewayWriter {
         let (mut revision, mut puts, mut deletes) = (0, 0, 0);
         for step in &plan.steps {
             for chunk in chunk_ops(&step.ops, &self.limits) {
+                let fence = fence_key(self.fence.as_ref())?;
                 let resp = kv
-                    .txn(txn_for(chunk))
+                    .txn(txn_for(chunk, fence.as_ref()))
                     .await
                     .with_context(|| format!("etcd txn ({})", step.what))?;
                 if !resp.succeeded() {
+                    if fence_lost(&resp, fence.as_ref()) {
+                        return Err(NotLeader.into());
+                    }
                     return Err(StoreConflict { step: step.what }.into());
                 }
                 revision = resp

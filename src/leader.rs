@@ -17,6 +17,15 @@
 //! the server reports it gone (TTL 0, e.g. revoked by an operator) and when our election key
 //! disappears (checked every keep-alive interval).
 //!
+//! # Fencing
+//!
+//! Timing alone cannot rule out a stale write: a leader paused (a frozen node, a long GC)
+//! after it checked its lease can send a Txn after another process was elected. So while it
+//! leads, this module also publishes its election key and that key's create revision on a
+//! [`LeaderFence`]. The etcd writers add `create_revision(key) == rev` to every Txn: once
+//! the lease is gone the key is gone, and etcd refuses the write ([`NotLeader`]). The fence
+//! is cleared before the channel goes to `false` and set before it goes to `true`.
+//!
 //! On every loss the channel goes to `false` first, then the lease is revoked (best effort) and
 //! the module campaigns again after a jittered exponential backoff (500 ms up to 10 s, reset
 //! after being elected). On shutdown it sends `false`, resigns and revokes the lease, so a
@@ -41,6 +50,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use etcd_client::{
@@ -55,6 +65,34 @@ use tracing::{debug, info, warn};
 
 use crate::etcd::client_error_unreachable;
 use crate::metrics::EtcdHealth;
+
+/// The election key held by the leader, as written into each etcd Txn compare.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FenceKey {
+    pub key: Vec<u8>,
+    /// Create revision of `key` ([`LeaderKey::rev`]).
+    pub revision: i64,
+}
+
+/// The election key while this process leads, `None` otherwise. Cheap to clone; clones
+/// share the value.
+#[derive(Clone, Debug, Default)]
+pub struct LeaderFence(Arc<RwLock<Option<FenceKey>>>);
+
+impl LeaderFence {
+    pub fn set(&self, key: Option<FenceKey>) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = key;
+    }
+
+    pub fn get(&self) -> Option<FenceKey> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+/// An etcd write was refused because this process does not hold the election key.
+#[derive(Debug, thiserror::Error)]
+#[error("not the leader; etcd write refused")]
+pub struct NotLeader;
 
 /// Default lease TTL.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(10);
@@ -99,6 +137,36 @@ pub async fn run_election_with_health(
     shutdown: impl Future<Output = ()>,
     health: Option<EtcdHealth>,
 ) {
+    run_election_fenced(
+        client,
+        election_name,
+        ttl,
+        identity,
+        tx,
+        LeaderFence::default(),
+        shutdown,
+        health,
+    )
+    .await;
+}
+
+/// [`run_election_with_health`] that also publishes the election key on `fence` while
+/// leading (see "Fencing" above).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_election_fenced(
+    client: Client,
+    election_name: String,
+    ttl: Duration,
+    identity: String,
+    tx: watch::Sender<bool>,
+    fence: LeaderFence,
+    shutdown: impl Future<Output = ()>,
+    health: Option<EtcdHealth>,
+) {
+    let out = Out {
+        tx: &tx,
+        fence: &fence,
+    };
     let health = Health(health);
     let shutdown = shutdown;
     tokio::pin!(shutdown);
@@ -110,13 +178,13 @@ pub async fn run_election_with_health(
             &election_name,
             ttl,
             &identity,
-            &tx,
+            &out,
             shutdown.as_mut(),
             &mut backoff,
             &health,
         )
         .await;
-        publish(&tx, false);
+        out.follow();
         match end {
             End::Shutdown => {
                 info!(election = %election_name, "leader election stopped");
@@ -181,7 +249,7 @@ async fn session<F: Future<Output = ()>>(
     name: &str,
     ttl: Duration,
     identity: &str,
-    tx: &watch::Sender<bool>,
+    out: &Out<'_>,
     mut shutdown: Pin<&mut F>,
     backoff: &mut Backoff,
     health: &Health,
@@ -224,12 +292,12 @@ async fn session<F: Future<Output = ()>>(
     )));
 
     let end = campaign_and_hold(
-        client, name, ttl, every, identity, id, tx, shutdown, state_rx, backoff, health,
+        client, name, ttl, every, identity, id, out, shutdown, state_rx, backoff, health,
     )
     .await;
 
     // Stop claiming before anything else, then release the lease.
-    publish(tx, false);
+    out.follow();
     drop(keeper);
     match timeout(RPC_TIMEOUT, lease.revoke(id)).await {
         Ok(Ok(_)) => debug!(election = %name, lease = id, "lease revoked"),
@@ -247,7 +315,7 @@ async fn campaign_and_hold<F: Future<Output = ()>>(
     every: Duration,
     identity: &str,
     lease_id: i64,
-    tx: &watch::Sender<bool>,
+    out: &Out<'_>,
     mut shutdown: Pin<&mut F>,
     mut state_rx: watch::Receiver<LeaseState>,
     backoff: &mut Backoff,
@@ -308,7 +376,10 @@ async fn campaign_and_hold<F: Future<Output = ()>>(
         if !announced {
             announced = true;
             backoff.reset();
-            publish(tx, true);
+            out.lead(FenceKey {
+                key: key.clone(),
+                revision: leader_key.rev(),
+            });
             info!(
                 election = %name,
                 key = %String::from_utf8_lossy(&key),
@@ -317,7 +388,7 @@ async fn campaign_and_hold<F: Future<Output = ()>>(
         }
         tokio::select! {
             _ = shutdown.as_mut() => {
-                publish(tx, false);
+                out.follow();
                 let mut election = client.election_client();
                 let resign = election.resign(Some(ResignOptions::new().with_leader(leader_key)));
                 match timeout(RPC_TIMEOUT, resign).await {
@@ -418,6 +489,26 @@ async fn keep_alive_once(
                 )),
             }
         }
+    }
+}
+
+/// Where leadership is published: the channel and the fence.
+struct Out<'a> {
+    tx: &'a watch::Sender<bool>,
+    fence: &'a LeaderFence,
+}
+
+impl Out<'_> {
+    /// Fence first, so a writer woken by the channel finds the key.
+    fn lead(&self, key: FenceKey) {
+        self.fence.set(Some(key));
+        publish(self.tx, true);
+    }
+
+    /// Fence first, so no write is fenced with a key we no longer claim.
+    fn follow(&self) {
+        self.fence.set(None);
+        publish(self.tx, false);
     }
 }
 

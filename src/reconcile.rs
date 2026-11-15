@@ -84,6 +84,7 @@ use tokio::time::{Instant, MissedTickBehavior, sleep_until};
 use crate::config::UpstreamConfig;
 use crate::etcd::{self, EtcdError};
 use crate::events::{Events, Notice};
+use crate::leader::NotLeader;
 use crate::metrics::{EtcdHealth, Metrics, WriteResult};
 use crate::resolve::{self, ResolveWarning, ServiceInput};
 use crate::server::Readiness;
@@ -954,7 +955,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
         let kind = classify(err);
         self.metrics.record_write(
             name,
-            if kind == FailureKind::Conflict {
+            if matches!(kind, FailureKind::Conflict | FailureKind::NotLeader) {
                 WriteResult::Conflict
             } else {
                 WriteResult::Error
@@ -964,6 +965,7 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
             name,
             match kind {
                 FailureKind::Conflict => "conflict",
+                FailureKind::NotLeader => "not_leader",
                 FailureKind::Malformed => "malformed",
                 FailureKind::Other => "error",
             },
@@ -1002,7 +1004,12 @@ impl<W: AddrsWriter, S: SnapshotSource> Engine<W, S> {
             let delay = jitter(st.backoff);
             st.backoff = (st.backoff * 2).min(RETRY_MAX);
             st.retry_at = Some(now + delay);
-            tracing::warn!(upstream = %name, error = %err, retry_in = ?delay, "writing addrs failed; will retry");
+            if kind == FailureKind::NotLeader {
+                // The leadership channel follows within a keep-alive interval.
+                tracing::info!(upstream = %name, retry_in = ?delay, "write refused: this process no longer holds the election key");
+            } else {
+                tracing::warn!(upstream = %name, error = %err, retry_in = ?delay, "writing addrs failed; will retry");
+            }
         }
         self.update_readiness();
         self.publish(name);
@@ -1038,6 +1045,8 @@ fn service_uid<S: SnapshotSource>(source: &S, key: &ServiceKey) -> Option<String
 enum FailureKind {
     /// CAS retries exhausted inside the writer.
     Conflict,
+    /// etcd refused the write: the election key is gone (fencing).
+    NotLeader,
     /// The stored entry cannot be edited.
     Malformed,
     /// etcd unreachable, timeouts and anything unclassified.
@@ -1047,6 +1056,9 @@ enum FailureKind {
 /// Best-effort classification: the reconciler stays generic over
 /// [`AddrsWriter`], so only errors that carry an [`EtcdError`] are refined.
 fn classify(err: &anyhow::Error) -> FailureKind {
+    if err.chain().any(|e| e.is::<NotLeader>()) {
+        return FailureKind::NotLeader;
+    }
     match err.chain().find_map(|e| e.downcast_ref::<EtcdError>()) {
         Some(EtcdError::Conflict { .. }) => FailureKind::Conflict,
         Some(
@@ -1069,6 +1081,18 @@ fn jitter(d: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fenced_write_is_not_leader_not_unreachable() {
+        let err = anyhow::Error::new(NotLeader).context("writing addrs");
+        assert_eq!(classify(&err), FailureKind::NotLeader);
+        assert!(!etcd::is_unreachable(&err));
+        let conflict = anyhow::Error::new(EtcdError::Conflict {
+            key: "k".into(),
+            attempts: 3,
+        });
+        assert_eq!(classify(&conflict), FailureKind::Conflict);
+    }
 
     use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
     use k8s_openapi::api::discovery::v1::{

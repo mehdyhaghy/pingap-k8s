@@ -55,6 +55,7 @@ use crate::gateway::model::{
     TranslateInput, TranslateOptions, is_owned,
 };
 use crate::gateway::{plan, render, translate};
+use crate::leader::NotLeader;
 use crate::metrics::{GatewaySyncResult, Metrics};
 use crate::types::{ServiceKey, SnapshotSource};
 
@@ -609,6 +610,10 @@ where
                     self.parts
                         .metrics
                         .record_gateway_sync(GatewaySyncResult::Error);
+                    // Re-reading cannot help: the election key is gone.
+                    if err.chain().any(|e| e.is::<NotLeader>()) {
+                        return Err(err.context("Gateway plan not applied"));
+                    }
                     if attempt >= APPLY_ATTEMPTS {
                         return Err(err
                             .context(format!("applying the Gateway plan failed {attempt} times")));
