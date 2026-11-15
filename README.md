@@ -572,6 +572,12 @@ rules:
     backendRefs: [{ name: shop, port: 80 }]
 ```
 
+- The Standard-channel install of v1.7.0 has a ValidatingAdmissionPolicy
+  (`safe-upgrades.gateway.networking.k8s.io`) that refuses Experimental-channel CRDs over
+  Standard ones: delete it and its binding first, or install `experimental-install.yaml`
+  from the start. Then restart the controller (`kubectl -n pingap-k8s rollout restart
+  deployment/pingap-k8s`): right after a CRD update the API server may still send watchers
+  objects pruned to the old schema.
 - The cookie is a session cookie with `Path=/`, `HttpOnly`, `SameSite=Lax` (and `Secure` over
   TLS). `lifetimeType: Permanent`, `absoluteTimeout`, another cookie `path` and
   `type: Header` are not supported: the rule is dropped (`PartiallyInvalid`). So is any

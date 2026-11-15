@@ -3509,30 +3509,52 @@ async fn e2e_38_generated_server() {
 // 39: session persistence (Experimental channel)
 // ---------------------------------------------------------------------------------------
 
-/// The HTTPRoute CRD of the Gateway API release of e2e-up.sh, from its `channel` install
-/// file (downloaded there).
-fn httproute_crd(channel: &str) -> String {
+/// Name of the ValidatingAdmissionPolicy (and its binding) of the Gateway API install
+/// files: it refuses Experimental-channel CRDs over Standard ones.
+const SAFE_UPGRADES: &str = "safe-upgrades.gateway.networking.k8s.io";
+
+/// The documents of the Gateway API install file of e2e-up.sh for `channel` whose text
+/// has every one of `needles`.
+fn install_docs(channel: &str, needles: &[&str]) -> String {
     let file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
         "target/e2e/gateway-api-v1.7.0-{channel}-install.yaml"
     ));
     let text = std::fs::read_to_string(&file)
         .unwrap_or_else(|e| panic!("{}: {e} (run scripts/e2e-up.sh)", file.display()));
-    text.split("\n---\n")
-        .find(|doc| {
-            doc.contains("kind: CustomResourceDefinition")
-                && doc.contains("name: httproutes.gateway.networking.k8s.io")
-        })
-        .unwrap_or_else(|| panic!("no HTTPRoute CRD in {}", file.display()))
-        .to_string()
+    let docs: Vec<&str> = text
+        .split("\n---\n")
+        .filter(|doc| needles.iter().all(|n| doc.contains(n)))
+        .collect();
+    assert!(
+        !docs.is_empty(),
+        "nothing with {needles:?} in {}",
+        file.display()
+    );
+    docs.join("\n---\n")
 }
 
-async fn apply_crd(env: &Env, crd: &str) -> anyhow::Result<()> {
+fn httproute_crd(channel: &str) -> String {
+    install_docs(
+        channel,
+        &[
+            "kind: CustomResourceDefinition",
+            "name: httproutes.gateway.networking.k8s.io",
+        ],
+    )
+}
+
+async fn apply_server_side(env: &Env, docs: &str) -> anyhow::Result<()> {
     env.kubectl
         .run_stdin(
             &["apply", "--server-side", "--force-conflicts", "-f", "-"],
-            Some(crd.as_bytes()),
+            Some(docs.as_bytes()),
         )
         .await?;
+    Ok(())
+}
+
+async fn apply_crd(env: &Env, crd: &str) -> anyhow::Result<()> {
+    apply_server_side(env, crd).await?;
     env.kubectl
         .run(&[
             "wait",
@@ -3542,6 +3564,41 @@ async fn apply_crd(env: &Env, crd: &str) -> anyhow::Result<()> {
         ])
         .await?;
     Ok(())
+}
+
+/// Swaps in the Experimental-channel HTTPRoute CRD the way the Gateway API docs ask for
+/// it: without the `safe-upgrades` admission policy, which refuses it.
+async fn install_experimental_httproutes(env: &Env) -> anyhow::Result<()> {
+    for kind in [
+        "validatingadmissionpolicybinding",
+        "validatingadmissionpolicy",
+    ] {
+        env.kubectl
+            .run(&["delete", kind, SAFE_UPGRADES, "--ignore-not-found"])
+            .await?;
+    }
+    // The API server enforces a deleted policy for a few more seconds.
+    let crd = httproute_crd("experimental");
+    wait_for(
+        "Experimental-channel HTTPRoute CRD applied",
+        STATUS_WAIT,
+        Duration::from_secs(2),
+        || async { apply_crd(env, &crd).await.map(Some) },
+    )
+    .await
+}
+
+/// Puts the Standard-channel HTTPRoute CRD and the admission policy back.
+async fn restore_standard_httproutes(env: &Env) -> anyhow::Result<()> {
+    apply_crd(env, &httproute_crd("standard")).await?;
+    apply_server_side(
+        env,
+        &install_docs(
+            "standard",
+            &["kind: ValidatingAdmissionPolicy", SAFE_UPGRADES],
+        ),
+    )
+    .await
 }
 
 /// With the Experimental-channel HTTPRoute CRD, a rule with a cookie `sessionPersistence`
@@ -3557,15 +3614,13 @@ async fn e2e_39_session_persistence() {
     let host = "t39.example.com";
     let objs = [obj(GATEWAYS, &ns, "t39"), obj(ROUTES, &ns, "t39")];
     ready(&env).await;
-    apply_crd(&env, &httproute_crd("experimental"))
-        .await
-        .unwrap();
     let restore = async {
         delete_all(&env, &objs).await?;
-        apply_crd(&env, &httproute_crd("standard")).await
+        restore_standard_httproutes(&env).await
     };
     guarded(
         with_objects(&env, &objs, async {
+            install_experimental_httproutes(&env).await.unwrap();
             let rules = json!([{
                 "sessionPersistence": { "type": "Cookie", "cookie": { "name": "t39-session" } },
                 "backendRefs": [backend("echo", None)],
@@ -3615,20 +3670,40 @@ async fn e2e_39_session_persistence() {
             .await;
 
             let front = Front::new(&env).await.unwrap();
-            let first = front
-                .wait(
-                    "sticky cookie set",
-                    HTTP_PORT,
-                    host,
-                    "/hostname",
-                    &[],
-                    |r| {
-                        r.status == 200
-                            && r.header("Set-Cookie")
-                                .is_some_and(|c| c.starts_with("t39-session="))
-                    },
-                )
-                .await;
+            // Right after a CRD update the API server may still send watchers the route
+            // pruned to the old schema: touch it until the controller sees the field.
+            let touches = std::sync::atomic::AtomicU32::new(0);
+            let first = wait_for(
+                "sticky cookie set",
+                TRAFFIC_WAIT,
+                Duration::from_secs(2),
+                || async {
+                    let r = front.get(HTTP_PORT, host, "/hostname", &[]).await?;
+                    if r.status == 200
+                        && r.header("Set-Cookie")
+                            .is_some_and(|c| c.starts_with("t39-session="))
+                    {
+                        return Ok(Some(r));
+                    }
+                    let n = touches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let touch = format!("e2e/touch={n}");
+                    env.kubectl
+                        .run(&[
+                            "annotate",
+                            "httproute",
+                            "t39",
+                            "-n",
+                            ns.as_str(),
+                            "--overwrite",
+                            touch.as_str(),
+                        ])
+                        .await?;
+                    anyhow::bail!("last response: {}", r.short())
+                },
+            )
+            .await
+            .unwrap();
+            println!("[{T}] route touched {} time(s)", touches.into_inner());
             let set_cookie = first.header("Set-Cookie").unwrap().to_string();
             println!(
                 "[{T}] first: {} Set-Cookie: {set_cookie}",
