@@ -521,6 +521,90 @@ Gateways accept ListenerSets through `allowedListeners` (none by default). Their
 the parent Gateway's servers; on conflicts the Gateway's own listeners win, then ListenerSets
 oldest first.
 
+### TLS certificates from cert-manager
+
+[cert-manager](https://cert-manager.io) writes `kubernetes.io/tls` Secrets, which HTTPS listeners
+reference like any other Secret. Tested with cert-manager v1.21.3 (e2e tests 36 and 37).
+
+**A Certificate per Secret.** The listener names the Certificate's `secretName`:
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: { name: api-prod-tls, namespace: web }
+spec:
+  secretName: api-prod-tls
+  dnsNames: [api.prod.example.com]
+  issuerRef: { kind: ClusterIssuer, name: letsencrypt }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: web, namespace: web }
+spec:
+  gatewayClassName: pingap
+  listeners:
+    - name: https
+      port: 443
+      protocol: HTTPS
+      hostname: api.prod.example.com
+      tls: { mode: Terminate, certificateRefs: [{ name: api-prod-tls }] }
+```
+
+**The Gateway annotation.** With cert-manager's Gateway API integration on, the annotation
+`cert-manager.io/cluster-issuer: <name>` (or `cert-manager.io/issuer` for an Issuer in the
+Gateway's namespace) on the Gateway above makes cert-manager create the Certificate itself: one
+per Secret named in `certificateRefs`, for the hostnames of the listeners that use it. Listeners
+without `hostname` get none. The integration is off by default; turn it on with the Helm value
+`config.gatewayAPI.enabled: true` (the static manifest: the controller flag
+`--enable-gateway-api`), and install the Gateway API CRDs before cert-manager, or restart
+cert-manager afterwards. ListenerSets need `config.gatewayAPI.enableListenerSet: true` and the
+`ListenerSets` feature gate (alpha in cert-manager).
+
+**RBAC.** The controller reads Secrets only in `gateway.namespaces`: list the namespaces of
+the Gateways that use cert-manager Secrets (cert-manager creates them in the Gateway's
+namespace). With `gateway.secretNames`, also list each Secret name (`api-prod-tls` above).
+cert-manager's other Secrets (ACME account keys, the next private key) are not needed.
+
+**Renewal.** cert-manager writes the renewed certificate into the same Secret. The controller
+watches it and rewrites the Pingap certificate; Pingap serves the new one within about a
+second (0.3 to 0.7 s in the e2e test, from the Secret update to the new serial on the wire),
+without a restart. Until the
+first issuance the Secret does not exist: that listener reports `ResolvedRefs=False`
+(`InvalidCertificateRef`) and is not programmed, the other listeners keep working.
+
+**ACME HTTP-01 through Pingap** works with the `gatewayHTTPRoute` solver: cert-manager creates
+an HTTPRoute (an `Exact` match on `/.well-known/acme-challenge/<token>`) and a solver Service
+on port 8089, which the controller turns into Pingap locations like any route. It needs:
+
+- a Gateway listener on port 80 for the hostname, reached by the ACME CA: with
+  `gateway.groups`, a group port `{ port: 80, targetPort: 9080 }` on a Gateway of its own; on
+  the shared servers, a Pingap server with port 80 in `addr`;
+- the namespace of the Certificate in `gateway.namespaces` (the solver Service lives there),
+  and, when the challenge Gateway is in another namespace, `allowedRoutes.namespaces.from: All`
+  (or a selector) on its port 80 listener.
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata: { name: letsencrypt }
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    privateKeySecretRef: { name: letsencrypt-account }
+    solvers:
+      - http01:
+          gatewayHTTPRoute:
+            parentRefs: [{ kind: Gateway, name: web, namespace: web }]
+```
+
+The HTTPS listener can be on the same Gateway or another one. Use DNS-01 when port 80 is not
+reachable from the internet, or for wildcard hostnames (HTTP-01 cannot issue them).
+
+**Keys.** RSA, ECDSA (P-256, P-384) and Ed25519, in cert-manager's `PKCS1` (`RSA PRIVATE KEY`,
+`EC PRIVATE KEY`) or `PKCS8` (`PRIVATE KEY`) encoding. Most browsers do not accept Ed25519
+certificates. `tls.crt` may hold the chain (leaf first): Pingap sends all of it. `ca.crt` is
+ignored.
+
 ### Supported features
 
 `status.supportedFeatures` of the GatewayClass:

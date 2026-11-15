@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- README: TLS certificates from cert-manager for Gateway listeners (a Certificate or the
+  Gateway annotation, RBAC, renewal, ACME HTTP-01 through Pingap, key types).
+- e2e: tests 36 and 37 with cert-manager v1.21.3 (opt-in, `E2E_CERT_MANAGER=1`): a CA
+  issuer and the Gateway annotation, chained certificates, RSA and ECDSA keys, renewal
+  served in under a second, and ACME HTTP-01 (Pebble) through a Pingap port 80 listener.
+
 ## 0.16.21 (2026-11-08)
 
 - kubectl plugin on Windows: `kubectl-pingap_<version>_windows_amd64.zip` in every release and
