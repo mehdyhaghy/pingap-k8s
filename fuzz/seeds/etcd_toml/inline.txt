@@ -1,0 +1,3 @@
+k8s-x
+web.example.com:443
+upstreams.k8s-x = { addrs = [] }

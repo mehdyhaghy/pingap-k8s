@@ -1,0 +1,12 @@
+web
+10.0.0.1:80|10.0.0.2:80 5
+# hand-made
+[upstreams.web]
+addrs = [
+    "10.0.0.1:80", # first
+    "10.0.0.3:80",
+]
+alpn = "H1"
+
+[upstreams.other]
+addrs = ["1.1.1.1:80"]

@@ -1,0 +1,3 @@
+https
+k8s-a
+servers.https = { addr = "0.0.0.0:443", global_certificates = true, enabled_h2 = true, locations = ["k8s-z", "a"] }

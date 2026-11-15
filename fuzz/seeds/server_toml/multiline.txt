@@ -1,0 +1,12 @@
+http
+k8s-a|k8s-b|manual|k8s-a
+# hand-made
+[servers.http]
+addr = "0.0.0.0:80,[::]:80"
+global_certificates = false
+locations = [
+    "manual", # kept
+    "k8s-old",
+    # note
+    "other",
+]

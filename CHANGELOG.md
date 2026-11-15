@@ -16,12 +16,17 @@
   out (`scripts/check-upstream-releases.sh`).
 - e2e: tests 38 (a generated server, programmed after a Pingap restart) and 39 (session
   persistence with the Experimental-channel HTTPRoute CRD).
-
 - README: TLS certificates from cert-manager for Gateway listeners (a Certificate or the
   Gateway annotation, RBAC, renewal, ACME HTTP-01 through Pingap, key types).
 - e2e: tests 36 and 37 with cert-manager v1.21.3 (opt-in, `E2E_CERT_MANAGER=1`): a CA
   issuer and the Gateway annotation, chained certificates, RSA and ECDSA keys, renewal
   served in under a second, and ACME HTTP-01 (Pebble) through a Pingap port 80 listener.
+- Fuzz targets (`fuzz/`, cargo-fuzz) for the controller config and etcd URL, the edits of
+  stored upstreams and servers, and the Gateway API translation, rendering and planning. The
+  `fuzz` workflow runs them weekly.
+- Error messages no longer show the etcd password when the URL writes the parameter name
+  encoded (`pass%77ord=...`): the name is now decoded before it is redacted, as the parser
+  reads it.
 
 ## 0.16.21 (2026-11-08)
 
