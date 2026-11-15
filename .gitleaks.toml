@@ -24,5 +24,5 @@ paths = ['''^tests/e2e/spec\.rs$''']
 description = "Pinned release checksums and commit ids of the Gateway API CRDs"
 regexTarget = "match"
 regexes = [
-  '''GATEWAY_API_(SHA256|COMMIT)=''',
+  '''GATEWAY_API_(EXPERIMENTAL_)?(SHA256|COMMIT)=''',
 ]
