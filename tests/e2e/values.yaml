@@ -28,6 +28,16 @@ gateway:
   # (pingap-k8s-pingap-gw-a / -gw-b, port 80). The test's Gateways ask for them by
   # address; the other tests' Gateways ask for the shared address above, so they
   # never take a group.
+  # E2E test 39: honor sessionPersistence (the test swaps in the Experimental-channel
+  # HTTPRoute CRD).
+  sessionPersistence: true
+  # E2E test 38: a listener on a port without a seed server gets a generated one; 9100
+  # is opened on the Pingap Service and NetworkPolicy. Test 20 expects 9999 to stay
+  # without a server (PortUnavailable).
+  generateServers:
+    enabled: true
+    excludePorts: [9999]
+    ports: [9100]
   groups:
     - name: a
       ports:

@@ -1,6 +1,8 @@
-//! The end-to-end tests 19–32 and 34–37 of the Gateway API provider, one test function each.
+//! The end-to-end tests 19–32 and 34–39 of the Gateway API provider, one test function each.
 //! Tests 36 and 37 (certificates from cert-manager) skip unless scripts/e2e-up.sh installed
-//! cert-manager (`E2E_CERT_MANAGER=1`).
+//! cert-manager (`E2E_CERT_MANAGER=1`). Test 38 restarts the Pingap pods onto a generated
+//! server; test 39 swaps in the Experimental-channel HTTPRoute CRD and restores the
+//! Standard one afterwards.
 //!
 //! The chart creates the GatewayClass `pingap` (tests/e2e/values.yaml): listeners map onto
 //! the seed's Pingap servers `gw-http` (plain HTTP and h2c, port 8082), `gw-https` (TLS
@@ -3408,6 +3410,271 @@ async fn e2e_37_cert_manager_acme_http01() {
         println!("[{T}] {ACME_HOST}: {} serial {:?}", r.status, r.serial);
         assert!(r.body.starts_with("echo-"), "{r:?}");
     })
+    .await;
+}
+
+// ---------------------------------------------------------------------------------------
+// 38: generated servers
+// ---------------------------------------------------------------------------------------
+
+/// Listener port of test 38: no seed server listens on it, the e2e values open it on the
+/// Pingap Service and NetworkPolicy (`gateway.generateServers.ports`).
+const GENERATED_PORT: u16 = 9100;
+
+/// A listener on [`GENERATED_PORT`] gets the generated server `k8s-http-9100` in etcd, with
+/// the route's location, and reports `Programmed=False` (`Pending`) until the Pingap pods
+/// restart; after a rollout restart it is programmed and serves the route. Deleting the
+/// Gateway deletes the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_38_generated_server() {
+    const T: &str = "e2e_38";
+    let Some(env) = Env::setup("e2e_38_generated_server").await else {
+        return;
+    };
+    let ns = env.app_namespace.clone();
+    let host = "t38.example.com";
+    let server = format!("k8s-http-{GENERATED_PORT}");
+    let key = format!("{}/servers/{server}.toml", env.etcd.prefix());
+    let objs = [obj(GATEWAYS, &ns, "t38"), obj(ROUTES, &ns, "t38")];
+    ready(&env).await;
+    with_objects(&env, &objs, async {
+        let gen_listener = json!({ "name": "gen", "port": GENERATED_PORT, "protocol": "HTTP", "hostname": host });
+        apply(
+            &env,
+            &list(vec![
+                gateway(&ns, "t38", vec![gen_listener]),
+                route(&ns, "t38", json!([{ "name": "t38" }]), &[host],
+                      json!([{ "filters": [tag("generated")], "backendRefs": [backend("echo", None)] }])),
+            ]),
+        )
+        .await
+        .unwrap();
+        let pending = wait_gateway(&env, &ns, "t38", "listener gen pending", |g| {
+            listener_cond_is(g, "gen", "Accepted", "True", "Accepted")
+                && listener_cond_is(g, "gen", "Programmed", "False", "Pending")
+        })
+        .await;
+        println!("[{T}] pending: {}", show(&listener(&pending, "gen").unwrap()["conditions"]));
+        let stored = wait_for("generated server stored", STATUS_WAIT, POLL, || async {
+            match env.etcd.get(&key).await? {
+                Some(kv) if kv.value.contains("locations") => Ok(Some(kv.value)),
+                other => anyhow::bail!("{key}: {other:?}"),
+            }
+        })
+        .await
+        .unwrap();
+        println!("[{T}] stored: {stored:?}");
+        assert!(stored.contains(&format!("addr = \"[::]:{GENERATED_PORT}\"")), "{stored}");
+        assert_eq!(server_locations(&env, &server).await.unwrap().len(), 1);
+
+        // Pingap binds the server when it starts.
+        k8s::rollout_restart(&env.client, &env.namespace, &env.pingap_deployment)
+            .await
+            .unwrap();
+        k8s::wait_deployment_rolled_out(
+            &env.client,
+            &env.namespace,
+            &env.pingap_deployment,
+            Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+        wait_obj_for(&env, "listener gen programmed", Duration::from_secs(180), GATEWAYS, Some(&ns), "t38", |g| {
+            listener_cond_is(g, "gen", "Programmed", "True", "Programmed")
+        })
+        .await
+        .unwrap();
+        let front = Front::new(&env).await.unwrap();
+        let r = front
+            .wait("generated server serves the route", GENERATED_PORT, host, "/hostname", &[], |r| {
+                r.status == 200 && r.header("X-Rule") == Some("generated")
+            })
+            .await;
+        println!("[{T}] served: {}", r.short());
+    })
+    .await;
+
+    // The Gateway is gone: so is its server.
+    wait_for("generated server deleted", STATUS_WAIT, POLL, || async {
+        match env.etcd.get(&key).await? {
+            None => Ok(Some(())),
+            Some(kv) => anyhow::bail!("{key} still stored: {}", kv.value),
+        }
+    })
+    .await
+    .unwrap();
+}
+
+// ---------------------------------------------------------------------------------------
+// 39: session persistence (Experimental channel)
+// ---------------------------------------------------------------------------------------
+
+/// The HTTPRoute CRD of the Gateway API release of e2e-up.sh, from its `channel` install
+/// file (downloaded there).
+fn httproute_crd(channel: &str) -> String {
+    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+        "target/e2e/gateway-api-v1.7.0-{channel}-install.yaml"
+    ));
+    let text = std::fs::read_to_string(&file)
+        .unwrap_or_else(|e| panic!("{}: {e} (run scripts/e2e-up.sh)", file.display()));
+    text.split("\n---\n")
+        .find(|doc| {
+            doc.contains("kind: CustomResourceDefinition")
+                && doc.contains("name: httproutes.gateway.networking.k8s.io")
+        })
+        .unwrap_or_else(|| panic!("no HTTPRoute CRD in {}", file.display()))
+        .to_string()
+}
+
+async fn apply_crd(env: &Env, crd: &str) -> anyhow::Result<()> {
+    env.kubectl
+        .run_stdin(
+            &["apply", "--server-side", "--force-conflicts", "-f", "-"],
+            Some(crd.as_bytes()),
+        )
+        .await?;
+    env.kubectl
+        .run(&[
+            "wait",
+            "--for=condition=Established",
+            "--timeout=60s",
+            "crd/httproutes.gateway.networking.k8s.io",
+        ])
+        .await?;
+    Ok(())
+}
+
+/// With the Experimental-channel HTTPRoute CRD, a rule with a cookie `sessionPersistence`
+/// gets a sticky upstream: the first response sets the cookie, and every request that
+/// sends it back reaches the same echo pod, while requests without it are spread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_39_session_persistence() {
+    const T: &str = "e2e_39";
+    let Some(env) = Env::setup("e2e_39_session_persistence").await else {
+        return;
+    };
+    let ns = env.app_namespace.clone();
+    let host = "t39.example.com";
+    let objs = [obj(GATEWAYS, &ns, "t39"), obj(ROUTES, &ns, "t39")];
+    ready(&env).await;
+    apply_crd(&env, &httproute_crd("experimental"))
+        .await
+        .unwrap();
+    let restore = async {
+        delete_all(&env, &objs).await?;
+        apply_crd(&env, &httproute_crd("standard")).await
+    };
+    guarded(
+        with_objects(&env, &objs, async {
+            let rules = json!([{
+                "sessionPersistence": { "type": "Cookie", "cookie": { "name": "t39-session" } },
+                "backendRefs": [backend("echo", None)],
+            }]);
+            // Retried: the API server may serve the old schema for a moment and prune
+            // the field.
+            wait_for(
+                "route with sessionPersistence stored",
+                STATUS_WAIT,
+                POLL,
+                || async {
+                    apply(
+                        &env,
+                        &list(vec![
+                            gateway(&ns, "t39", vec![http_listener("http", host)]),
+                            route(
+                                &ns,
+                                "t39",
+                                json!([{ "name": "t39" }]),
+                                &[host],
+                                rules.clone(),
+                            ),
+                        ]),
+                    )
+                    .await?;
+                    let r = get_obj(&env.kubectl, ROUTES, Some(&ns), "t39").await?;
+                    match r {
+                        Some(r) if !r["spec"]["rules"][0]["sessionPersistence"].is_null() => {
+                            Ok(Some(()))
+                        }
+                        _ => anyhow::bail!("sessionPersistence pruned"),
+                    }
+                },
+            )
+            .await
+            .unwrap();
+            wait_route(
+                &env,
+                &ns,
+                "t39",
+                "t39",
+                &[
+                    ("Accepted", "True", "Accepted"),
+                    ("ResolvedRefs", "True", "ResolvedRefs"),
+                ],
+            )
+            .await;
+
+            let front = Front::new(&env).await.unwrap();
+            let first = front
+                .wait(
+                    "sticky cookie set",
+                    HTTP_PORT,
+                    host,
+                    "/hostname",
+                    &[],
+                    |r| {
+                        r.status == 200
+                            && r.header("Set-Cookie")
+                                .is_some_and(|c| c.starts_with("t39-session="))
+                    },
+                )
+                .await;
+            let set_cookie = first.header("Set-Cookie").unwrap().to_string();
+            println!(
+                "[{T}] first: {} Set-Cookie: {set_cookie}",
+                first.body.trim()
+            );
+            assert!(
+                set_cookie.contains("Path=/") && set_cookie.contains("HttpOnly"),
+                "{set_cookie}"
+            );
+            let cookie = set_cookie.split(';').next().unwrap().to_string();
+            let pod = first.body.trim().to_string();
+            for _ in 0..12 {
+                let r = front
+                    .get(
+                        HTTP_PORT,
+                        host,
+                        "/hostname",
+                        &[&format!("Cookie: {cookie}")],
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    (r.status, r.body.trim()),
+                    (200, pod.as_str()),
+                    "{}",
+                    r.short()
+                );
+                assert!(
+                    r.header("Set-Cookie").is_none(),
+                    "a client with the cookie gets none"
+                );
+            }
+            let spread = front
+                .sample(HTTP_PORT, host, "/hostname", 12)
+                .await
+                .unwrap();
+            let pods: std::collections::BTreeSet<&str> =
+                spread.iter().map(|(_, body)| body.as_str()).collect();
+            println!("[{T}] without the cookie: {pods:?}");
+            assert!(
+                pods.len() > 1,
+                "requests without the cookie are spread: {spread:?}"
+            );
+        }),
+        restore,
+    )
     .await;
 }
 

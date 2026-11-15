@@ -78,6 +78,16 @@ Signed-off-by: Your Name <you@example.com>
   updates for both monthly; maintainers update the Rust crates by hand (`cargo update`) and
   review the changes.
 
+## Following upstream releases
+
+The `upstream-releases` workflow runs `scripts/check-upstream-releases.sh` every week and fails
+when a Gateway API or Pingap release is newer than the one this repository uses; the job
+summary lists the steps. A new Gateway API release is picked up within a month: regenerate the
+types (`scripts/gen-gateway-api.sh <version>`), check `src/gateway/api/experimental.rs` against
+the new `experimental-install.yaml`, bump `GATEWAY_API_VERSION` (`src/gateway/watch.rs`) and
+the pinned CRD digests (`scripts/e2e-up.sh`, `scripts/conformance.sh`), and run the e2e and
+conformance suites.
+
 ## Releasing
 
 Versions follow Pingap: a release is the Pingap version it is tested with plus one more digit,

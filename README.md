@@ -126,11 +126,11 @@ when the mounted ConfigMap changes (and on `SIGHUP`). Watches are started or sto
 Services that were added or removed. An invalid new config is rejected and the running one stays.
 
 A few settings are read only at startup: `[etcd]`, `[server]`, `[kubernetes]` `kubeconfig`,
-`context` and `events`, `defaults.resync`, and `[gateway]` `enabled`, `controller_name` and
-`max_txn_ops`. A change to them logs "restart required" and keeps the running value. The chart
+`context` and `events`, `defaults.resync`, `[gateway]` `enabled`, `controller_name` and
+`max_txn_ops`, and `[gateway.generate_servers]`. A change to them logs "restart required" and keeps the running value. The chart
 annotates the pod template with a checksum of the matching values (`events.enabled`,
-`config.server`, `gateway.enabled`, `gateway.controllerName`, `gateway.maxTxnOps`; `status.*`
-too), so `helm upgrade` restarts the controller pods for them. Otherwise apply them with
+`config.server`, `gateway.enabled`, `gateway.controllerName`, `gateway.maxTxnOps`,
+`gateway.generateServers`; `status.*` too), so `helm upgrade` restarts the controller pods for them. Otherwise apply them with
 `kubectl -n <namespace> rollout restart deployment/pingap-k8s`.
 
 Key chart values (see [`values.yaml`](charts/pingap-k8s/values.yaml) for all of them):
@@ -322,6 +322,8 @@ drain_terminating = true # every [defaults] key but resync can be set per upstre
 | `gateway.external_name` | `false` | allow `ExternalName` Service backends (Pingap resolves the name) |
 | `gateway.health_check` | `""` | Pingap `health_check` of generated upstreams; empty: Pingap's default TCP check |
 | `gateway.max_txn_ops` | `64` | operations per etcd transaction of the Gateway writer (2 to 1024; keep it below etcd's `--max-txn-ops`, 128 by default) |
+| `gateway.session_persistence` | `false` | honor the Experimental-channel `sessionPersistence` of route rules ([Session persistence](#session-persistence)) |
+| `gateway.generate_servers` | off | `[gateway.generate_servers]` with `enabled`, `listen` (`[::]`), `exclude_ports`, `pingap_namespace` (the controller's namespace) and `pingap_selector` (required): [generated servers](#generated-servers) |
 
 - `<name>` is the Pingap upstream name (`[A-Za-z0-9_-]+`). `<port>` is a Service port **name** or
   **number** (the `port` field, not `targetPort`) and is required. `weight` is a positive integer,
@@ -424,7 +426,7 @@ Conformance (v1.7.0): GATEWAY-HTTP core 40/40 and extended 46/46; GATEWAY-GRPC c
 
 | Gateway API | Pingap |
 |---|---|
-| Gateway listener (port, HTTP or HTTPS) | an **existing** Pingap server with that port in `addr` (HTTPS: `global_certificates = true`). The controller never creates servers (a new server needs a Pingap restart): a listener without one gets `Accepted=False` (`PortUnavailable`). |
+| Gateway listener (port, HTTP or HTTPS) | an existing Pingap server with that port in `addr` (HTTPS: `global_certificates = true`). A listener without one gets `Accepted=False` (`PortUnavailable`), unless the controller [generates a server](#generated-servers) for its port. |
 | HTTPS `certificateRefs` (a `kubernetes.io/tls` Secret) | one certificate per Secret and listener hostname, with that hostname as `domains`, chosen by SNI; a listener without hostname gets the default certificate, with the certificate's own names that no listener hostname takes as `domains`. So every name has one certificate, and the TLS server name (SNI) picks the same listener as the `Host`. A Secret renewal rewrites it. |
 | Misdirected requests (HTTP/2 connection reuse) | `strict_sni = true` on HTTPS servers (Pingap 0.16.2): a request whose `Host` belongs to another listener than the TLS server name of its connection gets `421 Misdirected Request`. The chart sets it on the HTTPS servers of `gateway.groups`; add it to other HTTPS servers yourself. |
 | HTTPRoute rule match | one location per server, host and match: `Exact` → `=path`, `PathPrefix` → a segment-aware regex (`/foo` matches `/foo` and `/foo/x`, not `/foobar`), `RegularExpression` → an anchored regex, exact header and query matches → `match_headers` / `match_query`. Explicit location `weight`s encode Gateway API precedence. |
@@ -470,7 +472,7 @@ Details and limits:
   Weighted and cross-namespace backends (ReferenceGrant from GRPCRoute) work as for HTTPRoutes.
 - Backends are reached over HTTP/2: h2c, or TLS with ALPN `h2` under a BackendTLSPolicy.
 - A listener accepts GRPCRoutes only when every Pingap server it maps to sets
-  `enabled_h2 = true` (add it yourself; the controller never writes servers).
+  `enabled_h2 = true` (add it yourself to hand-made servers; generated servers have it).
 - An HTTPRoute and a GRPCRoute with intersecting hostnames on one listener are not mixed: the
   older route wins, the newer gets `Accepted=False`.
 - Not supported: `RequestMirror` (Pingap mirrors over HTTP/1.1 only) and regex header matches.
@@ -514,6 +516,69 @@ address). A Gateway that asks for an address the controller does not serve is no
 
 The seed writes only to an empty etcd prefix: to add a group to an existing install, create its
 servers by hand and restart Pingap.
+
+### Generated servers
+
+Pingap listens only on the ports of its servers, and it binds a new server only when it
+starts. With `[gateway.generate_servers]` (chart: `gateway.generateServers.enabled`), a
+listener port of the shared servers that no Pingap server listens on gets one:
+
+| Listener | Generated server |
+|---|---|
+| HTTP on port N | `k8s-http-N`: `addr = "[::]:N"`, `enabled_h2 = true` (h2c, for GRPCRoutes) |
+| HTTPS on port N | `k8s-https-N`: the same plus `global_certificates = true` and `strict_sni = true` |
+
+- The server is written with the listener's locations, and deleted once no listener needs
+  it. Pingap keeps listening on a deleted server until it restarts.
+- Pingap starts listening on a new server only after a restart. The controller watches the
+  Pingap pods (`pingap_namespace`, `pingap_selector`; read-only) and tells by their start
+  time: until every Ready Pingap pod has started after the server was written, the listener
+  reports `Programmed=False` with reason `Pending`. Restart Pingap to program it
+  (`kubectl -n pingap-k8s rollout restart deployment/pingap-k8s-pingap`). The time is
+  compared with the nodes' clocks, so keep them in sync (NTP).
+- Never generated: ports a hand-made server listens on (in any group, with either TLS
+  setting), `exclude_ports` (the chart adds the quickstart admin port) and listeners of
+  Gateways in a [server group](#server-groups). When listeners want a port both with and
+  without TLS, the oldest Gateway decides and the other listener gets `PortUnavailable`.
+- Pingap must be able to bind the port. The quickstart Pingap runs as non-root: ports below
+  1024 need `net.ipv4.ip_unprivileged_port_start` low enough (containerd and Docker set it
+  to 0 in the pod network namespace).
+- The port must also reach Pingap. With the quickstart Pingap, list it in
+  `gateway.generateServers.ports`: the chart adds it to the proxy Service and its
+  NetworkPolicy. For your own Pingap, open it on your Service yourself.
+
+```yaml
+gateway:
+  enabled: true
+  generateServers:
+    enabled: true
+    ports: [8443]   # quickstart Pingap: open these listener ports
+```
+
+### Session persistence
+
+`sessionPersistence` on HTTPRoute and GRPCRoute rules is in the Gateway API Experimental
+channel only (v1.7.0). With the Experimental-channel CRDs installed and
+`gateway.session_persistence = true` (chart: `gateway.sessionPersistence`), a rule with a
+cookie session gets an upstream of its own with `algo = "sticky:<cookie>"`. Pingap gives a
+client without the cookie one for the backend it chose, and sends every request with that
+cookie to the same backend while it is in `addrs`.
+
+```yaml
+rules:
+  - sessionPersistence:
+      type: Cookie
+      cookie: { name: shop-session }   # optional; default k8s-session-<hash> per rule
+    backendRefs: [{ name: shop, port: 80 }]
+```
+
+- The cookie is a session cookie with `Path=/`, `HttpOnly`, `SameSite=Lax` (and `Secure` over
+  TLS). `lifetimeType: Permanent`, `absoluteTimeout`, another cookie `path` and
+  `type: Header` are not supported: the rule is dropped (`PartiallyInvalid`). So is any
+  `sessionPersistence` while the option is off.
+- Backends need [`target = "pods"`](#upstream-target) (the default), so Pingap sees each pod.
+  A pod that leaves `addrs` (scale-down, rollout) loses its sessions: affinity is a
+  preference, not a guarantee.
 
 ### ListenerSet
 
@@ -627,7 +692,9 @@ Not supported: TCPRoute, UDPRoute and TLSRoute (passthrough and terminate; Pinga
 HTTP-only L7 proxy, and L4 was declined upstream in
 [vicanso/pingap#159](https://github.com/vicanso/pingap/issues/159)), method matching and regex
 header or query matches, `HTTPRouteRetryCodes`, retry backoff, BackendTLSPolicy SAN validation,
-filters that differ between the weighted backendRefs of a rule, and session persistence.
+filters that differ between the weighted backendRefs of a rule, and session persistence other
+than session cookies (see [Session persistence](#session-persistence); it has no supported
+feature name in v1.7.0).
 
 ## Graceful shutdown of application pods (preStop)
 
@@ -918,7 +985,8 @@ see [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Limitations
 
-- Gateway API: servers are never generated (listeners need a Pingap server on their port); see
+- Gateway API: a listener needs a Pingap server on its port; a
+  [generated server](#generated-servers) needs a Pingap restart before it serves. See
   [Supported features](#supported-features). Without [server groups](#server-groups), all
   Gateways of the class share the same Pingap servers, certificates and addresses.
 - etcd is the only write target. Pingap file or ConfigMap storage is not supported.

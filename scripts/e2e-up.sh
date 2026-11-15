@@ -116,6 +116,17 @@ if [[ ! -s "$gateway_crds" ]] || ! echo "$GATEWAY_API_SHA256  $gateway_crds" | s
   echo "$GATEWAY_API_SHA256  $gateway_crds.tmp" | shasum -a 256 -c - >/dev/null
   mv "$gateway_crds.tmp" "$gateway_crds"
 fi
+# The Experimental channel is downloaded only: E2E test 39 swaps in its HTTPRoute CRD
+# for sessionPersistence and restores the Standard one.
+GATEWAY_API_EXPERIMENTAL_SHA256=e6d2d3407717f54b579b22ad4d164b6863895b3524f21250b0da0c1ff9a05d53
+experimental_crds="$ROOT/target/e2e/gateway-api-$GATEWAY_API_VERSION-experimental-install.yaml"
+if [[ ! -s "$experimental_crds" ]] || ! echo "$GATEWAY_API_EXPERIMENTAL_SHA256  $experimental_crds" | shasum -a 256 -c - >/dev/null 2>&1; then
+  log "downloading the Gateway API $GATEWAY_API_VERSION Experimental-channel CRDs"
+  curl -fsSL -o "$experimental_crds.tmp" \
+    "https://github.com/kubernetes-sigs/gateway-api/releases/download/$GATEWAY_API_VERSION/experimental-install.yaml"
+  echo "$GATEWAY_API_EXPERIMENTAL_SHA256  $experimental_crds.tmp" | shasum -a 256 -c - >/dev/null
+  mv "$experimental_crds.tmp" "$experimental_crds"
+fi
 log "installing the Gateway API $GATEWAY_API_VERSION CRDs"
 kubectl apply --server-side -f "$gateway_crds" >/dev/null
 kubectl wait --for=condition=Established --timeout=60s \

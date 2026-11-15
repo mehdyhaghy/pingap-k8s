@@ -1,0 +1,24 @@
+name: upstream-releases
+
+# Weekly: fails when a Gateway API or Pingap release is newer than the versions this
+# repository is built and tested against (scripts/check-upstream-releases.sh), so a new
+# release is picked up within the month. Read-only; nothing here builds project code.
+on:
+  schedule:
+    - cron: "41 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: compare with the latest releases
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: scripts/check-upstream-releases.sh

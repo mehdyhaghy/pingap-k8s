@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Gateway API: generated servers (`[gateway.generate_servers]`, chart
+  `gateway.generateServers`, off by default). A listener port of the shared servers without a
+  Pingap server gets `k8s-http-<port>` or `k8s-https-<port>`; the listener reports
+  `Programmed=False` (`Pending`) until the Pingap pods have restarted onto it. Needs a
+  read-only watch of the Pingap pods.
+- Gateway API: session persistence (`gateway.session_persistence`, chart
+  `gateway.sessionPersistence`, off by default). The Experimental-channel `sessionPersistence`
+  of HTTPRoute and GRPCRoute rules with a session cookie becomes a Pingap sticky upstream
+  (`algo = "sticky:<cookie>"`). Other session settings drop the rule; so does
+  `sessionPersistence` while the option is off (it was ignored before).
+- CI: a weekly `upstream-releases` workflow fails when a newer Gateway API or Pingap release is
+  out (`scripts/check-upstream-releases.sh`).
+- e2e: tests 38 (a generated server, programmed after a Pingap restart) and 39 (session
+  persistence with the Experimental-channel HTTPRoute CRD).
+
 - README: TLS certificates from cert-manager for Gateway listeners (a Certificate or the
   Gateway annotation, RBAC, renewal, ACME HTTP-01 through Pingap, key types).
 - e2e: tests 36 and 37 with cert-manager v1.21.3 (opt-in, `E2E_CERT_MANAGER=1`): a CA
