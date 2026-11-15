@@ -32,6 +32,7 @@ the fix. `make check` must pass before a pull request is merged.
 | `scripts/test-etcd.sh` | `tests/etcd_*.rs` against a throwaway etcd on 127.0.0.1: CAS writes, owned-key watch, compaction, leader election, the Gateway writer | `integration` |
 | `scripts/test-kind.sh` | `tests/watch_kind.rs`: the Service and EndpointSlice watchers on a throwaway kind cluster | `integration` |
 | `scripts/e2e-run.sh` | the end-to-end suite with the chart, Pingap, etcd and the Gateway API CRDs on kind | `e2e` |
+| `E2E_CERT_MANAGER=1 scripts/e2e-run.sh cert_manager` | also installs cert-manager (pinned, with its Gateway API integration): tests 36 and 37, listener certificates from a CA issuer and from ACME HTTP-01 (Pebble) through Pingap, and their renewal; they skip without it | no |
 | `scripts/conformance.sh` | the Gateway API conformance suite on its own kind cluster (`CONF_PROFILES`, default `GATEWAY-HTTP,GATEWAY-GRPC`); report in `target/conformance/report.yaml` | no |
 | `scripts/otel-local.sh` | the binary exporting to a real OpenTelemetry Collector (docker) | no |
 | `scripts/bench-local.sh` | the benchmarks of [docs/benchmarks.md](docs/benchmarks.md) | no |

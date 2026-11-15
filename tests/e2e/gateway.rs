@@ -1,4 +1,6 @@
-//! The end-to-end tests 19–32, 34 and 35 of the Gateway API provider, one test function each.
+//! The end-to-end tests 19–32 and 34–37 of the Gateway API provider, one test function each.
+//! Tests 36 and 37 (certificates from cert-manager) skip unless scripts/e2e-up.sh installed
+//! cert-manager (`E2E_CERT_MANAGER=1`).
 //!
 //! The chart creates the GatewayClass `pingap` (tests/e2e/values.yaml): listeners map onto
 //! the seed's Pingap servers `gw-http` (plain HTTP and h2c, port 8082), `gw-https` (TLS
@@ -279,7 +281,20 @@ async fn wait_obj(
     name: &str,
     check: impl Fn(&Value) -> bool,
 ) -> anyhow::Result<Value> {
-    wait_for(what, STATUS_WAIT, POLL, || async {
+    wait_obj_for(env, what, STATUS_WAIT, kind, namespace, name, check).await
+}
+
+/// [`wait_obj`] with a timeout.
+async fn wait_obj_for(
+    env: &Env,
+    what: &str,
+    timeout: Duration,
+    kind: &str,
+    namespace: Option<&str>,
+    name: &str,
+    check: impl Fn(&Value) -> bool,
+) -> anyhow::Result<Value> {
+    wait_for(what, timeout, POLL, || async {
         match get_obj(&env.kubectl, kind, namespace, name).await? {
             Some(v) if check(&v) => Ok(Some(v)),
             Some(v) => anyhow::bail!("last status: {}", v["status"]),
@@ -2724,6 +2739,678 @@ async fn e2e_35_misdirected_websocket_and_keepalive() {
     .await;
 }
 
+// ---------------------------------------------------------------------------------------
+// cert-manager (tests 36 and 37)
+// ---------------------------------------------------------------------------------------
+
+const CERTIFICATES: &str = "certificates.cert-manager.io";
+const ISSUERS: &str = "issuers.cert-manager.io";
+const CLUSTER_ISSUERS: &str = "clusterissuers.cert-manager.io";
+/// cert-manager's namespace; the Secrets of ClusterIssuers live there.
+const CERT_MANAGER_NS: &str = "cert-manager";
+const CERT_MANAGER_API: &str = "cert-manager.io/v1";
+/// Issuance through ACME (test 37) takes several round trips.
+const ISSUE_WAIT: Duration = Duration::from_secs(180);
+
+/// Whether cert-manager is installed (`E2E_CERT_MANAGER=1` in scripts/e2e-up.sh). Prints
+/// a skip line for `test` when it is not.
+async fn cert_manager_installed(env: &Env, test: &str) -> bool {
+    let crd = get_obj(&env.kubectl, "crd", None, CERTIFICATES)
+        .await
+        .expect("get the cert-manager CRD");
+    if crd.is_none() {
+        println!(
+            "skip {test}: cert-manager is not installed (E2E_CERT_MANAGER=1 scripts/e2e-up.sh)"
+        );
+    }
+    crd.is_some()
+}
+
+fn certificate(ns: &str, name: &str, issuer: Value, spec: Value) -> Value {
+    let mut c = json!({
+        "apiVersion": CERT_MANAGER_API, "kind": "Certificate",
+        "metadata": { "name": name, "namespace": ns },
+        "spec": { "secretName": name, "issuerRef": issuer },
+    });
+    if let (Some(dst), Some(src)) = (c["spec"].as_object_mut(), spec.as_object()) {
+        dst.extend(src.clone());
+    }
+    c
+}
+
+/// Waits until Certificate `ns/name` is Ready for its current generation.
+async fn wait_certificate_ready(env: &Env, ns: &str, name: &str) -> Value {
+    wait_obj_for(
+        env,
+        &format!("Certificate {ns}/{name} ready"),
+        ISSUE_WAIT,
+        CERTIFICATES,
+        Some(ns),
+        name,
+        |c| {
+            cond(&c["status"]["conditions"], "Ready").is_some_and(|r| {
+                r["status"] == "True" && r["observedGeneration"] == c["metadata"]["generation"]
+            })
+        },
+    )
+    .await
+    .unwrap()
+}
+
+/// What cmctl's `renew` does: the `Issuing` condition makes cert-manager issue the
+/// Certificate again.
+async fn renew_certificate(env: &Env, ns: &str, name: &str) -> anyhow::Result<()> {
+    let patch = json!([{ "op": "add", "path": "/status/conditions/-", "value": {
+        "type": "Issuing", "status": "True", "reason": "ManuallyTriggered",
+        "message": "Certificate re-issuance manually triggered by the e2e test",
+    } }]);
+    env.kubectl
+        .run(&[
+            "patch",
+            CERTIFICATES,
+            name,
+            "-n",
+            ns,
+            "--subresource=status",
+            "--type=json",
+            "-p",
+            &patch.to_string(),
+        ])
+        .await?;
+    Ok(())
+}
+
+/// A serial number as hex digits: lowercase, without separators and leading zeros, so
+/// curl's `Serial Number:` and the DER serial compare.
+fn normalize_serial(serial: &str) -> String {
+    let hex: String = serial
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    let trimmed = hex.trim_start_matches('0');
+    if trimmed.is_empty() { "0" } else { trimmed }.to_string()
+}
+
+/// The issued certificate in a `kubernetes.io/tls` Secret.
+#[derive(Debug, Clone)]
+struct Issued {
+    /// [`normalize_serial`] of the leaf.
+    serial: String,
+    /// `CERTIFICATE` blocks in `tls.crt` (leaf and chain).
+    chain_len: usize,
+    /// PEM label of `tls.key`.
+    key_label: String,
+    /// Whether the Secret has a `ca.crt`.
+    has_ca: bool,
+}
+
+/// The fields of Secret `ns/name`, decoded; `None` when it does not exist.
+async fn secret_data(
+    env: &Env,
+    ns: &str,
+    name: &str,
+) -> anyhow::Result<Option<BTreeMap<String, String>>> {
+    let Some(secret) = get_obj(&env.kubectl, "secret", Some(ns), name).await? else {
+        return Ok(None);
+    };
+    let mut out = BTreeMap::new();
+    for (key, b64) in secret["data"].as_object().into_iter().flatten() {
+        let bytes = crate::etcd::base64_decode(b64.as_str().unwrap_or_default())?;
+        out.insert(key.clone(), String::from_utf8(bytes)?);
+    }
+    Ok(Some(out))
+}
+
+/// `tls.crt` of Secret `ns/name`.
+async fn issued_pem(env: &Env, ns: &str, name: &str) -> anyhow::Result<String> {
+    secret_data(env, ns, name)
+        .await?
+        .and_then(|mut d| d.remove("tls.crt"))
+        .ok_or_else(|| anyhow::anyhow!("{ns}/{name} has no tls.crt"))
+}
+
+/// [`Issued`] of Secret `ns/name`; `None` while it or its `tls.crt` is missing.
+async fn issued(env: &Env, ns: &str, name: &str) -> anyhow::Result<Option<Issued>> {
+    let Some(data) = secret_data(env, ns, name).await? else {
+        return Ok(None);
+    };
+    let Some(crt) = data.get("tls.crt").filter(|c| !c.is_empty()) else {
+        return Ok(None);
+    };
+    let blocks = pem::parse_many(crt)?;
+    let certs: Vec<&pem::Pem> = blocks.iter().filter(|b| b.tag() == "CERTIFICATE").collect();
+    let leaf = certs
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("{ns}/{name}: tls.crt holds no certificate"))?;
+    let (_, cert) = x509_parser::parse_x509_certificate(leaf.contents())
+        .map_err(|e| anyhow::anyhow!("{ns}/{name}: {e}"))?;
+    let key_label = data
+        .get("tls.key")
+        .and_then(|k| pem::parse(k).ok())
+        .map(|k| k.tag().to_string())
+        .unwrap_or_default();
+    Ok(Some(Issued {
+        serial: normalize_serial(&cert.raw_serial_as_string()),
+        chain_len: certs.len(),
+        key_label,
+        has_ca: data.get("ca.crt").is_some_and(|c| !c.is_empty()),
+    }))
+}
+
+/// The answer to an HTTPS GET with the certificate checked against a CA file in the
+/// client pod (`ca`), or not checked (`None`).
+#[derive(Debug, Clone)]
+struct TlsGet {
+    /// 0 without a response (also when the certificate does not verify).
+    status: u16,
+    /// [`normalize_serial`] of the leaf served, when there was a handshake.
+    serial: Option<String>,
+    body: String,
+}
+
+impl Front {
+    /// GET `https://<host>:<HTTPS_PORT><path>` with `host` as the TLS server name.
+    async fn tls_get(&self, host: &str, path: &str, ca: Option<&str>) -> anyhow::Result<TlsGet> {
+        let mut cmd: Vec<String> = [
+            "curl",
+            "-s",
+            "-m",
+            "5",
+            "-w",
+            "\n@@code %{http_code}\n%{certs}",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        match ca {
+            Some(path) => cmd.extend(["--cacert".to_string(), path.to_string()]),
+            None => cmd.push("-k".into()),
+        }
+        cmd.push("--resolve".into());
+        cmd.push(self.resolve(host, HTTPS_PORT));
+        cmd.push(format!("https://{host}:{HTTPS_PORT}{path}"));
+        let out = self
+            .kubectl
+            .exec(&self.namespace, &self.pod, None, &cmd)
+            .await?;
+        let Some((body, rest)) = out.stdout.split_once("\n@@code ") else {
+            anyhow::bail!("unexpected curl output {:?} ({:?})", out.stdout, out.stderr);
+        };
+        let (code, certs) = rest.split_once('\n').unwrap_or((rest, ""));
+        let serial = certs
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("Serial Number:"))
+            .map(normalize_serial);
+        Ok(TlsGet {
+            status: code.trim().parse().unwrap_or(0),
+            serial,
+            body: body.to_string(),
+        })
+    }
+
+    /// Writes `pem` to `path` in the client pod.
+    async fn put_file(&self, path: &str, pem: &str) -> anyhow::Result<()> {
+        let out = self
+            .kubectl
+            .exec_stdin(
+                &self.namespace,
+                &self.pod,
+                None,
+                &["sh", "-c", &format!("cat > {path}")],
+                pem.as_bytes(),
+            )
+            .await?;
+        if !out.success {
+            anyhow::bail!("writing {path}: {}", out.stderr.trim());
+        }
+        Ok(())
+    }
+}
+
+/// Renews Certificate `ns/name` and measures how long until Pingap serves the new
+/// certificate for `host`: `(new certificate, trigger to new Secret, new Secret to
+/// served)`. Asserts that the Secret's previous certificate was `before`.
+async fn renew_and_measure(
+    env: &Env,
+    front: &Front,
+    ns: &str,
+    name: &str,
+    host: &str,
+    before: &Issued,
+) -> (Issued, Duration, Duration) {
+    let start = std::time::Instant::now();
+    renew_certificate(env, ns, name).await.unwrap();
+    let deadline = start + ISSUE_WAIT;
+    let mut new_secret: Option<(Issued, std::time::Instant)> = None;
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{ns}/{name}: renewal not served within {ISSUE_WAIT:?} (new Secret: {new_secret:?})"
+        );
+        if new_secret.is_none()
+            && let Some(i) = issued(env, ns, name).await.unwrap()
+            && i.serial != before.serial
+        {
+            new_secret = Some((i, std::time::Instant::now()));
+        }
+        if let Some((i, at)) = &new_secret
+            && let Ok(r) = front.tls_get(host, "/hostname", None).await
+            && r.serial.as_deref() == Some(i.serial.as_str())
+        {
+            let served = std::time::Instant::now();
+            return (i.clone(), *at - start, served - *at);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// 36. Certificates from cert-manager (CA issuer, Gateway annotation, renewal)
+// ---------------------------------------------------------------------------------------
+
+/// Needs cert-manager (`E2E_CERT_MANAGER=1`; skipped otherwise). A self-signed
+/// ClusterIssuer makes the CA of the ClusterIssuer `t36-ca`. Gateway `t36` has the
+/// annotation `cert-manager.io/cluster-issuer: t36-ca` and an HTTPS listener for
+/// `a.t36.example.com` with Secret `t36-tls`: cert-manager's Gateway integration creates
+/// the Certificate (RSA, PKCS#1 key). Gateway `t36-ec` uses Secret `t36-ec-tls` of an
+/// explicit Certificate (ECDSA P-256, PKCS#8 key) for `b.t36.example.com`. Both hosts
+/// answer through Pingap with a certificate that verifies against the CA (`ca.crt`) for
+/// the host name, and the serial served is the one in the Secret. Renewing each
+/// Certificate (as `cmctl renew` does) puts a new certificate into the Secret, and Pingap
+/// serves it within [`TRAFFIC_WAIT`]; the test prints the time it took.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_36_cert_manager_certificates() {
+    const T: &str = "e2e_36";
+    let Some(env) = Env::setup("e2e_36_cert_manager_certificates").await else {
+        return;
+    };
+    if !cert_manager_installed(&env, "e2e_36_cert_manager_certificates").await {
+        return;
+    }
+    let ns = env.app_namespace.clone();
+    let (a, b) = ("a.t36.example.com", "b.t36.example.com");
+    let objs = [
+        cluster_obj(CLUSTER_ISSUERS, "t36-selfsigned"),
+        obj(CERTIFICATES, CERT_MANAGER_NS, "t36-root"),
+        obj("secret", CERT_MANAGER_NS, "t36-root"),
+        cluster_obj(CLUSTER_ISSUERS, "t36-root"),
+        obj(CERTIFICATES, CERT_MANAGER_NS, "t36-ca"),
+        obj("secret", CERT_MANAGER_NS, "t36-ca"),
+        cluster_obj(CLUSTER_ISSUERS, "t36-ca"),
+        obj(GATEWAYS, &ns, "t36"),
+        obj(CERTIFICATES, &ns, "t36-tls"),
+        obj("secret", &ns, "t36-tls"),
+        obj(CERTIFICATES, &ns, "t36-ec-tls"),
+        obj("secret", &ns, "t36-ec-tls"),
+        obj(GATEWAYS, &ns, "t36-ec"),
+        obj(ROUTES, &ns, "t36"),
+    ];
+    ready(&env).await;
+    with_objects(&env, &objs, async {
+        // A root CA and an intermediate CA signed by it, the issuer of the listener
+        // certificates.
+        let cluster_issuer = |name: &str, spec: Value| {
+            json!({
+                "apiVersion": CERT_MANAGER_API, "kind": "ClusterIssuer",
+                "metadata": { "name": name }, "spec": spec,
+            })
+        };
+        apply(
+            &env,
+            &list(vec![
+                cluster_issuer("t36-selfsigned", json!({ "selfSigned": {} })),
+                certificate(
+                    CERT_MANAGER_NS,
+                    "t36-root",
+                    json!({ "kind": "ClusterIssuer", "name": "t36-selfsigned" }),
+                    json!({
+                        "isCA": true, "commonName": "t36 e2e root CA",
+                        "privateKey": { "algorithm": "ECDSA", "size": 256 },
+                    }),
+                ),
+                cluster_issuer("t36-root", json!({ "ca": { "secretName": "t36-root" } })),
+                certificate(
+                    CERT_MANAGER_NS,
+                    "t36-ca",
+                    json!({ "kind": "ClusterIssuer", "name": "t36-root" }),
+                    json!({
+                        "isCA": true, "commonName": "t36 e2e intermediate CA",
+                        "privateKey": { "algorithm": "ECDSA", "size": 256 },
+                    }),
+                ),
+                cluster_issuer("t36-ca", json!({ "ca": { "secretName": "t36-ca" } })),
+            ]),
+        )
+        .await
+        .unwrap();
+        wait_certificate_ready(&env, CERT_MANAGER_NS, "t36-root").await;
+        wait_certificate_ready(&env, CERT_MANAGER_NS, "t36-ca").await;
+
+        // The Gateways: one through the annotation, one with an explicit Certificate.
+        let mut gw = gateway(&ns, "t36", vec![https_listener("https", a, "t36-tls")]);
+        gw["metadata"]["annotations"] = json!({ "cert-manager.io/cluster-issuer": "t36-ca" });
+        apply(
+            &env,
+            &list(vec![
+                gw,
+                certificate(
+                    &ns,
+                    "t36-ec-tls",
+                    json!({ "kind": "ClusterIssuer", "name": "t36-ca" }),
+                    json!({
+                        "dnsNames": [b],
+                        "privateKey": { "algorithm": "ECDSA", "size": 256, "encoding": "PKCS8" },
+                    }),
+                ),
+                gateway(&ns, "t36-ec", vec![https_listener("https", b, "t36-ec-tls")]),
+                route(
+                    &ns,
+                    "t36",
+                    json!([{ "name": "t36" }, { "name": "t36-ec" }]),
+                    &[a, b],
+                    json!([{ "backendRefs": [backend("echo", None)] }]),
+                ),
+            ]),
+        )
+        .await
+        .unwrap();
+        let shim = wait_certificate_ready(&env, &ns, "t36-tls").await;
+        println!(
+            "[{T}] Certificate t36-tls from the annotation: dnsNames {} owner {}",
+            shim["spec"]["dnsNames"], shim["metadata"]["ownerReferences"][0]["kind"]
+        );
+        assert_eq!(shim["spec"]["dnsNames"], json!([a]));
+        wait_certificate_ready(&env, &ns, "t36-ec-tls").await;
+        for name in ["t36", "t36-ec"] {
+            wait_gateway(&env, &ns, name, &format!("Gateway {name} programmed"), |g| {
+                listener_cond_is(g, "https", "Programmed", "True", "Programmed")
+                    && listener_cond_is(g, "https", "ResolvedRefs", "True", "ResolvedRefs")
+            })
+            .await;
+        }
+
+        let front = Front::new(&env).await.unwrap();
+        let rsa = issued(&env, &ns, "t36-tls").await.unwrap().expect("t36-tls");
+        let ec = issued(&env, &ns, "t36-ec-tls").await.unwrap().expect("t36-ec-tls");
+        println!("[{T}] t36-tls: {rsa:?}");
+        println!("[{T}] t36-ec-tls: {ec:?}");
+        assert_eq!(rsa.key_label, "RSA PRIVATE KEY");
+        assert_eq!(ec.key_label, "PRIVATE KEY");
+        // tls.crt holds the leaf and the intermediate CA; clients verify up to the root.
+        assert_eq!((rsa.chain_len, ec.chain_len), (2, 2));
+        let root = issued_pem(&env, CERT_MANAGER_NS, "t36-root").await.unwrap();
+        let ca_file = "/tmp/e2e-t36-ca.pem";
+        front.put_file(ca_file, &root).await.unwrap();
+
+        for (host, secret, want) in [(a, "t36-tls", &rsa), (b, "t36-ec-tls", &ec)] {
+            let r = wait_for(
+                &format!("{host} served with the {secret} certificate"),
+                TRAFFIC_WAIT,
+                POLL,
+                || async {
+                    let r = front.tls_get(host, "/hostname", Some(ca_file)).await?;
+                    if r.status == 200 && r.serial.as_deref() == Some(want.serial.as_str()) {
+                        Ok(Some(r))
+                    } else {
+                        anyhow::bail!("last answer: {r:?}")
+                    }
+                },
+            )
+            .await
+            .unwrap();
+            println!("[{T}] {host}: {} (verified against the root CA) serial {:?}", r.status, r.serial);
+            assert!(r.body.starts_with("echo-"), "{r:?}");
+            let certs = secret_certificates(&env, &ns, secret).await.unwrap();
+            assert_eq!(certs.len(), 1, "{certs:?}");
+        }
+
+        // Renewal: cert-manager writes a new certificate (and key) into the Secret.
+        for (host, secret, before) in [(a, "t36-tls", &rsa), (b, "t36-ec-tls", &ec)] {
+            let (after, issue, serve) =
+                renew_and_measure(&env, &front, &ns, secret, host, before).await;
+            println!(
+                "[{T}] renewed {secret}: serial {} -> {}; new Secret after {issue:?}, served {serve:?} later",
+                before.serial, after.serial
+            );
+            assert!(serve <= TRAFFIC_WAIT, "{serve:?}");
+            let r = front.tls_get(host, "/hostname", Some(ca_file)).await.unwrap();
+            assert_eq!(r.status, 200, "{r:?}");
+            assert_eq!(r.serial.as_deref(), Some(after.serial.as_str()));
+            let certs = secret_certificates(&env, &ns, secret).await.unwrap();
+            assert_eq!(certs.len(), 1, "{certs:?}");
+        }
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------------------
+// 37. ACME HTTP-01 through Pingap (cert-manager and Pebble)
+// ---------------------------------------------------------------------------------------
+
+/// Pebble, the ACME test server of Let's Encrypt.
+const PEBBLE_IMAGE: &str = "ghcr.io/letsencrypt/pebble:2.10.3";
+/// The name the ACME Certificate is for: the DNS name of the Service of server group `a`
+/// (tests/e2e/values.yaml, port 80 to Pingap's `gw-a-80`), so cert-manager's self check
+/// and Pebble's HTTP-01 validation (both on port 80) reach Pingap through that Service.
+const ACME_HOST: &str = "pingap-k8s-pingap-gw-a.pingap-k8s.svc.cluster.local";
+
+/// Needs cert-manager (`E2E_CERT_MANAGER=1`; skipped otherwise). Pebble (an ACME server,
+/// HTTP-01 validation on port 80) runs in e2e-app. Gateway `t37-http` takes server group
+/// `a` (port 80) with an HTTP listener for [`ACME_HOST`]; the ACME Issuer `t37-acme`
+/// solves HTTP-01 with a `gatewayHTTPRoute` on it. Gateway `t37` on the shared HTTPS
+/// server has the annotation `cert-manager.io/issuer: t37-acme` and an HTTPS listener for
+/// [`ACME_HOST`] with Secret `t37-tls`. cert-manager's challenge HTTPRoute and solver
+/// Service are served by Pingap like any route: the Certificate becomes Ready, and Pingap
+/// serves it for [`ACME_HOST`].
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_37_cert_manager_acme_http01() {
+    const T: &str = "e2e_37";
+    let Some(env) = Env::setup("e2e_37_cert_manager_acme_http01").await else {
+        return;
+    };
+    if !cert_manager_installed(&env, "e2e_37_cert_manager_acme_http01").await {
+        return;
+    }
+    let ns = env.app_namespace.clone();
+    let objs = [
+        obj("configmap", &ns, "t37-pebble"),
+        obj("deployment", &ns, "t37-pebble"),
+        obj("service", &ns, "t37-pebble"),
+        obj(GATEWAYS, &ns, "t37-http"),
+        obj(ISSUERS, &ns, "t37-acme"),
+        obj("secret", &ns, "t37-acme-account"),
+        obj(GATEWAYS, &ns, "t37"),
+        obj(CERTIFICATES, &ns, "t37-tls"),
+        obj("secret", &ns, "t37-tls"),
+        obj(ROUTES, &ns, "t37"),
+    ];
+    ready(&env).await;
+    with_objects(&env, &objs, async {
+        let pebble_config = json!({ "pebble": {
+            "listenAddress": "0.0.0.0:14000",
+            "managementListenAddress": "0.0.0.0:15000",
+            "certificate": "test/certs/localhost/cert.pem",
+            "privateKey": "test/certs/localhost/key.pem",
+            "httpPort": 80,
+            "tlsPort": 5001,
+            "ocspResponderURL": "",
+            "externalAccountBindingRequired": false,
+            "retryAfter": { "authz": 3, "order": 5 },
+            "profiles": { "default": { "description": "e2e", "validityPeriod": 7776000 } },
+        } });
+        let mut http_gw = gateway_of(
+            &ns,
+            "t37-http",
+            CLASS,
+            vec![json!({ "name": "http", "port": 80, "protocol": "HTTP", "hostname": ACME_HOST })],
+        );
+        http_gw["spec"]["addresses"] = json!([{ "type": "Hostname", "value": GROUPS[0].1 }]);
+        apply(
+            &env,
+            &list(vec![
+                json!({
+                    "apiVersion": "v1", "kind": "ConfigMap",
+                    "metadata": { "name": "t37-pebble", "namespace": ns },
+                    "data": { "pebble.json": pebble_config.to_string() },
+                }),
+                deployment(
+                    &ns,
+                    "t37-pebble",
+                    json!({
+                        "name": "pebble", "image": PEBBLE_IMAGE,
+                        "args": ["-config", "/config/pebble.json"],
+                        // No random validation delays, no rejected nonces.
+                        "env": [
+                            { "name": "PEBBLE_VA_NOSLEEP", "value": "1" },
+                            { "name": "PEBBLE_WFE_NONCEREJECT", "value": "0" },
+                        ],
+                        "ports": [{ "containerPort": 14000 }],
+                        "readinessProbe": { "tcpSocket": { "port": 14000 }, "periodSeconds": 2 },
+                        "volumeMounts": [{ "name": "config", "mountPath": "/config" }],
+                    }),
+                    json!([{ "name": "config", "configMap": { "name": "t37-pebble" } }]),
+                ),
+                service(
+                    &ns,
+                    "t37-pebble",
+                    json!([{ "name": "acme", "port": 14000 }]),
+                ),
+                http_gw,
+            ]),
+        )
+        .await
+        .unwrap();
+        env.kubectl
+            .run(&[
+                "-n",
+                &ns,
+                "rollout",
+                "status",
+                "deployment/t37-pebble",
+                "--timeout=180s",
+            ])
+            .await
+            .unwrap();
+        wait_gateway(
+            &env,
+            &ns,
+            "t37-http",
+            "Gateway t37-http programmed on group a",
+            |g| listener_cond_is(g, "http", "Programmed", "True", "Programmed"),
+        )
+        .await;
+
+        let mut gw = gateway(
+            &ns,
+            "t37",
+            vec![https_listener("https", ACME_HOST, "t37-tls")],
+        );
+        gw["metadata"]["annotations"] = json!({ "cert-manager.io/issuer": "t37-acme" });
+        apply(
+            &env,
+            &list(vec![
+                json!({
+                    "apiVersion": CERT_MANAGER_API, "kind": "Issuer",
+                    "metadata": { "name": "t37-acme", "namespace": ns },
+                    "spec": { "acme": {
+                        "server": format!("https://t37-pebble.{ns}.svc:14000/dir"),
+                        // Pebble's own test certificate for its API.
+                        "skipTLSVerify": true,
+                        "privateKeySecretRef": { "name": "t37-acme-account" },
+                        "solvers": [{ "http01": { "gatewayHTTPRoute": { "parentRefs": [
+                            { "name": "t37-http", "namespace": ns, "kind": "Gateway" },
+                        ] } } }],
+                    } },
+                }),
+                gw,
+                route(
+                    &ns,
+                    "t37",
+                    json!([{ "name": "t37" }]),
+                    &[ACME_HOST],
+                    json!([{ "backendRefs": [backend("echo", None)] }]),
+                ),
+            ]),
+        )
+        .await
+        .unwrap();
+
+        // The challenge route: cert-manager's HTTPRoute on t37-http, accepted by the
+        // controller, until the Certificate is issued.
+        let start = std::time::Instant::now();
+        let solver = wait_for(
+            "the HTTP-01 challenge HTTPRoute",
+            ISSUE_WAIT,
+            POLL,
+            || async {
+                let out = env
+                    .kubectl
+                    .run(&[
+                        "get",
+                        ROUTES,
+                        "-n",
+                        &ns,
+                        "-l",
+                        "acme.cert-manager.io/http01-solver=true",
+                        "-o",
+                        "json",
+                    ])
+                    .await?;
+                let items: Value = serde_json::from_str(&out)?;
+                Ok(items["items"].as_array().and_then(|a| a.first()).cloned())
+            },
+        )
+        .await;
+        match &solver {
+            Ok(r) => println!(
+                "[{T}] challenge route {}: hostnames {} rules {} parents {}",
+                r["metadata"]["name"],
+                r["spec"]["hostnames"],
+                r["spec"]["rules"],
+                r["status"]["parents"]
+            ),
+            // Issued before the poll saw the route: the checks below still hold.
+            Err(e) => println!("[{T}] challenge route not seen: {e:#}"),
+        }
+        let cert = wait_certificate_ready(&env, &ns, "t37-tls").await;
+        println!(
+            "[{T}] Certificate t37-tls ready after {:?}: {}",
+            start.elapsed(),
+            show(&cert["status"]["conditions"])
+        );
+
+        wait_gateway(&env, &ns, "t37", "Gateway t37 programmed", |g| {
+            listener_cond_is(g, "https", "Programmed", "True", "Programmed")
+        })
+        .await;
+        let issued = issued(&env, &ns, "t37-tls")
+            .await
+            .unwrap()
+            .expect("t37-tls");
+        println!("[{T}] t37-tls: {issued:?}");
+        let front = Front::new(&env).await.unwrap();
+        let r = wait_for(
+            "the ACME certificate served",
+            TRAFFIC_WAIT,
+            POLL,
+            || async {
+                let r = front.tls_get(ACME_HOST, "/hostname", None).await?;
+                if r.status == 200 && r.serial.as_deref() == Some(issued.serial.as_str()) {
+                    Ok(Some(r))
+                } else {
+                    anyhow::bail!("last answer: {r:?}")
+                }
+            },
+        )
+        .await
+        .unwrap();
+        println!("[{T}] {ACME_HOST}: {} serial {:?}", r.status, r.serial);
+        assert!(r.body.starts_with("echo-"), "{r:?}");
+    })
+    .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2762,6 +3449,13 @@ mod tests {
         assert_eq!(r.body, "podinfo-abc x");
         let r = parse_grpc("404 2\nBODY \n").unwrap();
         assert_eq!((r.status, r.grpc_status), (404, None));
+    }
+
+    #[test]
+    fn serials_compare_in_both_spellings() {
+        assert_eq!(normalize_serial("00:7A:6f:8e"), "7a6f8e");
+        assert_eq!(normalize_serial("7a6f8e"), "7a6f8e");
+        assert_eq!(normalize_serial("00"), "0");
     }
 
     #[test]
