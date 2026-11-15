@@ -1,0 +1,82 @@
+name: fuzz
+
+# The fuzz targets in fuzz/ (cargo-fuzz, libFuzzer): weekly, or by hand with a
+# duration per target. A crash fails the job and uploads the input that caused it.
+on:
+  schedule:
+    - cron: "41 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds to run each target
+        type: number
+        default: 600
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_FUZZ_VERSION: 0.13.2
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [config, etcd_toml, server_toml, translate]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # etcd-client generates its gRPC code with protoc at build time;
+      # libprotobuf-dev provides the well-known .proto files it imports.
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+          protoc --version
+
+      # cargo-fuzz needs nightly (sanitizer flags).
+      - uses: dtolnay/rust-toolchain@6a52aad76a94a5fbc50d567bb5be24419801c1fb # nightly
+        with:
+          toolchain: nightly
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+
+      - name: Run ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+          SECONDS_PER_TARGET: ${{ inputs.seconds || 600 }}
+        run: |
+          mkdir -p "fuzz/corpus/$TARGET"
+          dict=()
+          if [ -f "fuzz/dicts/$TARGET.dict" ]; then
+            dict=(-dict="dicts/$TARGET.dict")
+          fi
+          cd fuzz
+          cargo fuzz run "$TARGET" "corpus/$TARGET" "seeds/$TARGET" -- \
+            -max_total_time="$SECONDS_PER_TARGET" -timeout=30 -rss_limit_mb=4096 -max_len=8192 \
+            "${dict[@]}"
+
+      - name: Upload the crash inputs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+          retention-days: 30

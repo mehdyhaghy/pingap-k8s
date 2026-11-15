@@ -33,6 +33,7 @@ the fix. `make check` must pass before a pull request is merged.
 | `scripts/test-kind.sh` | `tests/watch_kind.rs`: the Service and EndpointSlice watchers on a throwaway kind cluster | `integration` |
 | `scripts/e2e-run.sh` | the end-to-end suite with the chart, Pingap, etcd and the Gateway API CRDs on kind | `e2e` |
 | `scripts/conformance.sh` | the Gateway API conformance suite on its own kind cluster (`CONF_PROFILES`, default `GATEWAY-HTTP,GATEWAY-GRPC`); report in `target/conformance/report.yaml` | no |
+| `cargo fuzz run <target>` (in `fuzz/`) | fuzz targets: the controller config and etcd URL (`config`), the upstream edits in etcd (`etcd_toml`), the server and location reads and edits (`server_toml`), and Gateway API translation, rendering and planning (`translate`); see [Fuzzing](#fuzzing) | `fuzz` (weekly) |
 | `scripts/otel-local.sh` | the binary exporting to a real OpenTelemetry Collector (docker) | no |
 | `scripts/bench-local.sh` | the benchmarks of [docs/benchmarks.md](docs/benchmarks.md) | no |
 | `cargo audit` | RustSec advisories for `Cargo.lock` | `dependencies` |
@@ -47,6 +48,25 @@ anything.
 
 Line coverage: `cargo llvm-cov --lib --bins` (add `--test 'etcd_*'` with `PINGAP_K8S_TEST_ETCD`
 set to include the etcd tests).
+
+### Fuzzing
+
+`fuzz/` holds [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets. It is its own
+crate with its own `Cargo.lock`, outside the workspace, and is never published. cargo-fuzz
+needs a nightly toolchain:
+
+```sh
+cargo install cargo-fuzz
+cd fuzz
+cargo +nightly fuzz run translate corpus/translate seeds/translate -- -max_total_time=300
+```
+
+With only a stable toolchain, `RUSTC_BOOTSTRAP=1 cargo fuzz run --sanitizer none <target> ...`
+also works. New inputs go to `fuzz/corpus/<target>`, crashes to `fuzz/artifacts/<target>` (both
+ignored by git); `cargo fuzz run <target> fuzz/artifacts/<target>/<file>` replays one. The
+small seed inputs in `fuzz/seeds/` are committed. The `fuzz` workflow runs every target weekly
+(10 minutes each, or the `seconds` input when started by hand) and uploads the crash inputs
+when one fails. A crash fixed in the source comes with a unit test, like any other bug.
 
 ## Pull requests and sign-off
 

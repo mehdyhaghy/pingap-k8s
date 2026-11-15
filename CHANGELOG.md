@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fuzz targets (`fuzz/`, cargo-fuzz) for the controller config and etcd URL, the edits of
+  stored upstreams and servers, and the Gateway API translation, rendering and planning. The
+  `fuzz` workflow runs them weekly.
 - Error messages no longer show the etcd password when the URL writes the parameter name
   encoded (`pass%77ord=...`): the name is now decoded before it is redacted, as the parser
   reads it.
