@@ -1,6 +1,6 @@
 name: fuzz
 
-# The fuzz targets in fuzz/ (cargo-fuzz, libFuzzer): weekly, or by hand with a
+# The fuzz targets in fuzz/ (cargo-afl, AFL++): weekly, or by hand with a
 # duration per target. A crash fails the job and uploads the input that caused it.
 on:
   schedule:
@@ -21,7 +21,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_FUZZ_VERSION: 0.13.2
+  CARGO_AFL_VERSION: 0.18.2
 
 jobs:
   fuzz:
@@ -45,38 +45,45 @@ jobs:
           sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
           protoc --version
 
-      # cargo-fuzz needs nightly (sanitizer flags).
-      - uses: dtolnay/rust-toolchain@6a52aad76a94a5fbc50d567bb5be24419801c1fb # nightly
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: nightly
+          toolchain: stable
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: fuzz
 
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+      # Installing cargo-afl also builds AFL++.
+      - name: Install cargo-afl
+        run: cargo install cargo-afl --version "$CARGO_AFL_VERSION" --locked
 
       - name: Run ${{ matrix.target }}
         env:
           TARGET: ${{ matrix.target }}
           SECONDS_PER_TARGET: ${{ inputs.seconds || 600 }}
+          AFL_NO_UI: "1"
+          AFL_SKIP_CPUFREQ: "1"
+          AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES: "1"
         run: |
-          mkdir -p "fuzz/corpus/$TARGET"
-          dict=()
-          if [ -f "fuzz/dicts/$TARGET.dict" ]; then
-            dict=(-dict="dicts/$TARGET.dict")
-          fi
           cd fuzz
-          cargo fuzz run "$TARGET" "corpus/$TARGET" "seeds/$TARGET" -- \
-            -max_total_time="$SECONDS_PER_TARGET" -timeout=30 -rss_limit_mb=4096 -max_len=8192 \
-            "${dict[@]}"
+          cargo afl build --release
+          mkdir -p out
+          dict=()
+          if [ -f "dicts/$TARGET.dict" ]; then
+            dict=(-x "dicts/$TARGET.dict")
+          fi
+          cargo afl fuzz -i "seeds/$TARGET" -o "out/$TARGET" -V "$SECONDS_PER_TARGET" \
+            -t 30000 -m none "${dict[@]}" "target/release/$TARGET"
+          # afl-fuzz exits 0 even when it found crashes.
+          crashes=$(find "out/$TARGET/default/crashes" -type f ! -name README.txt | wc -l)
+          echo "$crashes crash input(s)"
+          test "$crashes" -eq 0
 
       - name: Upload the crash inputs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-artifacts-${{ matrix.target }}
-          path: fuzz/artifacts/${{ matrix.target }}
+          path: fuzz/out/${{ matrix.target }}/default/crashes
           if-no-files-found: ignore
           retention-days: 30

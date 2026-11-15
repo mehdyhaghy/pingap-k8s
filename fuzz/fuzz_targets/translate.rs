@@ -6,12 +6,10 @@
 //! not depend on the order of its input lists; every generated name is owned (`k8s-`)
 //! and a valid entry name; rendered entries parse and read back; and a second plan
 //! after an apply has nothing left to do.
-#![no_main]
 
 use std::collections::BTreeSet;
 
 use arbitrary::Unstructured;
-use libfuzzer_sys::fuzz_target;
 use pingap_k8s::gateway::model::{Desired, PluginEntry, RouteKind, ServerInfo, Stored, is_owned};
 use pingap_k8s::gateway::plan::{BUILTIN_PLUGINS, PlanInput, plan};
 use pingap_k8s::gateway::render;
@@ -20,44 +18,46 @@ use pingap_k8s_fuzz::store::{PREFIX, Store};
 use pingap_k8s_fuzz::valid_name;
 use pingap_k8s_fuzz::world::{self, World};
 
-fuzz_target!(|data: &[u8]| {
-    let mut u = Unstructured::new(data);
-    let Ok(servers) = world::servers(&mut u) else {
-        return;
-    };
-    let Ok(first) = world::world(&mut u) else {
-        return;
-    };
-    let Ok(second) = first.subset(&mut u) else {
-        return;
-    };
+fn main() {
+    afl::fuzz!(|data: &[u8]| {
+        let mut u = Unstructured::new(data);
+        let Ok(servers) = world::servers(&mut u) else {
+            return;
+        };
+        let Ok(first) = world::world(&mut u) else {
+            return;
+        };
+        let Ok(second) = first.subset(&mut u) else {
+            return;
+        };
 
-    let mut store = Store::default();
-    store.put(
-        "upstreams",
-        "manual-up",
-        "[upstreams.manual-up]\naddrs = [\"10.0.0.9:80\"]\n",
-    );
-    store.put(
-        "locations",
-        "manual",
-        "[locations.manual]\nupstream = \"manual-up\"\n",
-    );
-    for (name, toml) in &servers {
-        store.put("servers", name, toml);
-    }
-    for plugin in &first.plugins {
+        let mut store = Store::default();
         store.put(
-            "plugins",
-            plugin,
-            &format!("[plugins.{plugin}]\ncategory = \"ping\"\npath = \"/ping\"\n"),
+            "upstreams",
+            "manual-up",
+            "[upstreams.manual-up]\naddrs = [\"10.0.0.9:80\"]\n",
         );
-    }
-    store.validate("setup");
+        store.put(
+            "locations",
+            "manual",
+            "[locations.manual]\nupstream = \"manual-up\"\n",
+        );
+        for (name, toml) in &servers {
+            store.put("servers", name, toml);
+        }
+        for plugin in &first.plugins {
+            store.put(
+                "plugins",
+                plugin,
+                &format!("[plugins.{plugin}]\ncategory = \"ping\"\npath = \"/ping\"\n"),
+            );
+        }
+        store.validate("setup");
 
-    pass(&first, &mut store);
-    pass(&second, &mut store);
-});
+        pass(&first, &mut store);
+        pass(&second, &mut store);
+    });
+}
 
 /// One controller pass: translate, plan, apply, and check that it converged.
 fn pass(world: &World, store: &mut Store) {

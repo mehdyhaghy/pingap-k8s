@@ -28,6 +28,7 @@ junit.xml
 /fuzz/target/
 /fuzz/corpus/
 /fuzz/artifacts/
+/fuzz/out/
 
 # ---------------------------------------------------------------------------
 # Secrets and credentials (never commit)
