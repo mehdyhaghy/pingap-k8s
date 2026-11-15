@@ -1,0 +1,36 @@
+# Load generator and metrics scraper for scripts/soak.sh. Pinned to the control-plane
+# node, which the chaos loop never drains or pauses, so the client survives every
+# injected failure. In e2e-app: the chart's NetworkPolicy admits that namespace to the
+# controller's metrics port (tests/e2e/values.yaml).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: soak-client
+  namespace: e2e-app
+  labels:
+    app: soak-client
+spec:
+  terminationGracePeriodSeconds: 1
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: ""
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: fortio
+      image: fortio/fortio:1.75.3
+      # Idle server; load chunks and scrapes are started with `kubectl exec`.
+      args: ["server", "-http-port", "8080", "-grpc-port", "disabled", "-redirect-port", "disabled"]
+      ports:
+        - name: http
+          containerPort: 8080
+      readinessProbe:
+        httpGet:
+          path: /debug
+          port: http
+        periodSeconds: 2
+      resources:
+        requests:
+          cpu: 100m
+          memory: 32Mi

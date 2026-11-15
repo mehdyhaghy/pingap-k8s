@@ -34,6 +34,7 @@ the fix. `make check` must pass before a pull request is merged.
 | `scripts/e2e-run.sh` | the end-to-end suite with the chart, Pingap, etcd and the Gateway API CRDs on kind | `e2e` |
 | `scripts/conformance.sh` | the Gateway API conformance suite on its own kind cluster (`CONF_PROFILES`, default `GATEWAY-HTTP,GATEWAY-GRPC`); report in `target/conformance/report.yaml` | no |
 | `scripts/otel-local.sh` | the binary exporting to a real OpenTelemetry Collector (docker) | no |
+| `scripts/soak.sh` | soak test (default 60 min): load through Pingap on a 4-node kind cluster while app pods, the controller leader, etcd members, Pingap pods and nodes fail; report in `target/soak/report.md`, see [docs/soak.md](docs/soak.md) | `soak` (manual, `gh workflow run soak -f duration=60m`) |
 | `scripts/bench-local.sh` | the benchmarks of [docs/benchmarks.md](docs/benchmarks.md) | no |
 | `cargo audit` | RustSec advisories for `Cargo.lock` | `dependencies` |
 | `make deny` (`cargo deny check licenses sources`) | dependency licenses against the CNCF allowlist and crate sources, per `deny.toml` | `dependencies` |

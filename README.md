@@ -61,7 +61,9 @@ version (see [Pingap side](#pingap-side)).
    `addrs` back, it is corrected within the debounce window. A full resync every 5 minutes is a
    safety net.
 6. **High availability.** Run 2 replicas. They elect a leader through etcd (no Kubernetes write
-   permission needed); only the leader writes, the follower keeps its watches warm.
+   permission needed); only the leader writes, the follower keeps its watches warm. A deleted
+   leader resigns and the follower takes over within a second; when the leader's node stops
+   answering, its 10 s lease has to expire first (13 to 16 s in the [soak test](docs/soak.md)).
 
 If an owned upstream does not exist yet in etcd, the controller creates a minimal one (only
 `addrs`) and logs it. If an upstream would end up with zero addresses, the last list is kept and
@@ -600,10 +602,18 @@ Traffic is not interrupted by any of these:
   [preStop delay](#graceful-shutdown-of-application-pods-prestop). The e2e suite checks for no
   failed requests under load during rollouts and single-replica restarts.
 
+The [soak test](docs/soak.md) repeats these for an hour under load, together with controller
+leader, etcd member, Pingap pod and node failures: no request failed outside node failures.
+
 ## Production checklist
 
+Where an item has numbers, they come from the one-hour [soak test](docs/soak.md) (200 requests/s
+through 3 Pingap replicas while pods, the controller leader, etcd members, Pingap pods and nodes
+fail).
+
 - [ ] **App pods have a `preStop` delay** sized from the upstream health-check connect timeout
-      ([above](#graceful-shutdown-of-application-pods-prestop)).
+      ([above](#graceful-shutdown-of-application-pods-prestop)). With 10 s and a 1 s connect
+      timeout, 15 pod deletions, rollouts and scale-downs in the soak test failed no request.
 - [ ] **Every owned upstream has a Pingap health check**, e.g.
       `health_check = "http://api/healthz?connection_timeout=1s&check_frequency=5s"`. Minimal
       upstreams created by the controller have none, and fail-static depends on it. Prefer an
@@ -630,6 +640,14 @@ Traffic is not interrupted by any of these:
 - [ ] **Quickstart Pingap runs 2 or more replicas** (`pingap.replicas`) for its
       PodDisruptionBudget. A terminating Pingap pod cuts streams after about 45 s; raise seed
       `grace_period` and `pingap.terminationGracePeriodSeconds` together for longer ones.
+- [ ] **A hung node is covered in front of Pingap**: until Kubernetes marks a node that stopped
+      answering `NotReady` (about 45 s), the Pingap Service keeps sending connections to the
+      Pingap pods on it, and Pingap keeps sending requests to the app pods on it until its health
+      check fails. In the soak test each such node failure cost 13 to 37 requests (at 200
+      requests/s, 3 replicas); drains and Pingap pod deletions cost none. Use client retries or
+      a load balancer with health checks for that window, and check that the replicas stay on
+      different nodes: the default spread is a preference, and after drains two of the three
+      replicas shared a node.
 
 ## Operating it with kubectl
 
@@ -830,7 +848,9 @@ docker buildx imagetools inspect ghcr.io/mehdyhaghy/pingap-k8s:<version> --forma
 
 At 50 upstreams × 20 endpoints: event-to-write p50 0.52 s (the 500 ms debounce), ~30 MB
 controller RSS, one etcd revision per write. Measured with controller 0.1.0 on Kubernetes 1.32;
-see [docs/benchmarks.md](docs/benchmarks.md).
+see [docs/benchmarks.md](docs/benchmarks.md). Over a one-hour [soak test](docs/soak.md) with one
+upstream (controller 0.16.21, Kubernetes 1.37): event-to-write p99 1.9 s, controller memory
+flat at about 3 MiB (cgroup RSS), request latency through Pingap p99 2.9 ms at 200 requests/s.
 
 ## Limitations
 
