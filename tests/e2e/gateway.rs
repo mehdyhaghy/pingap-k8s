@@ -1,5 +1,5 @@
-//! The end-to-end tests 19–32 and 34–39 of the Gateway API provider, one test function each.
-//! Tests 36 and 37 (certificates from cert-manager) skip unless scripts/e2e-up.sh installed
+//! The end-to-end tests 19–32 and 34–40 of the Gateway API provider, one test function each.
+//! Tests 36, 37 and 40 (certificates from cert-manager) skip unless scripts/e2e-up.sh installed
 //! cert-manager (`E2E_CERT_MANAGER=1`). Test 38 restarts the Pingap pods onto a generated
 //! server; test 39 swaps in the Experimental-channel HTTPRoute CRD and restores the
 //! Standard one afterwards.
@@ -2742,7 +2742,7 @@ async fn e2e_35_misdirected_websocket_and_keepalive() {
 }
 
 // ---------------------------------------------------------------------------------------
-// cert-manager (tests 36 and 37)
+// cert-manager (tests 36, 37 and 40)
 // ---------------------------------------------------------------------------------------
 
 const CERTIFICATES: &str = "certificates.cert-manager.io";
@@ -3750,6 +3750,143 @@ async fn e2e_39_session_persistence() {
         }),
         restore,
     )
+    .await;
+}
+
+// ---------------------------------------------------------------------------------------
+// 40. Certificates from cert-manager for a ListenerSet
+// ---------------------------------------------------------------------------------------
+
+/// Needs cert-manager with its ListenerSet support (`E2E_CERT_MANAGER=1`; alpha in
+/// cert-manager, turned on by scripts/e2e-up.sh; skipped otherwise). A self-signed
+/// ClusterIssuer makes the CA of ClusterIssuer `t40-ca`. Gateway `t40` (HTTP listener for
+/// `t40.example.com`) allows ListenerSets from its namespace; ListenerSet `t40-ls` has the
+/// annotation `cert-manager.io/cluster-issuer: t40-ca` and an HTTPS listener for
+/// `ls.t40.example.com` with Secret `t40-ls-tls`. cert-manager creates Certificate
+/// `t40-ls-tls` for that host, owned by the ListenerSet; the listener is programmed with
+/// it, Pingap serves the host with a certificate that verifies against the CA, and a
+/// renewal is served too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_40_cert_manager_listener_set() {
+    const T: &str = "e2e_40";
+    let Some(env) = Env::setup("e2e_40_cert_manager_listener_set").await else {
+        return;
+    };
+    if !cert_manager_installed(&env, "e2e_40_cert_manager_listener_set").await {
+        return;
+    }
+    let ns = env.app_namespace.clone();
+    let (own, host) = ("t40.example.com", "ls.t40.example.com");
+    let objs = [
+        cluster_obj(CLUSTER_ISSUERS, "t40-selfsigned"),
+        obj(CERTIFICATES, CERT_MANAGER_NS, "t40-ca"),
+        obj("secret", CERT_MANAGER_NS, "t40-ca"),
+        cluster_obj(CLUSTER_ISSUERS, "t40-ca"),
+        obj(GATEWAYS, &ns, "t40"),
+        obj(LISTENER_SETS, &ns, "t40-ls"),
+        obj(CERTIFICATES, &ns, "t40-ls-tls"),
+        obj("secret", &ns, "t40-ls-tls"),
+        obj(ROUTES, &ns, "t40"),
+    ];
+    ready(&env).await;
+    with_objects(&env, &objs, async {
+        let cluster_issuer = |name: &str, spec: Value| {
+            json!({
+                "apiVersion": CERT_MANAGER_API, "kind": "ClusterIssuer",
+                "metadata": { "name": name }, "spec": spec,
+            })
+        };
+        apply(
+            &env,
+            &list(vec![
+                cluster_issuer("t40-selfsigned", json!({ "selfSigned": {} })),
+                certificate(
+                    CERT_MANAGER_NS,
+                    "t40-ca",
+                    json!({ "kind": "ClusterIssuer", "name": "t40-selfsigned" }),
+                    json!({
+                        "isCA": true, "commonName": "t40 e2e CA",
+                        "privateKey": { "algorithm": "ECDSA", "size": 256 },
+                    }),
+                ),
+                cluster_issuer("t40-ca", json!({ "ca": { "secretName": "t40-ca" } })),
+            ]),
+        )
+        .await
+        .unwrap();
+        wait_certificate_ready(&env, CERT_MANAGER_NS, "t40-ca").await;
+
+        let mut gw = gateway(&ns, "t40", vec![http_listener("http", own)]);
+        gw["spec"]["allowedListeners"] = json!({ "namespaces": { "from": "Same" } });
+        apply(
+            &env,
+            &list(vec![
+                gw,
+                json!({
+                    "apiVersion": API_VERSION, "kind": "ListenerSet",
+                    "metadata": {
+                        "name": "t40-ls", "namespace": ns,
+                        "annotations": { "cert-manager.io/cluster-issuer": "t40-ca" },
+                    },
+                    "spec": {
+                        "parentRef": { "name": "t40" },
+                        "listeners": [https_listener("https", host, "t40-ls-tls")],
+                    },
+                }),
+                route(&ns, "t40", json!([{ "group": GROUP, "kind": "ListenerSet", "name": "t40-ls" }]), &[host], json!([{ "backendRefs": [backend("echo", None)] }])),
+            ]),
+        )
+        .await
+        .unwrap();
+
+        let shim = wait_certificate_ready(&env, &ns, "t40-ls-tls").await;
+        println!(
+            "[{T}] Certificate t40-ls-tls from the ListenerSet annotation: dnsNames {} owner {}",
+            shim["spec"]["dnsNames"], shim["metadata"]["ownerReferences"][0]["kind"]
+        );
+        assert_eq!(shim["spec"]["dnsNames"], json!([host]));
+        assert_eq!(shim["metadata"]["ownerReferences"][0]["kind"], "ListenerSet");
+        let ls = wait_obj(&env, "ListenerSet t40-ls programmed", LISTENER_SETS, Some(&ns), "t40-ls", |l| {
+            let c = &l["status"]["conditions"];
+            current(l, c)
+                && cond_is(c, "Accepted", "True", Some("Accepted"))
+                && listener(l, "https").is_some_and(|x| {
+                    cond_is(&x["conditions"], "Programmed", "True", Some("Programmed"))
+                        && cond_is(&x["conditions"], "ResolvedRefs", "True", Some("ResolvedRefs"))
+                        && x["attachedRoutes"] == 1
+                })
+        })
+        .await
+        .unwrap();
+        println!("[{T}] listener https: {}", show(&listener(&ls, "https").unwrap()["conditions"]));
+
+        let front = Front::new(&env).await.unwrap();
+        let first = issued(&env, &ns, "t40-ls-tls").await.unwrap().expect("t40-ls-tls");
+        let ca = issued_pem(&env, CERT_MANAGER_NS, "t40-ca").await.unwrap();
+        let ca_file = "/tmp/e2e-t40-ca.pem";
+        front.put_file(ca_file, &ca).await.unwrap();
+        let r = wait_for(&format!("{host} served with the t40-ls-tls certificate"), TRAFFIC_WAIT, POLL, || async {
+            let r = front.tls_get(host, "/hostname", Some(ca_file)).await?;
+            if r.status == 200 && r.serial.as_deref() == Some(first.serial.as_str()) {
+                Ok(Some(r))
+            } else {
+                anyhow::bail!("last answer: {r:?}")
+            }
+        })
+        .await
+        .unwrap();
+        println!("[{T}] {host}: {} (verified against the CA) serial {:?}", r.status, r.serial);
+        assert!(r.body.starts_with("echo-"), "{r:?}");
+
+        let (after, issue, serve) = renew_and_measure(&env, &front, &ns, "t40-ls-tls", host, &first).await;
+        println!(
+            "[{T}] renewed t40-ls-tls: serial {} -> {}; new Secret after {issue:?}, served {serve:?} later",
+            first.serial, after.serial
+        );
+        assert!(serve <= TRAFFIC_WAIT, "{serve:?}");
+        let r = front.tls_get(host, "/hostname", Some(ca_file)).await.unwrap();
+        assert_eq!((r.status, r.serial.as_deref()), (200, Some(after.serial.as_str())), "{r:?}");
+    })
     .await;
 }
 

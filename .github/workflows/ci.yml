@@ -272,6 +272,8 @@ jobs:
       E2E_SKIP_BUILD: "1"
       # Kept until teardown so a failure can be inspected in the next step.
       E2E_KEEP: "1"
+      # cert-manager (e2e tests 36, 37 and 40) on one job only: they skip on the other.
+      E2E_CERT_MANAGER: ${{ matrix.ipFamily == 'ipv4' && '1' || '0' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

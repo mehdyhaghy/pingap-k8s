@@ -33,14 +33,14 @@
 //!
 //! The end-to-end tests 1–18 and 33 are in [`spec`] (`spec::e2e_01_initial_sync` ...
 //! `spec::e2e_18_service_target_recreated`, `spec::e2e_33_external_name_upstream`); filter
-//! with e.g. `scripts/e2e-run.sh e2e_04`. The tests 19–32 and 34–39 of the Gateway API
+//! with e.g. `scripts/e2e-run.sh e2e_04`. The tests 19–32 and 34–40 of the Gateway API
 //! provider are in [`gateway`] (`gateway::e2e_19_gateway_class_status` ...,
 //! `gateway::e2e_34_misdirected_request_on_reused_connection`,
 //! `gateway::e2e_35_misdirected_websocket_and_keepalive`,
 //! `gateway::e2e_36_cert_manager_certificates`, `gateway::e2e_37_cert_manager_acme_http01`,
-//! `gateway::e2e_38_generated_server`, `gateway::e2e_39_session_persistence`).
-//! Tests 36 and 37 need cert-manager and skip without it:
-//! `E2E_CERT_MANAGER=1 scripts/e2e-run.sh cert_manager`.
+//! `gateway::e2e_38_generated_server`, `gateway::e2e_39_session_persistence`,
+//! `gateway::e2e_40_cert_manager_listener_set`). Tests 36, 37 and 40 need cert-manager
+//! and skip without it: `E2E_CERT_MANAGER=1 scripts/e2e-run.sh cert_manager`.
 
 // Helpers are shared with the tests in [`spec`]; not every one is used by every test.
 #![allow(dead_code)]

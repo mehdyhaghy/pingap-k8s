@@ -32,7 +32,7 @@
 #   E2E_EXTRA_VALUES     extra Helm values files (space-separated), applied after
 #                        tests/e2e/values.yaml (scripts/soak.sh uses tests/soak/values.yaml)
 #   E2E_CERT_MANAGER=1   also install cert-manager with its Gateway API integration
-#                        (e2e tests 36 and 37; default 0: they skip)
+#                        (e2e tests 36, 37 and 40; default 0: they skip)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -138,7 +138,8 @@ kubectl wait --for=condition=Established --timeout=60s \
 
 # --- cert-manager (opt-in, E2E_CERT_MANAGER=1; after the Gateway API CRDs) ----------
 # The release manifest, checked against its pinned digest, with the Gateway API
-# integration on (--enable-gateway-api). Only e2e tests 36 and 37 use it; they skip without it.
+# integration on (--enable-gateway-api, and its ListenerSet support). Only e2e tests 36,
+# 37 and 40 use it; they skip without it.
 if [[ "${E2E_CERT_MANAGER:-0}" == "1" ]]; then
   CERT_MANAGER_VERSION=v1.21.3
   CERT_MANAGER_SHA256=c04a51295adda2b1a775146751f973e787190778c7f35180861d9678876e5c74
@@ -152,8 +153,12 @@ if [[ "${E2E_CERT_MANAGER:-0}" == "1" ]]; then
   fi
   log "installing cert-manager $CERT_MANAGER_VERSION"
   kubectl apply --server-side -f "$cm_manifest" >/dev/null
-  kubectl -n cert-manager patch deployment cert-manager --type=json \
-    -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--enable-gateway-api"}]' >/dev/null
+  # ListenerSet support (test 40) is alpha in cert-manager: a flag and a feature gate.
+  kubectl -n cert-manager patch deployment cert-manager --type=json -p '[
+    {"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--enable-gateway-api"},
+    {"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--enable-gateway-api-listenerset"},
+    {"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--feature-gates=ListenerSets=true"}
+  ]' >/dev/null
   for d in cert-manager cert-manager-cainjector cert-manager-webhook; do
     kubectl -n cert-manager rollout status "deployment/$d" --timeout "$TIMEOUT"
   done

@@ -599,7 +599,7 @@ oldest first.
 ### TLS certificates from cert-manager
 
 [cert-manager](https://cert-manager.io) writes `kubernetes.io/tls` Secrets, which HTTPS listeners
-reference like any other Secret. Tested with cert-manager v1.21.3 (e2e tests 36 and 37).
+reference like any other Secret. Tested with cert-manager v1.21.3 (e2e tests 36, 37 and 40).
 
 **A Certificate per Secret.** The listener names the Certificate's `secretName`:
 
@@ -633,7 +633,9 @@ without `hostname` get none. The integration is off by default; turn it on with 
 `config.gatewayAPI.enabled: true` (the static manifest: the controller flag
 `--enable-gateway-api`), and install the Gateway API CRDs before cert-manager, or restart
 cert-manager afterwards. ListenerSets need `config.gatewayAPI.enableListenerSet: true` and the
-`ListenerSets` feature gate (alpha in cert-manager).
+`ListenerSets` feature gate (alpha in cert-manager; the static manifest: the flags
+`--enable-gateway-api-listenerset` and `--feature-gates=ListenerSets=true`). The annotation then
+goes on the ListenerSet, and the Certificate is created in its namespace.
 
 **RBAC.** The controller reads Secrets only in `gateway.namespaces`: list the namespaces of
 the Gateways that use cert-manager Secrets (cert-manager creates them in the Gateway's
