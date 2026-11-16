@@ -143,15 +143,13 @@ impl Store {
                 );
             }
         }
-        // Not the value: it holds the private key.
-        for (name, entry) in &stored.certificates {
-            if let Err(e) = entry.value.parse::<toml::Table>() {
-                panic!(
-                    "after {after}: certificate {name} does not parse: {} at {:?}",
-                    e.message(),
-                    e.span()
-                );
-            }
+        // The message names nothing of the entry: code scanning takes all of it for key
+        // material. Replay the input to see which one.
+        for entry in stored.certificates.values() {
+            assert!(
+                entry.value.parse::<toml::Table>().is_ok(),
+                "after {after}: a certificate entry does not parse"
+            );
         }
         for (server, entry) in &stored.servers {
             for name in render::server_locations(&entry.value, server).unwrap() {

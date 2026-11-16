@@ -233,16 +233,17 @@ fn check_desired(desired: &Desired, plugins: &BTreeSet<String>) {
         }
     }
     for (name, certificate) in &desired.certificates {
-        owned("certificate", name);
-        // Not the rendered entry: it holds the private key.
+        // The messages name nothing of a certificate entry: code scanning takes all of it
+        // for key material. Replay the input to see which one.
+        assert!(
+            is_owned(name) && valid_name(name),
+            "a certificate entry is not owned or has an invalid name"
+        );
         let rendered = render::render_certificate(name, certificate);
-        if let Err(e) = rendered.parse::<toml::Table>() {
-            panic!(
-                "certificate {name} does not parse: {} at {:?}",
-                e.message(),
-                e.span()
-            );
-        }
+        assert!(
+            rendered.parse::<toml::Table>().is_ok(),
+            "a rendered certificate entry does not parse"
+        );
     }
     for (name, plugin) in &desired.plugins {
         owned("plugin", name);
