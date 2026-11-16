@@ -52,6 +52,9 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: fuzz
+          # cargo afl builds with -C target-cpu=native: build output (proc macros included)
+          # from one runner's CPU can die with SIGILL on another's.
+          cache-targets: false
 
       # Installing cargo-afl also builds AFL++ and its runtime for the current rustc. --force:
       # rust-cache restores ~/.cargo/bin, and without it cargo skips the install when that
