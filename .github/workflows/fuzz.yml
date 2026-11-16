@@ -53,9 +53,11 @@ jobs:
         with:
           workspaces: fuzz
 
-      # Installing cargo-afl also builds AFL++.
+      # Installing cargo-afl also builds AFL++ and its runtime for the current rustc. --force:
+      # rust-cache restores ~/.cargo/bin, and without it cargo skips the install when that
+      # holds the same cargo-afl, so a newer stable rustc found no runtime.
       - name: Install cargo-afl
-        run: cargo install cargo-afl --version "$CARGO_AFL_VERSION" --locked
+        run: cargo install cargo-afl --version "$CARGO_AFL_VERSION" --locked --force
 
       - name: Run ${{ matrix.target }}
         env:
