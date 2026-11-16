@@ -678,7 +678,7 @@ async fn server_locations(env: &Env, server: &str) -> anyhow::Result<Vec<String>
 }
 
 /// The keys of the generated certificates of Secret `ns/name`.
-async fn secret_certificates(env: &Env, ns: &str, name: &str) -> anyhow::Result<Vec<String>> {
+async fn pingap_entries_from(env: &Env, ns: &str, name: &str) -> anyhow::Result<Vec<String>> {
     let remark = format!("remark = \"pingap-k8s secret {ns}/{name}\"");
     Ok(env
         .etcd
@@ -1461,8 +1461,8 @@ async fn e2e_25_https_listener() {
             subject.contains(&format!("CN = {host}")) || subject.contains(&format!("CN={host}")),
             "{subject}"
         );
-        let certs = secret_certificates(&env, &ns, "t25-tls").await.unwrap();
-        assert_eq!(certs.len(), 1, "{certs:?}");
+        let entries = pingap_entries_from(&env, &ns, "t25-tls").await.unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
 
         // Rotation: a new certificate in the same Secret.
         apply_tls_secret(&env, &ns, "t25-tls", host).await.unwrap();
@@ -1536,8 +1536,8 @@ async fn e2e_25_https_listener() {
             STATUS_WAIT,
             POLL,
             || async {
-                let a = secret_certificates(&env, &ns, "t25-tls").await?;
-                let b = secret_certificates(&env, &ns, "t25-late").await?;
+                let a = pingap_entries_from(&env, &ns, "t25-tls").await?;
+                let b = pingap_entries_from(&env, &ns, "t25-late").await?;
                 Ok((a.is_empty() && b.is_empty()).then_some(()))
             },
         )
@@ -2781,7 +2781,7 @@ fn certificate(ns: &str, name: &str, issuer: Value, spec: Value) -> Value {
 }
 
 /// Waits until Certificate `ns/name` is Ready for its current generation.
-async fn wait_certificate_ready(env: &Env, ns: &str, name: &str) -> Value {
+async fn wait_issuance_ready(env: &Env, ns: &str, name: &str) -> Value {
     wait_obj_for(
         env,
         &format!("Certificate {ns}/{name} ready"),
@@ -2984,19 +2984,19 @@ async fn renew_and_measure(
     let start = std::time::Instant::now();
     renew_certificate(env, ns, name).await.unwrap();
     let deadline = start + ISSUE_WAIT;
-    let mut new_secret: Option<(Issued, std::time::Instant)> = None;
+    let mut renewed: Option<(Issued, std::time::Instant)> = None;
     loop {
         assert!(
             std::time::Instant::now() < deadline,
-            "{ns}/{name}: renewal not served within {ISSUE_WAIT:?} (new Secret: {new_secret:?})"
+            "{ns}/{name}: renewal not served within {ISSUE_WAIT:?} (new Secret: {renewed:?})"
         );
-        if new_secret.is_none()
+        if renewed.is_none()
             && let Some(i) = issued(env, ns, name).await.unwrap()
             && i.serial != before.serial
         {
-            new_secret = Some((i, std::time::Instant::now()));
+            renewed = Some((i, std::time::Instant::now()));
         }
-        if let Some((i, at)) = &new_secret
+        if let Some((i, at)) = &renewed
             && let Ok(r) = front.tls_get(host, "/hostname", None).await
             && r.serial.as_deref() == Some(i.serial.as_str())
         {
@@ -3086,8 +3086,8 @@ async fn e2e_36_cert_manager_certificates() {
         )
         .await
         .unwrap();
-        wait_certificate_ready(&env, CERT_MANAGER_NS, "t36-root").await;
-        wait_certificate_ready(&env, CERT_MANAGER_NS, "t36-ca").await;
+        wait_issuance_ready(&env, CERT_MANAGER_NS, "t36-root").await;
+        wait_issuance_ready(&env, CERT_MANAGER_NS, "t36-ca").await;
 
         // The Gateways: one through the annotation, one with an explicit Certificate.
         let mut gw = gateway(&ns, "t36", vec![https_listener("https", a, "t36-tls")]);
@@ -3117,13 +3117,13 @@ async fn e2e_36_cert_manager_certificates() {
         )
         .await
         .unwrap();
-        let shim = wait_certificate_ready(&env, &ns, "t36-tls").await;
+        let shim = wait_issuance_ready(&env, &ns, "t36-tls").await;
         println!(
             "[{T}] Certificate t36-tls from the annotation: dnsNames {} owner {}",
             shim["spec"]["dnsNames"], shim["metadata"]["ownerReferences"][0]["kind"]
         );
         assert_eq!(shim["spec"]["dnsNames"], json!([a]));
-        wait_certificate_ready(&env, &ns, "t36-ec-tls").await;
+        wait_issuance_ready(&env, &ns, "t36-ec-tls").await;
         for name in ["t36", "t36-ec"] {
             wait_gateway(&env, &ns, name, &format!("Gateway {name} programmed"), |g| {
                 listener_cond_is(g, "https", "Programmed", "True", "Programmed")
@@ -3145,9 +3145,9 @@ async fn e2e_36_cert_manager_certificates() {
         let ca_file = "/tmp/e2e-t36-ca.pem";
         front.put_file(ca_file, &root).await.unwrap();
 
-        for (host, secret, want) in [(a, "t36-tls", &rsa), (b, "t36-ec-tls", &ec)] {
+        for (host, tls_name, want) in [(a, "t36-tls", &rsa), (b, "t36-ec-tls", &ec)] {
             let r = wait_for(
-                &format!("{host} served with the {secret} certificate"),
+                &format!("{host} served with the {tls_name} certificate"),
                 TRAFFIC_WAIT,
                 POLL,
                 || async {
@@ -3163,24 +3163,24 @@ async fn e2e_36_cert_manager_certificates() {
             .unwrap();
             println!("[{T}] {host}: {} (verified against the root CA) serial {:?}", r.status, r.serial);
             assert!(r.body.starts_with("echo-"), "{r:?}");
-            let certs = secret_certificates(&env, &ns, secret).await.unwrap();
-            assert_eq!(certs.len(), 1, "{certs:?}");
+            let entries = pingap_entries_from(&env, &ns, tls_name).await.unwrap();
+            assert_eq!(entries.len(), 1, "{entries:?}");
         }
 
         // Renewal: cert-manager writes a new certificate (and key) into the Secret.
-        for (host, secret, before) in [(a, "t36-tls", &rsa), (b, "t36-ec-tls", &ec)] {
+        for (host, tls_name, before) in [(a, "t36-tls", &rsa), (b, "t36-ec-tls", &ec)] {
             let (after, issue, serve) =
-                renew_and_measure(&env, &front, &ns, secret, host, before).await;
+                renew_and_measure(&env, &front, &ns, tls_name, host, before).await;
             println!(
-                "[{T}] renewed {secret}: serial {} -> {}; new Secret after {issue:?}, served {serve:?} later",
+                "[{T}] renewed {tls_name}: serial {} -> {}; new Secret after {issue:?}, served {serve:?} later",
                 before.serial, after.serial
             );
             assert!(serve <= TRAFFIC_WAIT, "{serve:?}");
             let r = front.tls_get(host, "/hostname", Some(ca_file)).await.unwrap();
             assert_eq!(r.status, 200, "{r:?}");
             assert_eq!(r.serial.as_deref(), Some(after.serial.as_str()));
-            let certs = secret_certificates(&env, &ns, secret).await.unwrap();
-            assert_eq!(certs.len(), 1, "{certs:?}");
+            let entries = pingap_entries_from(&env, &ns, tls_name).await.unwrap();
+            assert_eq!(entries.len(), 1, "{entries:?}");
         }
     })
     .await;
@@ -3375,7 +3375,7 @@ async fn e2e_37_cert_manager_acme_http01() {
             // Issued before the poll saw the route: the checks below still hold.
             Err(e) => println!("[{T}] challenge route not seen: {e:#}"),
         }
-        let cert = wait_certificate_ready(&env, &ns, "t37-tls").await;
+        let cert = wait_issuance_ready(&env, &ns, "t37-tls").await;
         println!(
             "[{T}] Certificate t37-tls ready after {:?}: {}",
             start.elapsed(),
@@ -3814,7 +3814,7 @@ async fn e2e_40_cert_manager_listener_set() {
         )
         .await
         .unwrap();
-        wait_certificate_ready(&env, CERT_MANAGER_NS, "t40-ca").await;
+        wait_issuance_ready(&env, CERT_MANAGER_NS, "t40-ca").await;
 
         let mut gw = gateway(&ns, "t40", vec![http_listener("http", own)]);
         gw["spec"]["allowedListeners"] = json!({ "namespaces": { "from": "Same" } });
@@ -3839,7 +3839,7 @@ async fn e2e_40_cert_manager_listener_set() {
         .await
         .unwrap();
 
-        let shim = wait_certificate_ready(&env, &ns, "t40-ls-tls").await;
+        let shim = wait_issuance_ready(&env, &ns, "t40-ls-tls").await;
         println!(
             "[{T}] Certificate t40-ls-tls from the ListenerSet annotation: dnsNames {} owner {}",
             shim["spec"]["dnsNames"], shim["metadata"]["ownerReferences"][0]["kind"]

@@ -133,7 +133,6 @@ impl Store {
             &stored.servers,
             &stored.locations,
             &stored.upstreams,
-            &stored.certificates,
             &stored.plugins,
         ] {
             for (name, entry) in map {
@@ -141,6 +140,16 @@ impl Store {
                     entry.value.parse::<toml::Table>().is_ok(),
                     "after {after}: {name} does not parse:\n{}",
                     entry.value
+                );
+            }
+        }
+        // Not the value: it holds the private key.
+        for (name, entry) in &stored.certificates {
+            if let Err(e) = entry.value.parse::<toml::Table>() {
+                panic!(
+                    "after {after}: certificate {name} does not parse: {} at {:?}",
+                    e.message(),
+                    e.span()
                 );
             }
         }
