@@ -74,8 +74,23 @@ jobs:
           fi
           cargo afl fuzz -i "seeds/$TARGET" -o "out/$TARGET" -V "$SECONDS_PER_TARGET" \
             -t 30000 -m none "${dict[@]}" "target/release/$TARGET"
-          # afl-fuzz exits 0 even when it found crashes.
-          crashes=$(find "out/$TARGET/default/crashes" -type f ! -name README.txt | wc -l)
+          # afl-fuzz exits 0 even when it found crashes. Its file names hold colons, which
+          # artifacts do not allow: each crash is copied to crashes/crash-<n>, with the
+          # output of a replay (the panic message) in crash-<n>.log and the AFL++ name in
+          # crash-<n>.name.
+          mkdir -p crashes
+          crashes=0
+          for f in "out/$TARGET/default/crashes"/id:*; do
+            [ -f "$f" ] || continue
+            crashes=$((crashes + 1))
+            c="crashes/crash-$crashes"
+            cp "$f" "$c"
+            basename "$f" >"$c.name"
+            RUST_BACKTRACE=1 timeout 60 "target/release/$TARGET" <"$f" >"$c.log" 2>&1 || true
+            echo "::group::crash-$crashes ($(basename "$f"))"
+            grep -A3 -m1 -E "panicked|overflowed" "$c.log" || tail -n 5 "$c.log"
+            echo "::endgroup::"
+          done
           echo "$crashes crash input(s)"
           test "$crashes" -eq 0
 
@@ -84,6 +99,6 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-artifacts-${{ matrix.target }}
-          path: fuzz/out/${{ matrix.target }}/default/crashes
+          path: fuzz/crashes
           if-no-files-found: ignore
           retention-days: 30

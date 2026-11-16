@@ -70,7 +70,8 @@ New inputs and crashes go to `fuzz/out/<target>/default/` (ignored by git);
 `target/release/<target> < fuzz/out/<target>/default/crashes/<file>` replays one. The
 small seed inputs in `fuzz/seeds/` are committed. The `fuzz` workflow runs every target weekly
 (10 minutes each, or the `seconds` input when started by hand) and uploads the crash inputs
-when one fails. A crash fixed in the source comes with a unit test, like any other bug.
+when one fails: the `fuzz-artifacts-<target>` artifact holds `crash-<n>` (the input),
+`crash-<n>.log` (its panic message) and `crash-<n>.name` (the AFL++ file name). A crash fixed in the source comes with a unit test, like any other bug.
 
 ## Pull requests and sign-off
 
