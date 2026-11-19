@@ -527,9 +527,16 @@ fn replace_owned_in_array(array: &mut Array, added: &[String]) {
         }
         let mut value = value.clone();
         if !pending.is_empty() {
+            // The comment runs to the end of its line: an element that was on the line of
+            // the dropped one gets a line of its own, or the comment would swallow it.
+            let rest = if prefix.contains('\n') {
+                prefix
+            } else {
+                line_prefix.clone()
+            };
             value
                 .decor_mut()
-                .set_prefix(format!("{}{prefix}", std::mem::take(&mut pending)));
+                .set_prefix(format!("{}{rest}", std::mem::take(&mut pending)));
         }
         kept.push(value);
     }
@@ -545,11 +552,11 @@ fn replace_owned_in_array(array: &mut Array, added: &[String]) {
     for value in kept {
         array.push_formatted(value);
     }
-    let trailing = format!("{pending}{trailing}");
+    // A line break after the comments of dropped names, or `]` would end up in one.
     array.set_trailing(if trailing.contains('\n') {
-        trailing
+        format!("{pending}{trailing}")
     } else {
-        "\n".to_string()
+        format!("{pending}\n")
     });
     array.set_trailing_comma(!array.is_empty());
 }
@@ -1053,6 +1060,50 @@ global_certificates = true
             out,
             "[servers.http]\nlocations = [\n    # owned below\n    \"a\",\n    \"k8s-y\",\n]\n"
         );
+    }
+
+    #[test]
+    fn a_moved_comment_does_not_swallow_the_next_name() {
+        // Found by fuzzing: the comment of a dropped name moved in front of a name on the
+        // same line, where it ran over that name to the end of the line.
+        for (doc, kept) in [
+            (
+                "[servers.http]\nlocations = [\"s6gb\",\n    # note\n    \"k8s-x\",\"a\"]\n",
+                &["s6gb", "a"][..],
+            ),
+            (
+                "[servers.http]\nlocations = [\n    \"m\", # note\n    \"k8s-x\",'''b''']\n",
+                &["m", "b"][..],
+            ),
+            (
+                "servers.http = {locations = [\"s\",\n    # note\n    \"k8s-x\",\"a\"] }\n",
+                &["s", "a"][..],
+            ),
+            // The last name dropped: its comment goes in front of `]`.
+            (
+                "[servers.http]\nlocations = [\n    \"a\",\n    # note\n    \"k8s-x\" ]\n",
+                &["a"][..],
+            ),
+            (
+                "[servers.http]\nlocations = [\n    \"a\", # note\n    \"k8s-x\"]\n",
+                &["a"][..],
+            ),
+        ] {
+            for desired in [&[][..], &["k8s-y"][..]] {
+                let out = replace_owned_locations(doc, "http", &s(desired))
+                    .unwrap()
+                    .unwrap();
+                let mut want = s(kept);
+                want.extend(s(desired));
+                assert_eq!(server_locations(&out, "http").unwrap(), want, "{out}");
+                assert!(out.contains("# note"), "{out}");
+                assert_eq!(
+                    replace_owned_locations(&out, "http", &s(desired)).unwrap(),
+                    None,
+                    "{out}"
+                );
+            }
+        }
     }
 
     #[test]

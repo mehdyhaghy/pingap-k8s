@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Gateway API: editing the `locations` of a hand-made Pingap server whose array holds
+  comments no longer writes broken TOML. The comment of a dropped `k8s-` name moved in front
+  of a name on the same line, or of the closing `]`, and swallowed it, so Pingap could not
+  load the server or lost a hand-made location. Found by fuzzing.
+- `health_check` values whose host holds `%` or non-ASCII characters are rejected with a
+  clear message. Such hosts reached a debug assertion in `idna` (not in release builds).
+  Found by fuzzing.
 - An etcd URL listing several members works when some of them do not answer: the controller
   probes every member every 2 s and keeps requests on those that answer. Before, requests
   went to every listed member, so writes failed at random while one was down, and on a

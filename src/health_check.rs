@@ -28,6 +28,11 @@ pub fn validate(value: &str) -> Result<(), String> {
     if value.chars().any(|c| c.is_control()) {
         return Err("contains a control character".to_string());
     }
+    // A service name or an address. Also keeps `url` from handing such a host to the
+    // ASCII-only `idna` backend, which asserts (in debug builds) on some of them.
+    if authority(value).contains(|c: char| c == '%' || !c.is_ascii()) {
+        return Err("the host must be ASCII, without percent-encoding".to_string());
+    }
     let url = Url::parse(value).map_err(|e| format!("not a URL: {e}"))?;
     if !SCHEMES.contains(&url.scheme()) {
         return Err(format!(
@@ -68,6 +73,14 @@ pub fn validate(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The authority (user info, host and port) the way `url` finds it: after `<scheme>:` and
+/// any slashes, up to the path, query or fragment.
+fn authority(value: &str) -> &str {
+    let rest = value.split_once(':').map_or(value, |(_, rest)| rest);
+    let rest = rest.trim_start_matches(['/', '\\']);
+    rest.split(['/', '\\', '?', '#']).next().unwrap_or("")
+}
+
 /// `200`, `200-299`, `200,204-206`: statuses 100 to 599, ranges not reversed.
 fn expect_status(value: &str) -> Result<(), String> {
     let status = |text: &str| {
@@ -100,8 +113,21 @@ mod tests {
     fn host_names_are_ascii() {
         // `idna` is built without Unicode tables (deny.toml, Cargo.toml).
         assert!(validate("http://xn--bcher-kva.example/healthz").is_ok());
-        let err = validate("http://b\u{fc}cher.example/healthz").unwrap_err();
-        assert!(err.starts_with("not a URL"), "{err}");
+        // Percent-encoding and non-ASCII stay allowed in the path and the query.
+        assert!(validate("http://api/h%20z/\u{fc}?from=b%C3%BC").is_ok());
+        for value in [
+            "http://b\u{fc}cher.example/healthz",
+            "http://b%C3%BCcher.example/healthz",
+            // Found by fuzzing: `idna`'s ASCII-only backend asserted on these.
+            "http://0N%9ftnm",
+            "http:K\u{455}.%8ckyi",
+            "http:/XN--Acers=_____B____0O\u{c6}ozkhhhhhhhhhhmnm",
+            "http:/@0N%deqsm",
+            "https:\\\\A%41/x",
+        ] {
+            let err = validate(value).unwrap_err();
+            assert!(err.contains("must be ASCII"), "{value}: {err}");
+        }
     }
 
     #[test]
