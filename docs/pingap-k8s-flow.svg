@@ -1,0 +1,212 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 470" width="960" height="470" role="img" aria-label="pingap-k8s flow: the controller watches the Kubernetes API, writes ready pod addresses and routes into etcd, and Pingap reloads them and sends traffic straight to the pods">
+  <title>pingap-k8s flow</title>
+  <!-- Shown in the README. Animated with SMIL and CSS only, no script.
+       Colors follow prefers-color-scheme; prefers-reduced-motion stops the motion.
+       One config cycle is 6 s: a pod becomes ready, the controller writes etcd, Pingap reloads. -->
+  <style>
+    svg {
+      --bg: #ffffff; --panel: #f6f8fa; --line: #d1d9e0; --text: #1f2328; --muted: #59636e;
+      --k8s: #eef4ff; --k8s-o: #326ce5; --k8s-hi: #d3e1ff;
+      --etcd-hi: #ccfbf1;
+      --pg: #fff4e8; --pg-o: #f97316; --pg-hi: #ffe2c2;
+      --cfg: #7c3aed; --a: #2563eb; --b: #0d9488; --ok: #22c55e;
+    }
+    @media (prefers-color-scheme: dark) {
+      svg {
+        --bg: #0d1117; --panel: #161b22; --line: #30363d; --text: #e6edf3; --muted: #9198a1;
+        --k8s: #0f1a2e; --k8s-o: #5b8def; --k8s-hi: #1c3360;
+        --etcd-hi: #0f3b37;
+        --pg: #24180d; --pg-o: #fb923c; --pg-hi: #4a2e12;
+        --cfg: #a78bfa; --a: #60a5fa; --b: #2dd4bf; --ok: #4ade80;
+      }
+    }
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; fill: var(--text); font-size: 13px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; }
+    .m { fill: var(--muted); font-size: 12px; }
+    .mono.m { font-size: 11px; }
+    .b { font-weight: 700; }
+    .big { font-size: 18px; font-weight: 700; }
+    .cap { font-size: 11px; letter-spacing: 1.2px; fill: var(--muted); font-weight: 600; }
+    .bg { fill: var(--bg); stroke: var(--line); }
+    .panel { fill: var(--panel); stroke: var(--line); }
+    .row { fill: var(--panel); stroke: var(--line); }
+    .k8s { fill: var(--k8s); stroke: var(--k8s-o); stroke-width: 1.5; }
+    .pg { fill: var(--pg); stroke: var(--pg-o); stroke-width: 1.5; }
+    .wire { fill: none; stroke: var(--line); stroke-width: 1.6; }
+    .flow { fill: none; stroke-width: 1.8; stroke-dasharray: 5 7; animation: dash 1.2s linear infinite; }
+    .cfg { stroke: var(--cfg); }
+    .fa { stroke: var(--a); }
+    .fb { stroke: var(--b); }
+    .dot { stroke: var(--bg); stroke-width: 1.5; }
+    .ok { fill: var(--ok); animation: beat 2.4s ease-in-out infinite; }
+    .scan-k { animation: scan-k 6s linear infinite; }
+    .scan-e { animation: scan-e 6s linear infinite; }
+    .scan-p { animation: scan-p 6s linear infinite; }
+    @keyframes dash { to { stroke-dashoffset: -24; } }
+    @keyframes beat { 50% { opacity: .45; } }
+    @keyframes scan-k { 0%, 9% { fill: var(--panel); } 3% { fill: var(--k8s-hi); } }
+    @keyframes scan-e { 0%, 9% { fill: var(--panel); } 3% { fill: var(--etcd-hi); } }
+    @keyframes scan-p { 0%, 9% { fill: var(--panel); } 3% { fill: var(--pg-hi); } }
+    @media (prefers-reduced-motion: reduce) {
+      .dot { display: none; }
+      .flow, .ok, .scan-k, .scan-e, .scan-p { animation: none; }
+    }
+  </style>
+
+  <rect class="bg" x="0.5" y="0.5" width="959" height="469" rx="14"/>
+
+  <!-- ============ CONFIG PATH ============ -->
+  <text class="cap" x="24" y="40">CONFIG</text>
+
+  <!-- Kubernetes API -->
+  <rect class="panel" x="24" y="52" width="196" height="172" rx="12"/>
+  <text class="b" x="40" y="76">Kubernetes API</text>
+  <rect class="row" x="36" y="88" width="172" height="26" rx="7"/>
+  <text class="mono" x="48" y="105">Service</text>
+  <rect class="row" x="36" y="120" width="172" height="26" rx="7"/>
+  <text class="mono" x="48" y="137">EndpointSlice</text>
+  <rect class="row" x="36" y="152" width="172" height="26" rx="7"/>
+  <text class="mono" x="48" y="169">Gateway · ListenerSet</text>
+  <rect class="row" x="36" y="184" width="172" height="26" rx="7"/>
+  <text class="mono" x="48" y="201">HTTPRoute · GRPCRoute</text>
+
+  <!-- watch wires: k8s -> controller -->
+  <path id="w1" class="wire" d="M220,101 C250,101 250,102 280,102"/>
+  <path id="w2" class="wire" d="M220,133 C252,133 248,102 280,102"/>
+  <path id="w3" class="wire" d="M220,165 C254,165 246,102 280,102"/>
+  <path id="w4" class="wire" d="M220,197 C256,197 244,102 280,102"/>
+
+  <!-- pingap-k8s controller -->
+  <rect class="k8s" x="280" y="44" width="300" height="192" rx="16"/>
+  <circle cx="302" cy="66" r="6" fill="var(--k8s-o)"/>
+  <text class="big" x="316" y="72">pingap-k8s</text>
+  <rect x="490" y="56" width="74" height="22" rx="11" fill="var(--bg)" stroke="var(--line)"/>
+  <circle class="ok" cx="504" cy="67" r="4"/>
+  <text class="m" x="514" y="71.5">leader</text>
+  <rect class="row scan-k" style="animation-delay:.9s" x="296" y="86" width="268" height="32" rx="8"/>
+  <text x="310" y="107"><tspan class="b">Watch</tspan><tspan class="m"> · Services, slices, routes</tspan></text>
+  <rect class="row scan-k" style="animation-delay:1.3s" x="296" y="122" width="268" height="32" rx="8"/>
+  <text x="310" y="143"><tspan class="b">Resolve</tspan><tspan class="m"> · ready pod IPs, weights</tspan></text>
+  <rect class="row scan-k" style="animation-delay:1.7s" x="296" y="158" width="268" height="32" rx="8"/>
+  <text x="310" y="179"><tspan class="b">Debounce</tspan><tspan class="m"> · 500 ms, at most 2 s</tspan></text>
+  <rect class="row scan-k" style="animation-delay:2.1s" x="296" y="194" width="268" height="32" rx="8"/>
+  <text x="310" y="215"><tspan class="b">Write</tspan><tspan class="m"> · CAS txn, leader-fenced</tspan></text>
+
+  <!-- write path: controller -> etcd -->
+  <path id="wr" class="flow cfg" d="M580,210 C612,210 604,101 636,101"/>
+
+  <!-- etcd -->
+  <rect class="panel" x="636" y="52" width="300" height="172" rx="12"/>
+  <text x="652" y="76"><tspan class="b">etcd</tspan><tspan class="m"> · Pingap config storage</tspan></text>
+  <rect class="row scan-e" style="animation-delay:3.0s" x="648" y="88" width="276" height="26" rx="7"/>
+  <text class="mono" x="660" y="105">upstreams/api.toml</text>
+  <text class="mono m" x="912" y="105" text-anchor="end">addrs</text>
+  <rect class="row scan-e" style="animation-delay:3.15s" x="648" y="120" width="276" height="26" rx="7"/>
+  <text class="mono" x="660" y="137">locations/k8s-…</text>
+  <text class="mono m" x="912" y="137" text-anchor="end">routes</text>
+  <rect class="row scan-e" style="animation-delay:3.3s" x="648" y="152" width="276" height="26" rx="7"/>
+  <text class="mono" x="660" y="169">plugins/k8s-…</text>
+  <text class="mono m" x="912" y="169" text-anchor="end">filters</text>
+  <rect class="row scan-e" style="animation-delay:3.45s" x="648" y="184" width="276" height="26" rx="7"/>
+  <text class="mono" x="660" y="201">certificates/k8s-…</text>
+  <text class="mono m" x="912" y="201" text-anchor="end">TLS</text>
+
+  <!-- watch path: etcd -> Pingap -->
+  <path id="wa" class="flow cfg" d="M786,224 V256 Q786,262 780,262 H466 Q460,262 460,268 V300"/>
+  <text class="mono m" x="604" y="282">watch · --autoreload</text>
+
+  <!-- config packets (one 6 s cycle) -->
+  <circle class="dot" r="4.5" fill="var(--cfg)" opacity="0">
+    <animateMotion dur="6s" repeatCount="indefinite" calcMode="linear" keyPoints="0;1;1" keyTimes="0;0.13;1"><mpath href="#w2"/></animateMotion>
+    <animate attributeName="opacity" dur="6s" repeatCount="indefinite" values="1;1;0;0" keyTimes="0;0.13;0.14;1"/>
+  </circle>
+  <circle class="dot" r="4.5" fill="var(--cfg)" opacity="0">
+    <animateMotion dur="6s" repeatCount="indefinite" calcMode="linear" keyPoints="0;0;1;1" keyTimes="0;0.02;0.15;1"><mpath href="#w1"/></animateMotion>
+    <animate attributeName="opacity" dur="6s" repeatCount="indefinite" values="0;1;1;0;0" keyTimes="0;0.02;0.15;0.16;1"/>
+  </circle>
+  <circle class="dot" r="4.5" fill="var(--cfg)" opacity="0">
+    <animateMotion dur="6s" repeatCount="indefinite" calcMode="linear" keyPoints="0;0;1;1" keyTimes="0;0.4;0.5;1"><mpath href="#wr"/></animateMotion>
+    <animate attributeName="opacity" dur="6s" repeatCount="indefinite" values="0;0;1;1;0;0" keyTimes="0;0.39;0.4;0.5;0.51;1"/>
+  </circle>
+  <circle class="dot" r="4.5" fill="var(--cfg)" opacity="0">
+    <animateMotion dur="6s" repeatCount="indefinite" calcMode="linear" keyPoints="0;0;1;1" keyTimes="0;0.6;0.75;1"><mpath href="#wa"/></animateMotion>
+    <animate attributeName="opacity" dur="6s" repeatCount="indefinite" values="0;0;1;1;0;0" keyTimes="0;0.59;0.6;0.75;0.76;1"/>
+  </circle>
+
+  <!-- ============ TRAFFIC PATH ============ -->
+  <text class="cap" x="24" y="300">TRAFFIC</text>
+
+  <!-- clients -->
+  <rect class="panel" x="24" y="318" width="140" height="40" rx="20"/>
+  <text x="94" y="342.5" text-anchor="middle">Browser</text>
+  <rect class="panel" x="24" y="392" width="140" height="40" rx="20"/>
+  <text x="94" y="416.5" text-anchor="middle">gRPC client</text>
+  <path id="c1" class="wire" d="M164,338 C250,338 244,375 330,375"/>
+  <path id="c2" class="wire" d="M164,412 C250,412 244,375 330,375"/>
+
+  <!-- Pingap -->
+  <rect class="pg" x="330" y="300" width="260" height="150" rx="16"/>
+  <circle cx="352" cy="322" r="6" fill="var(--pg-o)"/>
+  <text class="big" x="366" y="328">Pingap</text>
+  <text class="m" x="574" y="327" text-anchor="end">stock image</text>
+  <rect class="row" x="346" y="340" width="228" height="30" rx="8"/>
+  <text x="360" y="360"><tspan class="b">Routes</tspan><tspan class="m"> · host · path · headers</tspan></text>
+  <rect class="row" x="346" y="376" width="228" height="30" rx="8"/>
+  <text x="360" y="396"><tspan class="b">Plugins</tspan><tspan class="m"> · headers · redirect</tspan></text>
+  <rect class="row scan-p" style="animation-delay:4.5s" x="346" y="412" width="228" height="30" rx="8"/>
+  <text x="360" y="432"><tspan class="b">Upstreams</tspan><tspan class="m"> · health checks</tspan></text>
+
+  <!-- pods -->
+  <text class="cap" x="676" y="300">PODS (POD IPs, NO SERVICE VIP)</text>
+  <rect class="panel" x="676" y="310" width="260" height="62" rx="12"/>
+  <text class="b" x="692" y="346">api</text>
+  <text class="mono" x="760" y="336">10.244.1.7:8080</text>
+  <text class="mono" x="760" y="357">10.244.2.4:8080</text>
+  <circle class="ok" cx="912" cy="332" r="4"/>
+  <circle class="ok" style="animation-delay:.6s" cx="912" cy="353" r="4"/>
+  <rect class="panel" x="676" y="384" width="260" height="62" rx="12"/>
+  <text class="b" x="692" y="420">web</text>
+  <text class="mono" x="760" y="410">10.244.3.9:3000</text>
+  <text class="mono" x="760" y="431">10.244.1.5:3000</text>
+  <circle class="ok" style="animation-delay:1.2s" cx="912" cy="406" r="4"/>
+  <circle class="ok" style="animation-delay:1.8s" cx="912" cy="427" r="4"/>
+
+  <path id="ua" class="flow fa" d="M590,368 C634,368 632,341 676,341"/>
+  <path id="ub" class="flow fb" d="M590,382 C634,382 632,415 676,415"/>
+
+  <!-- traffic packets: 4 requests per 4 s, each client leg then upstream leg -->
+  <g>
+    <circle class="dot" r="4.5" fill="var(--a)" opacity="0">
+      <animateMotion dur="4s" begin="0s" repeatCount="indefinite" calcMode="linear" keyPoints="0;1;1" keyTimes="0;0.3;1"><mpath href="#c1"/></animateMotion>
+      <animate attributeName="opacity" dur="4s" begin="0s" repeatCount="indefinite" values="1;1;0;0" keyTimes="0;0.3;0.31;1"/>
+    </circle>
+    <circle class="dot" r="4.5" fill="var(--a)" opacity="0">
+      <animateMotion dur="4s" begin="0s" repeatCount="indefinite" calcMode="linear" keyPoints="0;0;1;1" keyTimes="0;0.4;0.65;1"><mpath href="#ua"/></animateMotion>
+      <animate attributeName="opacity" dur="4s" begin="0s" repeatCount="indefinite" values="0;0;1;1;0;0" keyTimes="0;0.39;0.4;0.65;0.66;1"/>
+    </circle>
+    <circle class="dot" r="4.5" fill="var(--b)" opacity="0">
+      <animateMotion dur="4s" begin="1s" repeatCount="indefinite" calcMode="linear" keyPoints="0;1;1" keyTimes="0;0.3;1"><mpath href="#c2"/></animateMotion>
+      <animate attributeName="opacity" dur="4s" begin="1s" repeatCount="indefinite" values="1;1;0;0" keyTimes="0;0.3;0.31;1"/>
+    </circle>
+    <circle class="dot" r="4.5" fill="var(--b)" opacity="0">
+      <animateMotion dur="4s" begin="1s" repeatCount="indefinite" calcMode="linear" keyPoints="0;0;1;1" keyTimes="0;0.4;0.65;1"><mpath href="#ub"/></animateMotion>
+      <animate attributeName="opacity" dur="4s" begin="1s" repeatCount="indefinite" values="0;0;1;1;0;0" keyTimes="0;0.39;0.4;0.65;0.66;1"/>
+    </circle>
+    <circle class="dot" r="4.5" fill="var(--b)" opacity="0">
+      <animateMotion dur="4s" begin="2s" repeatCount="indefinite" calcMode="linear" keyPoints="0;1;1" keyTimes="0;0.3;1"><mpath href="#c1"/></animateMotion>
+      <animate attributeName="opacity" dur="4s" begin="2s" repeatCount="indefinite" values="1;1;0;0" keyTimes="0;0.3;0.31;1"/>
+    </circle>
+    <circle class="dot" r="4.5" fill="var(--b)" opacity="0">
+      <animateMotion dur="4s" begin="2s" repeatCount="indefinite" calcMode="linear" keyPoints="0;0;1;1" keyTimes="0;0.4;0.65;1"><mpath href="#ub"/></animateMotion>
+      <animate attributeName="opacity" dur="4s" begin="2s" repeatCount="indefinite" values="0;0;1;1;0;0" keyTimes="0;0.39;0.4;0.65;0.66;1"/>
+    </circle>
+    <circle class="dot" r="4.5" fill="var(--a)" opacity="0">
+      <animateMotion dur="4s" begin="3s" repeatCount="indefinite" calcMode="linear" keyPoints="0;1;1" keyTimes="0;0.3;1"><mpath href="#c2"/></animateMotion>
+      <animate attributeName="opacity" dur="4s" begin="3s" repeatCount="indefinite" values="1;1;0;0" keyTimes="0;0.3;0.31;1"/>
+    </circle>
+    <circle class="dot" r="4.5" fill="var(--a)" opacity="0">
+      <animateMotion dur="4s" begin="3s" repeatCount="indefinite" calcMode="linear" keyPoints="0;0;1;1" keyTimes="0;0.4;0.65;1"><mpath href="#ua"/></animateMotion>
+      <animate attributeName="opacity" dur="4s" begin="3s" repeatCount="indefinite" values="0;0;1;1;0;0" keyTimes="0;0.39;0.4;0.65;0.66;1"/>
+    </circle>
+  </g>
+</svg>

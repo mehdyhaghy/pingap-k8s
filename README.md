@@ -11,11 +11,9 @@ config storage. Pingap instances started with `--autoreload` pick up each change
 the upstream that changed, without a restart. With the Gateway API provider on, it also turns
 Gateways, HTTPRoutes and GRPCRoutes into Pingap locations, plugins, certificates and upstreams.
 
-```
- Kubernetes API ──watch──▶ pingap-k8s ──put <prefix>/upstreams/api.toml──▶ etcd
-                                                                             │
-                          Pingap replicas (--autoreload, watch etcd) ◀───────┘
-```
+<p align="center">
+  <img src="docs/pingap-k8s-flow.svg" alt="pingap-k8s flow: the controller watches the Kubernetes API, writes pod addresses and routes into etcd, and Pingap reloads them and sends traffic straight to the pods" width="100%">
+</p>
 
 - **No change to Pingap.** Use the stock Pingap image. All Kubernetes knowledge lives in the
   controller.
