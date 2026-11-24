@@ -104,6 +104,7 @@ data:
     drain_terminating = true
     external_name = false
     include_not_ready = false
+    ip_family = "primary"
     resync = "5m"
     target = "pods"
 

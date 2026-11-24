@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Removed the deprecated `ipv4_only` option; use `ip_family` (`"ipv4"` or `"primary"`). A
+  config or chart values that still set it are rejected. The chart now sets `ip_family: primary`.
 - Gateway API: editing the `locations` of a hand-made Pingap server whose array holds
   comments no longer writes broken TOML. The comment of a dropped `k8s-` name moved in front
   of a name on the same line, or of the closing `]`, and swallowed it, so Pingap could not

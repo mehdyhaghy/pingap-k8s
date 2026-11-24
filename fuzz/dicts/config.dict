@@ -26,7 +26,6 @@
 "debounce_max = "
 "resync = "
 "ip_family = "
-"ipv4_only = "
 "target = "
 "external_name = "
 "[server]"

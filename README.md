@@ -30,12 +30,6 @@ Gateways, HTTPRoutes and GRPCRoutes into Pingap locations, plugins, certificates
   addresses and its health checks remove dead pods. New pods get no traffic until the controller
   is back.
 
-Status: endpoint discovery, plus the [Gateway API provider](#gateway-api) (Gateway API v1.7.0
-Standard channel, profiles GATEWAY-HTTP and GATEWAY-GRPC). The frozen Ingress API will not be
-supported. Before 1.0, the configuration and the chart values may still change between releases;
-the [CHANGELOG](CHANGELOG.md) says how to upgrade. Each release is tested with one Pingap
-version (see [Pingap side](#pingap-side)).
-
 ## How it works
 
 1. **Watch.** For every Service referenced in the config, the controller runs one watcher on its
@@ -310,7 +304,7 @@ drain_terminating = true # every [defaults] key but resync can be set per upstre
 | `drain_terminating` | `true` | remove terminating endpoints; `false` treats serving terminating endpoints as ready |
 | `debounce` / `debounce_max` | `500ms` / `2s` | wait this long after the last event before writing / write at the latest this long after the first pending event |
 | `resync` | `5m` | reconcile every upstream at this interval even without events (global) |
-| `ip_family` | `primary` | address families written, see below. `ipv4_only` is a deprecated alias (`true` is `ipv4`, `false` is `primary`); setting both is an error |
+| `ip_family` | `primary` | address families written, see below |
 | `external_name` | `false` | allow `ExternalName` Services, see below |
 | `target` | `pods` | `pods` writes ready pod IPs, `service` the Service's ClusterIP ([Upstream target](#upstream-target)) |
 | `upstreams.<name>.services` | (required) | list of `<service>[.<namespace>]:<port> [weight]` |
@@ -1005,11 +999,11 @@ docker buildx imagetools inspect ghcr.io/mehdyhaghy/pingap-k8s:<version> --forma
 
 ## Performance
 
-At 50 upstreams × 20 endpoints: event-to-write p50 0.52 s (the 500 ms debounce), ~30 MB
-controller RSS, one etcd revision per write. Measured with controller 0.1.0 on Kubernetes 1.32;
-see [docs/benchmarks.md](docs/benchmarks.md). Over a one-hour [soak test](docs/soak.md) with one
-upstream (controller 0.16.21, Kubernetes 1.37): event-to-write p99 1.9 s, controller memory
-flat at about 3 MiB (cgroup RSS), request latency through Pingap p99 2.9 ms at 200 requests/s.
+At 50 upstreams × 20 endpoints: event-to-write p50 0.52 s (the 500 ms debounce), about 30 MiB
+controller RSS, one etcd revision per write; see [docs/benchmarks.md](docs/benchmarks.md). Over a
+one-hour [soak test](docs/soak.md) with one upstream (controller 0.16.21, Pingap 0.16.2,
+Kubernetes 1.37): event-to-write p99 1.9 s, controller memory flat at about 3 MiB (cgroup RSS),
+request latency through Pingap p99 2.9 ms at 200 requests/s.
 
 ## Limitations
 

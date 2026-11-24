@@ -237,10 +237,8 @@ config:
     # Full re-list and re-reconcile, corrects drift.
     resync: "5m"
     # Address families written: "primary" (default; one address per pod, in the
-    # Service's primary family), "ipv4", "ipv6" or "both". Replaces the
-    # deprecated ipv4_only (true is "ipv4", false is "primary"); set one of the
-    # two, not both. Left unset here so values that set ipv4_only keep working.
-    # ip_family: primary
+    # Service's primary family), "ipv4", "ipv6" or "both".
+    ip_family: primary
     # ExternalName Services write <externalName>:<port> (Pingap resolves the
     # name). Off: skipped with a warning in "pods" mode. On: anyone who can
     # create Services in a listed namespace can point the upstream at any host.

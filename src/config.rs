@@ -394,8 +394,6 @@ struct RawDefaults {
     #[serde(default, with = "humantime_serde")]
     resync: Option<Duration>,
     ip_family: Option<String>,
-    /// Deprecated alias: `true` is `ip_family = "ipv4"`, `false` is `"primary"`.
-    ipv4_only: Option<bool>,
     external_name: Option<bool>,
     target: Option<String>,
 }
@@ -411,8 +409,6 @@ struct RawUpstream {
     #[serde(default, with = "humantime_serde")]
     debounce_max: Option<Duration>,
     ip_family: Option<String>,
-    /// Deprecated alias of `ip_family`, see [`RawDefaults`].
-    ipv4_only: Option<bool>,
     external_name: Option<bool>,
     target: Option<String>,
 }
@@ -422,12 +418,6 @@ impl Config {
     /// `kubernetes.default_namespace` is empty.
     pub fn from_toml_str(s: &str, pod_namespace: &str) -> Result<Config, ConfigError> {
         let raw: RawConfig = toml::from_str(s)?;
-        if raw.defaults.ipv4_only.is_some() || raw.upstreams.values().any(|u| u.ipv4_only.is_some())
-        {
-            tracing::warn!(
-                "ipv4_only is deprecated: use ip_family = \"ipv4\" (for true) or \"primary\" (for false)"
-            );
-        }
 
         if raw.etcd.url.trim().is_empty() {
             return Err(ConfigError::Invalid("etcd.url must not be empty".into()));
@@ -444,9 +434,11 @@ impl Config {
                 .map_err(|reason| ConfigError::Invalid(format!("defaults.target: {reason}")))?,
             None => built.target.clone(),
         };
-        let ip_family = merge_ip_family(raw.defaults.ip_family.as_deref(), raw.defaults.ipv4_only)
-            .map_err(|reason| ConfigError::Invalid(format!("defaults.{reason}")))?
-            .unwrap_or(built.ip_family);
+        let ip_family = match raw.defaults.ip_family.as_deref() {
+            Some(value) => parse_ip_family(value)
+                .map_err(|reason| ConfigError::Invalid(format!("defaults.ip_family: {reason}")))?,
+            None => built.ip_family,
+        };
         let defaults = Defaults {
             include_not_ready: raw
                 .defaults
@@ -574,9 +566,12 @@ fn build_upstream(
         }
         None => defaults.target.clone(),
     };
-    let ip_family = merge_ip_family(raw.ip_family.as_deref(), raw.ipv4_only)
-        .map_err(upstream_err)?
-        .unwrap_or(defaults.ip_family);
+    let ip_family = match raw.ip_family.as_deref() {
+        Some(value) => {
+            parse_ip_family(value).map_err(|r| upstream_err(format!("ip_family: {r}")))?
+        }
+        None => defaults.ip_family,
+    };
     let options = UpstreamOptions {
         include_not_ready: raw.include_not_ready.unwrap_or(defaults.include_not_ready),
         drain_terminating: raw.drain_terminating.unwrap_or(defaults.drain_terminating),
@@ -876,26 +871,6 @@ fn validate_controller_name(name: &str) -> Result<(), String> {
         return Err("the path after the domain must be non-empty URL path characters".into());
     }
     Ok(())
-}
-
-/// `target = "pods" | "service"`.
-/// `ip_family` and its deprecated alias `ipv4_only` of one table; `None` when neither is
-/// set. Setting both is an error.
-fn merge_ip_family(
-    ip_family: Option<&str>,
-    ipv4_only: Option<bool>,
-) -> Result<Option<IpFamily>, String> {
-    match (ip_family, ipv4_only) {
-        (Some(_), Some(_)) => {
-            Err("ipv4_only: set either ip_family or the deprecated ipv4_only, not both".into())
-        }
-        (Some(value), None) => parse_ip_family(value)
-            .map(Some)
-            .map_err(|r| format!("ip_family: {r}")),
-        (None, Some(true)) => Ok(Some(IpFamily::Ipv4)),
-        (None, Some(false)) => Ok(Some(IpFamily::Primary)),
-        (None, None) => Ok(None),
-    }
 }
 
 fn parse_ip_family(value: &str) -> Result<IpFamily, String> {
@@ -1630,12 +1605,12 @@ target = "service"
     #[test]
     fn wrong_types_rejected() {
         assert!(cfg("[upstreams.a]\nservices = \"a:80\"\n").is_err());
-        assert!(cfg("[defaults]\nipv4_only = \"yes\"\n").is_err());
+        assert!(cfg("[defaults]\nip_family = true\n").is_err());
         assert!(cfg("[defaults]\nexternal_name = \"yes\"\n").is_err());
     }
 
     #[test]
-    fn ip_family_values_and_deprecated_alias() {
+    fn ip_family_values() {
         let family = |defaults: &str, upstream: &str| {
             cfg(&format!(
                 "[defaults]\n{defaults}\n[upstreams.a]\nservices = [\"a:80\"]\n{upstream}\n"
@@ -1652,16 +1627,8 @@ target = "service"
                 IpFamily::Primary,
                 IpFamily::Ipv4,
             ),
-            // The deprecated alias: true is ipv4, false is the default (primary).
-            ("ipv4_only = true", "", IpFamily::Ipv4, IpFamily::Ipv4),
             (
-                "ipv4_only = true",
-                "ipv4_only = false",
-                IpFamily::Ipv4,
-                IpFamily::Primary,
-            ),
-            (
-                "ipv4_only = true",
+                "ip_family = \"ipv4\"",
                 "ip_family = \"both\"",
                 IpFamily::Ipv4,
                 IpFamily::Both,
@@ -1676,15 +1643,13 @@ target = "service"
         }
         let m = err("[defaults]\nip_family = \"dual\"\n");
         assert!(m.contains("defaults.ip_family"), "{m}");
-        let m = err("[defaults]\nip_family = \"ipv4\"\nipv4_only = true\n");
-        assert!(m.contains("not both"), "{m}");
-        let m = family("", "ip_family = \"ipv4\"\nipv4_only = true")
-            .unwrap_err()
-            .to_string();
+        let m = family("", "ip_family = \"dual\"").unwrap_err().to_string();
         assert!(
-            m.contains("upstream \"a\"") && m.contains("not both"),
+            m.contains("upstream \"a\"") && m.contains("ip_family"),
             "{m}"
         );
+        // The removed ipv4_only key is an unknown field now.
+        assert!(cfg("[defaults]\nipv4_only = true\n").is_err());
     }
 
     #[test]

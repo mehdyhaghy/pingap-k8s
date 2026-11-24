@@ -46,15 +46,9 @@
         "debounce": { "$ref": "#/$defs/duration" },
         "debounce_max": { "$ref": "#/$defs/duration" },
         "ip_family": { "enum": ["primary", "ipv4", "ipv6", "both"] },
-        "ipv4_only": {
-          "description": "Deprecated: use ip_family (true is \"ipv4\", false is \"primary\").",
-          "deprecated": true,
-          "type": "boolean"
-        },
         "external_name": { "type": "boolean" },
         "target": { "enum": ["pods", "service"] }
-      },
-      "not": { "required": ["ip_family", "ipv4_only"] }
+      }
     }
   },
   "properties": {
